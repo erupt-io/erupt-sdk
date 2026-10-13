@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -149,7 +150,7 @@ func (r *SQLRepository) pageSQL(q Query) (count string, countArgs []any, page st
 	}
 	order := strings.Join(orders, ", ")
 	if order == "" {
-		order = r.q(r.model.pk) + " DESC"
+		order = r.q(r.model.pk) + " ASC"
 	}
 	page = "SELECT " + r.columns() + " FROM " + r.q(r.Table) + where + " ORDER BY " + order +
 		" LIMIT " + pb.p(q.Limit) + " OFFSET " + pb.p(q.Offset)
@@ -304,7 +305,8 @@ func (r *SQLRepository) fromDB(f *field, v any) any {
 				return n
 			}
 		}
-		if n, ok := v.(float64); ok && n == float64(int64(n)) {
+		// drivers differ (int32 from pgx, int64 from mysql, float64 from sqlite): integral numbers become int64
+		if n, ok := toFloat(v); ok && n == math.Trunc(n) && math.Abs(n) < 1<<53 {
 			return int64(n)
 		}
 	}

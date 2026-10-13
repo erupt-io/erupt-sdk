@@ -97,8 +97,15 @@ Then on the server add menus of type `table` with values `blog.Article` and `blo
 
 `IRepository` (`PageAsync`, `GetAsync`, `AddAsync`, `UpdateAsync`, `DeleteAsync`) puts a model on anything.
 Shipped: `MemoryRepository` and `DbRepository` over any ADO.NET provider: identifiers quoted (`Quote` for
-MySQL / SQL Server), values parameterized as `@pN`, LIKE wildcards escaped, `Paging.OffsetFetch` for SQL Server
-and Oracle, dates as ISO text; `AutoCreateSqlite` creates a missing SQLite table.
+MySQL / SQL Server), values parameterized as `@pN`, LIKE escaped with `ESCAPE '!'`, dates as ISO text;
+`AutoCreateSqlite` creates a missing SQLite table. Without a sort, rows come back by primary key ascending.
+
+| Database | Settings |
+|----------|----------|
+| SQLite, PostgreSQL | defaults |
+| MySQL | `Quote = ("`", "`")` |
+| SQL Server 2012+ | `Quote = ("[", "]"), Paging = Paging.OffsetFetch` |
+| Oracle 12c+ | `ParameterPrefix = ":", Paging = Paging.OffsetFetch` |
 
 ## Generated code
 

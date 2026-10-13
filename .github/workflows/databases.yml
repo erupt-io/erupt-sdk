@@ -1,0 +1,90 @@
+# Every SDK's SQL repository against real PostgreSQL and MySQL. The containers are throwaway and accept
+# connections without a password (trust / empty root password), so no credential lives in this file.
+name: databases
+
+on:
+  push:
+    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", ".github/workflows/databases.yml"]
+  pull_request:
+    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", ".github/workflows/databases.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  sql:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: erupt
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: erupt
+        ports: ["3306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1" --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      ERUPT_TEST_DATABASES: "1"
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGDATABASE: erupt
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_DATABASE: erupt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: go/dbtest/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+          extensions: pdo_pgsql, pdo_mysql
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      # each language runs even when an earlier one failed; the job fails if any did
+      - name: Python
+        if: success() || failure()
+        working-directory: python
+        run: |
+          python -m pip install "psycopg[binary]==3.3.6" "PyMySQL==1.2.3"
+          PYTHONPATH=src python -m unittest tests.test_databases -v
+      - name: Go
+        if: success() || failure()
+        working-directory: go/dbtest
+        run: go test -v ./...
+      - name: TypeScript
+        if: success() || failure()
+        working-directory: ts
+        run: |
+          npm ci
+          npm run build
+          node --test --test-reporter=spec dist/test/databases.test.js
+      - name: PHP
+        if: success() || failure()
+        working-directory: php
+        run: php tests/databases.php
+      - name: .NET
+        if: success() || failure()
+        working-directory: dotnet
+        run: dotnet test -c Release --filter "FullyQualifiedName~DatabaseTests" --logger "console;verbosity=normal"

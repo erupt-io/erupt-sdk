@@ -34,11 +34,28 @@ jobs:
           for f in erupt-annotations.schema.json erupt-node-defaults.json; do
             curl -fsSL "https://raw.githubusercontent.com/erupts/erupt/$REF/schema/$f" -o "$RUNNER_TEMP/schema/$f"
           done
-      - name: Regenerate
-        working-directory: python
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Regenerate every language
         run: |
-          python tools/gen_types.py "$RUNNER_TEMP/schema"
-          PYTHONPATH=src python -m unittest discover -s tests
+          # python copies the schema into schema/ (and its package); the others generate from schema/
+          (cd python && python tools/gen_types.py "$RUNNER_TEMP/schema")
+          (cd go && go run ./cmd/gentypes ../schema)
+          (cd ts && node tools/gen-types.mjs ../schema)
+          (cd php && php tools/gen-types.php ../schema)
+          (cd dotnet && dotnet run --project tools/GenTypes -- ../schema)
+          (cd python && PYTHONPATH=src python -m unittest discover -s tests)
       - name: Open a pull request
         run: |
           if git diff --quiet; then echo "schema unchanged"; exit 0; fi

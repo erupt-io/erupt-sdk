@@ -1,0 +1,40 @@
+name: ts
+
+on:
+  # also run by release.yml before anything is published
+  workflow_call:
+  push:
+    paths: ["ts/**", "schema/**", "conformance/**", ".github/workflows/ts.yml"]
+  pull_request:
+    paths: ["ts/**", "schema/**", "conformance/**", ".github/workflows/ts.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ["22", "24"]
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+      - name: Generated files match schema/
+        run: node tools/gen-types.mjs ../schema --check
+      - name: Unit tests
+        run: npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Conformance
+        working-directory: .
+        run: python conformance/run.py -- node ts/dist/examples/conformance.js

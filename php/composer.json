@@ -1,0 +1,25 @@
+{
+    "name": "erupt-io/erupt-sdk",
+    "description": "Serve PHP models as erupt admin pages through an erupt cloud server",
+    "type": "library",
+    "license": "Apache-2.0",
+    "keywords": ["erupt", "admin", "low-code", "crud"],
+    "homepage": "https://github.com/erupt-io/erupt-sdk",
+    "require": {
+        "php": ">=8.1",
+        "ext-json": "*",
+        "ext-pdo": "*"
+    },
+    "suggest": {
+        "ext-pdo_sqlite": "for PdoRepository on SQLite",
+        "ext-pcntl": "to deregister on SIGINT / SIGTERM in Node::heartbeat()"
+    },
+    "autoload": {
+        "psr-4": {
+            "Erupt\\": "src/"
+        }
+    },
+    "scripts": {
+        "test": "php tests/run.php"
+    }
+}

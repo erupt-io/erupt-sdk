@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- apps, tools and tests target the LTS but may run on any newer runtime -->
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+</Project>

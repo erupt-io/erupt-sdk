@@ -1,0 +1,41 @@
+name: php
+
+on:
+  # also run by release.yml before anything is published
+  workflow_call:
+  push:
+    paths: ["php/**", "schema/**", "conformance/**", ".github/workflows/php.yml"]
+  pull_request:
+    paths: ["php/**", "schema/**", "conformance/**", ".github/workflows/php.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ["8.1", "8.5"]
+    defaults:
+      run:
+        working-directory: php
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_sqlite, pcntl
+          tools: composer
+      - name: Generated files match schema/
+        run: php tools/gen-types.php ../schema --check
+      - name: Package metadata
+        run: composer validate --strict
+      - name: Unit tests
+        run: php tests/run.php
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Conformance
+        working-directory: .
+        run: python conformance/run.py -- php php/examples/conformance.php

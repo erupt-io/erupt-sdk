@@ -1,0 +1,204 @@
+# Publishes one language per tag: python/v1.2.3, ts/v1.2.3, go/v1.2.3, php/v1.2.3, dotnet/v1.2.3.
+# Each runs that language's full CI first and refuses a tag that differs from the package version.
+# Publishing uses OpenID Connect trusted publishing; no registry token is stored in this repository.
+# One-time setup per registry: see RELEASING.md.
+name: release
+
+on:
+  push:
+    tags: ["python/v*", "ts/v*", "go/v*", "php/v*", "dotnet/v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      lang: ${{ steps.tag.outputs.lang }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^(python|ts|go|php|dotnet)/v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?)$ ]] || { echo "illegal tag $TAG"; exit 1; }
+          echo "lang=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- python -> PyPI
+
+  python-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'python'
+    uses: ./.github/workflows/python.yml
+
+  python:
+    needs: [meta, python-ci]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag matches the package version
+        working-directory: python
+        run: |
+          grep -qx "version = \"$VERSION\"" pyproject.toml || { echo "pyproject.toml is not $VERSION"; exit 1; }
+          grep -qx "__version__ = \"$VERSION\"" src/erupt/node.py || { echo "erupt.__version__ is not $VERSION"; exit 1; }
+      - name: Build
+        working-directory: python
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
+
+  # ---------------------------------------------------------------- ts -> npm
+
+  ts-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'ts'
+    uses: ./.github/workflows/ts.yml
+
+  ts:
+    needs: [meta, ts-ci]
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - name: Tag matches the package version
+        run: |
+          [ "$(node -p 'require("./package.json").version')" = "$VERSION" ] || { echo "package.json is not $VERSION"; exit 1; }
+          grep -qx "export const VERSION = \"$VERSION\";" src/node.ts || { echo "VERSION in src/node.ts is not $VERSION"; exit 1; }
+      - run: npm ci
+      - run: npm run build
+      # trusted publishing needs npm 11.5.1+; provenance is attached automatically
+      - run: npm install -g npm@11
+      - run: npm publish --access public
+
+  # ---------------------------------------------------------------- go -> module proxy
+
+  go-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'go'
+    uses: ./.github/workflows/go.yml
+
+  go:
+    needs: [meta, go-ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the reported version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: grep -qx "const Version = \"$VERSION\"" go/node.go || { echo "Version in go/node.go is not $VERSION"; exit 1; }
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # a go/vX.Y.Z tag is the release; ask the proxy for it so pkg.go.dev lists it right away
+      - name: Warm the module proxy
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: GOPROXY=https://proxy.golang.org GOFLAGS=-mod=mod go list -m "github.com/erupt-io/erupt-sdk/go@v$VERSION"
+
+  # ---------------------------------------------------------------- php -> Packagist (via a split repository)
+
+  php-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'php'
+    uses: ./.github/workflows/php.yml
+
+  php:
+    needs: [meta, php-ci]
+    runs-on: ubuntu-latest
+    environment: packagist
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag matches the reported version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: grep -q "public const VERSION = '$VERSION';" php/src/Node.php || { echo "VERSION in php/src/Node.php is not $VERSION"; exit 1; }
+      # Packagist needs composer.json at a repository root, so php/ is split into its own read-only repository
+      - name: Push php/ to the split repository
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          SPLIT_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}
+          SPLIT_REPO: ${{ vars.PHP_SPLIT_REPO || 'erupt-io/erupt-sdk-php' }}
+        run: |
+          [[ "$SPLIT_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo "illegal PHP_SPLIT_REPO"; exit 1; }
+          git subtree split --prefix php -b php-split
+          url="https://x-access-token:${SPLIT_TOKEN}@github.com/${SPLIT_REPO}.git"
+          git push "$url" php-split:main
+          git tag "v$VERSION" php-split
+          git push "$url" "v$VERSION"
+
+  # ---------------------------------------------------------------- dotnet -> NuGet
+
+  dotnet-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'dotnet'
+    uses: ./.github/workflows/dotnet.yml
+
+  dotnet:
+    needs: [meta, dotnet-ci]
+    runs-on: ubuntu-latest
+    environment: nuget
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        working-directory: dotnet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Tag matches the package version
+        run: |
+          grep -q "<Version>$VERSION</Version>" src/Erupt.Sdk/Erupt.Sdk.csproj || { echo "Erupt.Sdk.csproj is not $VERSION"; exit 1; }
+          grep -q "public const string Version = \"$VERSION\";" src/Erupt.Sdk/Node.cs || { echo "Version in Node.cs is not $VERSION"; exit 1; }
+      - run: dotnet pack src/Erupt.Sdk -c Release -o out
+      # trusted publishing: exchanges the workflow's OIDC token for a short-lived NuGet API key
+      - uses: NuGet/login@v1
+        id: nuget
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - run: dotnet nuget push "out/*.nupkg" --api-key "${{ steps.nuget.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json
+
+  # ---------------------------------------------------------------- GitHub release
+
+  github-release:
+    needs: [meta, python, ts, go, php, dotnet]
+    # exactly one language job ran; the others are skipped
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes

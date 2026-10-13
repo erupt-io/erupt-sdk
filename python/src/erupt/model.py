@@ -129,7 +129,7 @@ class Field:
         if py is datetime.date:
             return _parse_datetime(value).date()
         if self.type == "CHOICE" and self.choices and str(value) not in map(str, self.choices):
-            raise ValueError(f"{self.title}: illegal option '{value}'")
+            raise ValueError(f"illegal option '{value}'")
         return py(value)
 
 

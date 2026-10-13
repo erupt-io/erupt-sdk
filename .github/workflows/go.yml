@@ -1,0 +1,44 @@
+name: go
+
+on:
+  # also run by release.yml before anything is published
+  workflow_call:
+  push:
+    paths: ["go/**", "schema/**", "conformance/**", ".github/workflows/go.yml"]
+  pull_request:
+    paths: ["go/**", "schema/**", "conformance/**", ".github/workflows/go.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.21", "stable"]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go/go.sum
+      - name: Generated files match schema/
+        run: go run ./cmd/gentypes -check ../schema
+      - name: Vet and format
+        run: |
+          go vet ./...
+          test -z "$(gofmt -l .)"
+      - name: Unit tests
+        run: go test ./...
+      - name: Build the conformance fixture
+        run: go build -o "$RUNNER_TEMP/conformance" ./examples/conformance
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Conformance
+        working-directory: .
+        run: python conformance/run.py -- "$RUNNER_TEMP/conformance"

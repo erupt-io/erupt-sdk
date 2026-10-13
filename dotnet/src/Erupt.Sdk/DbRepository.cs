@@ -1,0 +1,190 @@
+using System.Data.Common;
+using System.Globalization;
+
+namespace Erupt;
+
+/// <summary>How a database pages results.</summary>
+public enum Paging
+{
+    /// <summary><c>LIMIT n OFFSET m</c>: SQLite, PostgreSQL, MySQL.</summary>
+    LimitOffset,
+
+    /// <summary><c>OFFSET m ROWS FETCH NEXT n ROWS ONLY</c>: SQL Server, Oracle.</summary>
+    OffsetFetch,
+}
+
+/// <summary>
+/// A table over any ADO.NET provider. Identifiers come from the model (checked when it was declared) and are
+/// quoted; every value is a parameter (<c>@p0</c>, understood by SQLite, SQL Server, PostgreSQL and MySQL
+/// providers). Dates are stored as ISO text so they compare and sort the same everywhere.
+/// </summary>
+public sealed class DbRepository(Func<DbConnection> connect, string table) : IRepository
+{
+    private EruptModel _model = null!;
+
+    /// <summary>Opening and closing quote of identifiers (<c>"</c> by default; <c>`</c> for MySQL, <c>[</c> <c>]</c> for SQL Server).</summary>
+    public (string Open, string Close) Quote { get; init; } = ("\"", "\"");
+
+    public Paging Paging { get; init; } = Paging.LimitOffset;
+
+    /// <summary>Create the table when missing, with SQLite column types. Leave off for any other database.</summary>
+    public bool AutoCreateSqlite { get; init; }
+
+    public void Bind(EruptModel model)
+    {
+        _model = model;
+        if (!AutoCreateSqlite) return;
+        var columns = model.Fields.Select(f => f.IsPk
+            ? $"{Q(f.Name)} INTEGER PRIMARY KEY AUTOINCREMENT"
+            : $"{Q(f.Name)} {(f.Type is "NUMBER" ? "NUMERIC" : f.Type is "BOOLEAN" || f.IsReference ? "INTEGER" : "TEXT")}");
+        using var conn = Open();
+        Execute(conn, $"CREATE TABLE IF NOT EXISTS {Q(table)} ({string.Join(", ", columns)})", []);
+    }
+
+    public async Task<(long Total, IReadOnlyList<Record> Records)> PageAsync(Query query, CancellationToken ct = default)
+    {
+        var parameters = new List<object?>();
+        var where = Where(query.Conditions, parameters);
+        await using var conn = Open();
+        var total = Convert.ToInt64(await Command(conn, $"SELECT COUNT(*) FROM {Q(table)}{where}", parameters).ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+        var order = query.Sort.Count > 0
+            ? string.Join(", ", query.Sort.Select(s => $"{Q(s.Field)} {(s.Desc ? "DESC" : "ASC")}"))
+            : $"{Q(_model.Pk!)} DESC";
+        var limit = P(parameters, query.Limit);
+        var offset = P(parameters, query.Offset);
+        var paging = Paging == Paging.LimitOffset ? $"LIMIT {limit} OFFSET {offset}" : $"OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY";
+        return (total, await Read(conn, $"SELECT * FROM {Q(table)}{where} ORDER BY {order} {paging}", parameters, ct));
+    }
+
+    public async Task<Record?> GetAsync(object pk, CancellationToken ct = default)
+    {
+        var parameters = new List<object?>();
+        await using var conn = Open();
+        var rows = await Read(conn, $"SELECT * FROM {Q(table)} WHERE {Q(_model.Pk!)} = {P(parameters, pk)}", parameters, ct);
+        return rows.FirstOrDefault();
+    }
+
+    public async Task AddAsync(Record record, CancellationToken ct = default)
+    {
+        var values = record.Where(e => e.Key != _model.Pk).ToList();
+        var parameters = new List<object?>();
+        var placeholders = values.Select(e => P(parameters, e.Value)).ToList();
+        await using var conn = Open();
+        await Command(conn, $"INSERT INTO {Q(table)} ({string.Join(", ", values.Select(e => Q(e.Key)))}) VALUES ({string.Join(", ", placeholders)})", parameters).ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task UpdateAsync(object pk, Record record, CancellationToken ct = default)
+    {
+        var values = record.Where(e => e.Key != _model.Pk).ToList();
+        if (values.Count == 0) return;
+        var parameters = new List<object?>();
+        var sets = string.Join(", ", values.Select(e => $"{Q(e.Key)} = {P(parameters, e.Value)}"));
+        await using var conn = Open();
+        await Command(conn, $"UPDATE {Q(table)} SET {sets} WHERE {Q(_model.Pk!)} = {P(parameters, pk)}", parameters).ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task DeleteAsync(IReadOnlyList<object> pks, CancellationToken ct = default)
+    {
+        if (pks.Count == 0) return;
+        var parameters = new List<object?>();
+        var list = string.Join(", ", pks.Select(pk => P(parameters, pk)));
+        await using var conn = Open();
+        await Command(conn, $"DELETE FROM {Q(table)} WHERE {Q(_model.Pk!)} IN ({list})", parameters).ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>The WHERE clause of <paramref name="conditions"/>, values appended to <paramref name="parameters"/>.</summary>
+    internal string Where(IEnumerable<Cond> conditions, List<object?> parameters)
+    {
+        var clauses = new List<string>();
+        foreach (var c in conditions)
+        {
+            var col = Q(c.Field);
+            var list = (c.Value as IEnumerable<object?>)?.ToList();
+            clauses.Add(c.Op switch
+            {
+                "EQ" => $"{col} = {P(parameters, c.Value)}",
+                "NEQ" => $"{col} <> {P(parameters, c.Value)}",
+                "GT" => $"{col} > {P(parameters, c.Value)}",
+                "GTE" => $"{col} >= {P(parameters, c.Value)}",
+                "LT" => $"{col} < {P(parameters, c.Value)}",
+                "LTE" => $"{col} <= {P(parameters, c.Value)}",
+                "LIKE" or "NOT_LIKE" => $"{col} {(c.Op == "NOT_LIKE" ? "NOT " : "")}LIKE {P(parameters, "%" + Escape(Values.Str(c.Value)) + "%")} ESCAPE '\\'",
+                "RANGE" => $"{col} BETWEEN {P(parameters, list![0])} AND {P(parameters, list[1])}",
+                "IN" or "NOT_IN" when list!.Count == 0 => c.Op == "IN" ? "1=0" : "1=1",
+                "IN" or "NOT_IN" => $"{col} {(c.Op == "NOT_IN" ? "NOT " : "")}IN ({string.Join(", ", list!.Select(v => P(parameters, v)))})",
+                "NULL" => $"{col} IS NULL",
+                "NOT_NULL" => $"{col} IS NOT NULL",
+                _ => throw new ArgumentException($"illegal operator '{c.Op}'"),
+            });
+        }
+        return clauses.Count > 0 ? " WHERE " + string.Join(" AND ", clauses) : "";
+    }
+
+    internal string Q(string identifier) => Quote.Open + identifier.Replace(Quote.Close, Quote.Close + Quote.Close) + Quote.Close;
+
+    private static string Escape(string text) => text.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+
+    private static string P(List<object?> parameters, object? value)
+    {
+        parameters.Add(value);
+        return "@p" + (parameters.Count - 1).ToString(CultureInfo.InvariantCulture);
+    }
+
+    private DbConnection Open()
+    {
+        var conn = connect();
+        if (conn.State != System.Data.ConnectionState.Open) conn.Open();
+        return conn;
+    }
+
+    private static DbCommand Command(DbConnection conn, string sql, List<object?> parameters)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        for (var i = 0; i < parameters.Count; i++)
+        {
+            var p = cmd.CreateParameter();
+            p.ParameterName = "@p" + i.ToString(CultureInfo.InvariantCulture);
+            p.Value = ToDb(parameters[i]);
+            cmd.Parameters.Add(p);
+        }
+        return cmd;
+    }
+
+    private static void Execute(DbConnection conn, string sql, List<object?> parameters) => Command(conn, sql, parameters).ExecuteNonQuery();
+
+    private static object ToDb(object? value) => value switch
+    {
+        null => DBNull.Value,
+        DateOnly d => d.ToString(Values.DateFormat, CultureInfo.InvariantCulture),
+        DateTime t => t.ToString("yyyy-MM-dd HH:mm:ss.fffffff", CultureInfo.InvariantCulture),
+        _ => Values.Normalize(value)!,
+    };
+
+    private async Task<List<Record>> Read(DbConnection conn, string sql, List<object?> parameters, CancellationToken ct)
+    {
+        await using var reader = await Command(conn, sql, parameters).ExecuteReaderAsync(ct);
+        var rows = new List<Record>();
+        while (await reader.ReadAsync(ct))
+        {
+            var record = new Record();
+            for (var i = 0; i < reader.FieldCount; i++)
+            {
+                var name = reader.GetName(i);
+                if (!_model.FieldMap.TryGetValue(name, out var field)) continue;
+                record[name] = FromDb(field, reader.IsDBNull(i) ? null : reader.GetValue(i));
+            }
+            rows.Add(record);
+        }
+        return rows;
+    }
+
+    private static object? FromDb(FieldDef field, object? value) => value switch
+    {
+        null => null,
+        _ when field.Type == "BOOLEAN" => value is bool b ? b : Convert.ToInt64(value, CultureInfo.InvariantCulture) != 0,
+        _ when field.Type == "DATE" => value is DateTime dt ? DateOnly.FromDateTime(dt) : DateOnly.FromDateTime(Values.ParseDateTime(value)),
+        _ when field.Type == FieldDef.TemplateDateTime => value is DateTime t ? t : Values.ParseDateTime(value),
+        _ => Values.Normalize(value),
+    };
+}

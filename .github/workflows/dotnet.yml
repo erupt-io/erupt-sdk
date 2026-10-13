@@ -1,0 +1,38 @@
+name: dotnet
+
+on:
+  # also run by release.yml before anything is published
+  workflow_call:
+  push:
+    paths: ["dotnet/**", "schema/**", "conformance/**", ".github/workflows/dotnet.yml"]
+  pull_request:
+    paths: ["dotnet/**", "schema/**", "conformance/**", ".github/workflows/dotnet.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dotnet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Generated files match schema/
+        run: dotnet run --project tools/GenTypes -- ../schema --check
+      - name: Build (warnings are errors)
+        run: dotnet build -c Release
+      - name: Unit tests
+        run: dotnet test -c Release --no-build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Conformance
+        working-directory: .
+        run: python conformance/run.py -- dotnet dotnet/examples/Conformance/bin/Release/net8.0/Conformance.dll

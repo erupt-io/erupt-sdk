@@ -1,0 +1,329 @@
+import base64
+import datetime
+import io
+import json
+import os
+import tempfile
+import unittest
+
+from erupt import Field, MemoryRepository, Node, SqliteRepository, _schema, erupt, operation
+
+TOKEN = "node-secret"
+
+
+@erupt("Category")
+class Category:
+    id: int = Field(pk=True)
+    name: str = Field("Name", search=True)
+    parent: int = Field("Parent")
+
+
+@erupt("Publish Options")
+class PublishForm:
+    note: str = Field("Note", not_null=True)
+
+
+CALLS = []
+
+
+@erupt("Article", order_by="id desc")
+class Article:
+    id: int = Field(pk=True)
+    title: str = Field("Title", search=True, not_null=True, sortable=True)
+    status: str = Field("Status", choices={"draft": "Draft", "published": "Published"}, search=True)
+    views: int = Field("Views", sortable=True)
+    featured: bool = Field("Featured", search=True)
+    publish_date: datetime.date = Field("Publish Date", search=True)
+    review_at: datetime.datetime = Field("Review At")
+    body: str = Field("Body", type="TEXTAREA", table=False)
+    category: Category = Field("Category", search=True)
+    topic: Category = Field("Topic", tree="parent")
+
+    @operation("Publish", form=PublishForm)
+    def publish(op):
+        CALLS.append(("publish", [r["id"] for r in op.rows], op.param))
+        for row in op.rows:
+            op.repo.update(row["id"], {"status": "published"})
+
+    @operation("Feature", mode="SINGLE", confirm=False)
+    def feature(op):
+        return "alert('featured')"
+
+    @operation("Rebuild", mode="BUTTON", show=lambda user: user and user["account"] == "root")
+    def rebuild(op):
+        CALLS.append(("rebuild", op.rows, op.param))
+
+
+@erupt("Note", power={"delete": False})
+class Note:
+    id: int = Field(pk=True)
+    text: str = Field("Text")
+
+
+class NodeTest(unittest.TestCase):
+    repo_factory = staticmethod(lambda: MemoryRepository())
+
+    def setUp(self):
+        self.node = Node("blog", TOKEN, "http://server")
+        self.remote = {"add": True, "edit": True, "delete": True, "viewDetails": True, "export": True, "importable": True}
+        self.node._server_get = lambda path, params, headers: dict(self.remote)
+        self.node.register(Category, MemoryRepository([
+            {"name": "Tech", "parent": None}, {"name": "Python", "parent": 1}, {"name": "Life", "parent": None}]))
+        self.node.register(Article, self.repo_factory())
+        self.node.register(Note, MemoryRepository())
+        CALLS.clear()
+
+    def call(self, method, path, body=None, erupt="Article", headers=None, account="admin"):
+        raw = b"" if body is None else json.dumps(body).encode()
+        environ = {"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": "", "CONTENT_LENGTH": str(len(raw)),
+                   "wsgi.input": io.BytesIO(raw), "HTTP_ACCESS_TOKEN": TOKEN, "HTTP_TOKEN": "t1",
+                   "HTTP_USER": base64.b64encode(json.dumps({"uid": 1, "account": account}).encode()).decode()}
+        if erupt:
+            environ["HTTP_ERUPT"] = erupt
+        environ.update(headers or {})
+        out = {}
+        payload = b"".join(self.node(environ, lambda status, h: out.update(status=int(status.split()[0]))))
+        text = payload.decode()
+        return out["status"], (json.loads(text) if text and text[0] in "{[" else text)
+
+    def add(self, **row):
+        status, r = self.call("POST", "/erupt-api/data/modify/Article", row)
+        self.assertEqual(200, status)
+        self.assertTrue(r["success"], r)
+
+    def table(self, condition=(), sort=(), size=10):
+        status, page = self.call("POST", "/erupt-api/data/table/Article",
+                                 {"pageIndex": 1, "pageSize": size, "condition": list(condition), "sort": list(sort)})
+        self.assertEqual(200, status, page)
+        return page
+
+    def test_build(self):
+        status, build = self.call("GET", "/erupt-api/build/Article")
+        self.assertEqual(200, status)
+        model = build["eruptModel"]
+        self.assertEqual("Article", model["eruptName"])
+        fields = {f["fieldName"]: f for f in model["eruptFieldModels"]}
+        types = {k: f["eruptFieldJson"]["edit"]["type"] for k, f in fields.items()}
+        self.assertEqual({"id": "NUMBER", "title": "INPUT", "status": "CHOICE", "views": "NUMBER", "featured": "BOOLEAN",
+                          "publish_date": "DATE", "review_at": "DATE", "body": "TEXTAREA",
+                          "category": "REFERENCE_TABLE", "topic": "REFERENCE_TREE"}, types)
+        self.assertEqual("Category", fields["category"]["fieldReturnName"])
+        self.assertEqual({"dependField": "", "id": "id", "label": "name"}, fields["category"]["eruptFieldJson"]["edit"]["referenceTableType"])
+        self.assertEqual("name", fields["category"]["eruptFieldJson"]["views"][0]["column"])
+        self.assertEqual("parent", fields["topic"]["eruptFieldJson"]["edit"]["referenceTreeType"]["pid"])
+        ops = {o["code"]: o for o in model["eruptJson"]["rowOperation"]}
+        self.assertEqual(["publish", "feature"], list(ops))  # rebuild is hidden from admin
+        self.assertEqual("PublishForm", ops["publish"]["eruptClass"])
+        self.assertEqual("void", ops["feature"]["eruptClass"])
+        self.assertEqual("", ops["feature"]["callHint"])
+        self.assertEqual("SINGLE", ops["feature"]["mode"])
+        self.assertEqual(["publish"], list(build["operationErupts"]))
+        self.assertEqual(["note"], [f["fieldName"] for f in build["operationErupts"]["publish"]["eruptFieldModels"]])
+        self.assertEqual("DATE_TIME", fields["review_at"]["eruptFieldJson"]["edit"]["dateType"]["type"])
+        self.assertEqual("DATE", fields["publish_date"]["eruptFieldJson"]["views"][0]["type"])
+        self.assertEqual([], fields["body"]["eruptFieldJson"]["views"])
+        self.assertEqual(["draft", "published"], [v["value"] for v in fields["status"]["componentValue"]])
+        self.assertTrue(fields["title"]["eruptFieldJson"]["edit"]["notNull"])
+        self.assertFalse(build["power"]["export"])
+
+    def test_power_is_declared_and_server(self):
+        self.remote["add"] = False
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/modify/Article", {"title": "x"})[0])
+        _, build = self.call("GET", "/erupt-api/build/Note", erupt="Note")
+        self.assertFalse(build["power"]["delete"])
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/modify/Note/delete", [1], erupt="Note")[0])
+
+    def test_power_fails_closed(self):
+        def down(*args):
+            raise OSError("server down")
+        self.node._server_get = down
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/modify/Article", {"title": "x"})[0])
+
+    def test_guards(self):
+        self.assertEqual(403, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ORIGIN": "http://evil"})[0])
+        self.assertEqual(403, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ACCESS_TOKEN": "bad"})[0])
+        self.assertEqual(403, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ACCESS_TOKEN": ""})[0])
+        self.assertEqual(404, self.call("GET", "/erupt-api/build/Missing", erupt="Missing")[0])
+        self.assertEqual(404, self.call("GET", "/erupt-api/build/Article", erupt="Note")[0])
+        self.assertEqual(404, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ERUPTPARENT": "blog.Note"})[0])
+        self.assertEqual(200, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ERUPTPARENT": "blog.Article"})[0])
+        self.assertEqual((200, "blog"), self.call("GET", "/node-health", erupt=None, headers={"HTTP_ACCESS_TOKEN": ""}))
+
+    def test_crud(self):
+        self.add(title="Hello erupt", status="published", views=10, featured=True, publish_date="2026-01-05",
+                 review_at="2026-01-05 10:30:00", body="...")
+        self.add(title="Second", status="draft", views="3", featured=False, publish_date="2026-03-01")
+        page = self.table()
+        self.assertEqual(2, page["total"])
+        self.assertEqual(1, page["totalPage"])
+        first = next(r for r in page["list"] if r["title"] == "Hello erupt")
+        self.assertEqual("2026-01-05", first["publish_date"])
+        self.assertEqual("2026-01-05T10:30:00.000", first["review_at"])
+        self.assertEqual(10, first["views"])
+
+        self.assertEqual(["Hello erupt"], [r["title"] for r in self.table([{"key": "title", "expression": "LIKE", "value": "hello"}])["list"]])
+        self.assertEqual(["Second"], [r["title"] for r in self.table([{"key": "status", "expression": "EQ", "value": "draft"}])["list"]])
+        self.assertEqual(["Hello erupt"], [r["title"] for r in self.table([{"key": "featured", "expression": "EQ", "value": True}])["list"]])
+        ranged = self.table([{"key": "publish_date", "expression": "RANGE", "value": ["2026-02-01", "2026-12-31"]}])
+        self.assertEqual(["Second"], [r["title"] for r in ranged["list"]])
+        self.assertEqual(["Second", "Hello erupt"], [r["title"] for r in self.table(sort=[{"field": "views", "direction": "ASC"}])["list"]])
+
+        pk = first["id"]
+        status, row = self.call("GET", f"/erupt-api/data/Article/{pk}")
+        self.assertEqual("Hello erupt", row["title"])
+        _, r = self.call("POST", "/erupt-api/data/modify/Article/update", {**row, "title": "Renamed"})
+        self.assertTrue(r["success"], r)
+        self.assertEqual("Renamed", self.call("GET", f"/erupt-api/data/Article/{pk}")[1]["title"])
+        _, r = self.call("POST", "/erupt-api/data/modify/Article/delete", [pk])
+        self.assertTrue(r["success"])
+        self.assertEqual(1, self.table()["total"])
+
+    def test_reference(self):
+        status, build = self.call("GET", "/erupt-api/build/Article/category")
+        self.assertEqual(200, status)
+        self.assertEqual("Category", build["eruptModel"]["eruptName"])
+        self.assertEqual(404, self.call("GET", "/erupt-api/build/Article/title")[0])
+        _, page = self.call("POST", "/erupt-api/data/Article/reference-table/category",
+                            {"pageIndex": 1, "pageSize": 10, "condition": [{"key": "name", "expression": "LIKE", "value": "py"}]})
+        self.assertEqual([{"id": 2, "name": "Python", "parent": 1}], page["list"])
+        self.assertEqual(404, self.call("POST", "/erupt-api/data/Article/reference-table/topic", {})[0])
+
+        self.add(title="Ref", category={"id": "2", "name": "Python"}, topic={"id": 1, "name": "Tech"})
+        row = self.table()["list"][0]
+        self.assertEqual({"id": "2", "name": "Python"}, row["category"])
+        self.assertEqual("Python", row["category_name"])
+        self.assertEqual("Tech", row["topic_name"])
+        _, got = self.call("GET", f"/erupt-api/data/Article/{row['id']}")
+        self.assertEqual({"id": "2", "name": "Python"}, got["category"])
+        hit = self.table([{"key": "category", "expression": "EQ", "value": {"id": 2, "name": "Python"}}])
+        self.assertEqual(1, hit["total"])
+        miss = self.table([{"key": "category", "expression": "IN", "value": [{"id": 1}, {"id": 3}]}])
+        self.assertEqual(0, miss["total"])
+        _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "category", "expression": "LIKE", "value": "x"}]})
+        self.assertFalse(r["success"])
+
+    def test_reference_tree(self):
+        status, tree = self.call("GET", "/erupt-api/data/Article/reference-tree/topic")
+        self.assertEqual(200, status)
+        self.assertEqual(["Tech", "Life"], [n["label"] for n in tree])
+        self.assertEqual(["Python"], [n["label"] for n in tree[0]["children"]])
+        self.assertEqual(2, tree[0]["children"][0]["level"])
+        self.assertEqual(404, self.call("GET", "/erupt-api/data/Article/reference-tree/category")[0])
+
+    def test_operations(self):
+        self.add(title="A")
+        self.add(title="B")
+        ids = [r["id"] for r in self.table()["list"]]
+        path = "/erupt-api/data/Article/operator/"
+        _, r = self.call("POST", path + "publish", {"ids": ids, "param": {}})
+        self.assertFalse(r["success"])  # the form's required note is missing
+        _, r = self.call("POST", path + "publish", {"ids": ids, "param": {"note": "go"}})
+        self.assertTrue(r["success"], r)
+        self.assertEqual("Executed successfully", r["message"])
+        self.assertEqual([("publish", sorted(ids), {"note": "go"})], [(c[0], sorted(c[1]), c[2]) for c in CALLS])
+        self.assertEqual({"published"}, {r["status"] for r in self.table()["list"]})
+        _, r = self.call("POST", path + "feature", {"ids": ids, "param": None})
+        self.assertFalse(r["success"])  # SINGLE takes exactly one row
+        _, r = self.call("POST", path + "feature", {"ids": ids[:1], "param": None})
+        self.assertEqual("alert('featured')", r["data"])
+        _, r = self.call("POST", path + "publish", {"ids": [], "param": {"note": "go"}})
+        self.assertFalse(r["success"])
+        self.assertEqual(403, self.call("POST", path + "rebuild", {"ids": None, "param": None})[0])
+        _, r = self.call("POST", path + "rebuild", {"ids": None, "param": None}, account="root")
+        self.assertTrue(r["success"])
+        self.assertEqual(("rebuild", [], None), CALLS[-1])
+        self.assertEqual(404, self.call("POST", path + "missing", {})[0])
+        status, form = self.call("POST", path + "publish/form-value")
+        self.assertEqual((200, {"note": None}), (status, form))
+        self.assertEqual(404, self.call("POST", path + "feature/form-value")[0])
+
+    def test_default_order(self):
+        self.add(title="first")
+        self.add(title="second")
+        self.assertEqual(["second", "first"], [r["title"] for r in self.table()["list"]])
+        self.assertEqual(["first", "second"], [r["title"] for r in self.table(sort=[{"field": "title", "direction": "ASC"}])["list"]])
+
+    def test_build_matches_schema(self):
+        for name in ("Article", "Note"):
+            _, build = self.call("GET", f"/erupt-api/build/{name}", erupt=name)
+            models = [build["eruptModel"], *(build["operationErupts"] or {}).values()]
+            for model in models:
+                _schema.check("Erupt", model["eruptJson"], model["eruptName"], partial=False)
+                for op in model["eruptJson"]["rowOperation"]:
+                    _schema.check("RowOperation", op, f"{model['eruptName']}.{op['code']}", partial=False)
+                for f in model["eruptFieldModels"]:
+                    _schema.check("EruptField", f["eruptFieldJson"], f"{model['eruptName']}.{f['fieldName']}", partial=False)
+
+    def test_rejects_illegal_input(self):
+        _, r = self.call("POST", "/erupt-api/data/modify/Article", {"status": "draft"})
+        self.assertFalse(r["success"])
+        self.assertIn("Title", r["message"])
+        _, r = self.call("POST", "/erupt-api/data/modify/Article", {"title": "x", "status": "deleted"})
+        self.assertFalse(r["success"])
+        _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "views", "expression": "EQ", "value": 1}]})
+        self.assertFalse(r["success"])
+        _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title\" OR 1=1 --", "value": 1}]})
+        self.assertFalse(r["success"])
+        _, r = self.call("POST", "/erupt-api/data/table/Article", {"sort": [{"field": "body", "direction": "ASC"}]})
+        self.assertFalse(r["success"])
+        _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title", "expression": "DROP", "value": 1}]})
+        self.assertFalse(r["success"])
+
+
+class SqliteNodeTest(NodeTest):
+
+    def setUp(self):
+        self.db = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+        self.repo_factory = lambda: SqliteRepository(self.db, "article")
+        super().setUp()
+
+    def tearDown(self):
+        os.remove(self.db)
+
+    def test_like_escapes_wildcards(self):
+        self.add(title="100% pure")
+        self.add(title="100 points")
+        self.assertEqual(["100% pure"], [r["title"] for r in self.table([{"key": "title", "expression": "LIKE", "value": "100%"}])["list"]])
+
+
+class DeclarationTest(unittest.TestCase):
+
+    def declare(self, **attrs):
+        return type("Bad", (), {"id": Field(pk=True), **attrs})
+
+    def test_rejects_unknown_annotation_values(self):
+        cases = [
+            ({"title": Field("T", edit={"inputTyp": {"length": 9}})}, {}, "Edit has no attribute 'inputTyp'"),
+            ({"title": Field("T", view={"sortable": "yes"})}, {}, "expected boolean"),
+            ({"title": Field("T", type="INPUTT")}, {}, "is not a EditType"),
+            ({"title": Field("T", edit={"search": {"operator": "ABOUT"}})}, {}, "is not a QueryExpression"),
+            ({}, {"orderBy": "id"}, "Erupt has no attribute 'orderBy'"),
+            ({}, {"layout": {"pageSize": "10"}}, "expected integer"),
+            ({}, {"order_by": "missing desc"}, "illegal order_by"),
+        ]
+        for attrs, kwargs, message in cases:
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                erupt("Bad", **kwargs)(self.declare(**attrs))
+        with self.assertRaisesRegex(ValueError, "is not a RowOperationMode"):
+            operation("Go", mode="ALL")(lambda op: None)
+        with self.assertRaisesRegex(ValueError, "RowOperation has no attribute 'colour'"):
+            operation("Go", colour="red")(lambda op: None)
+
+    def test_raw_attributes_pass_through(self):
+        cls = erupt("Ok", layout={"pageSize": 30})(self.declare(title=Field("T", edit={"inputType": {"length": 9}})))
+        model = cls.__erupt__.build_erupt()
+        self.assertEqual(30, model["eruptJson"]["layout"]["pageSize"])
+        self.assertEqual(9, model["eruptFieldModels"][1]["eruptFieldJson"]["edit"]["inputType"]["length"])
+
+    def test_generated_types_are_current(self):
+        import importlib.util, pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location("gen_types", root / "tools" / "gen_types.py")
+        gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gen)
+        schema = json.loads((root / "src" / "erupt" / "_schema.json").read_text("utf-8"))
+        self.assertEqual(gen.generate(schema), (root / "src" / "erupt" / "_types.py").read_text("utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -2,9 +2,9 @@
 name = "erupt-sdk"
 version = "0.1.0"
 edition = "2021"
-# unverified: only the current stable toolchain is installed; the crate itself needs OnceLock (1.70) and
-# u64::div_ceil (1.73); the drivers behind features may need a newer toolchain
-rust-version = "1.73"
+# the default build (serde, serde_json, ctrlc, some of them edition 2024) is checked on 1.85 by the msrv job;
+# the database drivers behind features follow their own MSRV (1.88 at the time of writing)
+rust-version = "1.85"
 description = "Serve Rust models as erupt admin pages through an erupt cloud server"
 license = "Apache-2.0"
 repository = "https://github.com/erupt-io/erupt-sdk"

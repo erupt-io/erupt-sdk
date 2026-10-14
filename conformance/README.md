@@ -9,6 +9,7 @@ python conformance/run.py -- python3 python/examples/conformance.py
 (cd go && go build -o /tmp/erupt-go-conformance ./examples/conformance) && python conformance/run.py -- /tmp/erupt-go-conformance
 python conformance/run.py -- node ts/dist/examples/conformance.js
 python conformance/run.py -- php php/examples/conformance.php
+(cd rust && cargo build --release --example conformance) && python conformance/run.py -- rust/target/release/examples/conformance
 (cd dotnet && dotnet build -c Release) && python conformance/run.py -- dotnet dotnet/examples/Conformance/bin/Release/net8.0/Conformance.dll
 ```
 

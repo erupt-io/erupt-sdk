@@ -4,9 +4,9 @@ name: databases
 
 on:
   push:
-    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", ".github/workflows/databases.yml"]
+    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", "rust/**", ".github/workflows/databases.yml"]
   pull_request:
-    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", ".github/workflows/databases.yml"]
+    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", "rust/**", ".github/workflows/databases.yml"]
 
 permissions:
   contents: read
@@ -88,3 +88,7 @@ jobs:
         if: success() || failure()
         working-directory: dotnet
         run: dotnet test -c Release --filter "FullyQualifiedName~DatabaseTests" --logger "console;verbosity=normal"
+      - name: Rust
+        if: success() || failure()
+        working-directory: rust
+        run: cargo test --features postgres,mysql --test databases -- --nocapture

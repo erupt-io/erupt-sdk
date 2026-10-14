@@ -55,6 +55,7 @@ jobs:
           (cd ts && node tools/gen-types.mjs ../schema)
           (cd php && php tools/gen-types.php ../schema)
           (cd dotnet && dotnet run --project tools/GenTypes -- ../schema)
+          (cd rust && cargo run --bin gen-types -- ../schema)
           (cd python && PYTHONPATH=src python -m unittest discover -s tests)
       - name: Open a pull request
         run: |

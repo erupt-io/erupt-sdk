@@ -19,15 +19,15 @@ git tag python/v0.2.0 && git push origin python/v0.2.0
 | `rust/vX.Y.Z` | crates.io `erupt-sdk` | `rust/Cargo.toml`, `VERSION` in `rust/src/node.rs` |
 | `dotnet/vX.Y.Z` | NuGet `Erupt.Sdk` | `<Version>` in `dotnet/src/Erupt.Sdk/Erupt.Sdk.csproj`, `Version` in `dotnet/src/Erupt.Sdk/Node.cs` |
 | `ruby/vX.Y.Z` | RubyGems `erupt-sdk` | `VERSION` in `ruby/lib/erupt/version.rb` (the gemspec and the reported version read it) |
-| `jvm/vX.Y.Z` | Maven Central `xyz.erupt:erupt-sdk` | `<version>` in `jvm/pom.xml` (and `erupt-sdk.version` in `jvm/examples/pom.xml`), `VERSION` in `jvm/src/main/java/xyz/erupt/sdk/Node.java` |
 
-Spring Java nodes use `xyz.erupt:erupt-cloud-node`, which ships with erupt.
+Java nodes ship with erupt: `xyz.erupt:erupt-cloud-node` (Spring) and `xyz.erupt:erupt-cloud-node-lite` (no Spring;
+`-solon`, `-quarkus`, `-vertx`). Bump `erupt.version` in `jvm/examples/pom.xml` after an erupt release.
 
 ## One-time setup
 
 No registry token is stored in this repository. Publishing uses OpenID Connect trusted publishing, so each
 registry is told once that this repository's `release.yml` may publish the package. Each job runs in a
-GitHub environment of the same name (`pypi`, `npm`, `nuget`, `packagist`, `crates-io`, `rubygems`, `maven-central`); add required reviewers there to
+GitHub environment of the same name (`pypi`, `npm`, `nuget`, `packagist`, `crates-io`, `rubygems`); add required reviewers there to
 approve every release by hand.
 
 - **PyPI**: on pypi.org add a pending trusted publisher for project `erupt-sdk`: owner `erupt-io`,
@@ -49,9 +49,6 @@ approve every release by hand.
 - **RubyGems**: on rubygems.org add a pending trusted publisher for gem `erupt-sdk`: repository
   `erupt-io/erupt-sdk`, workflow `release.yml`, environment `rubygems`. A pre-release version is written
   `x.y.z.rc1` (no `-`).
-- **Maven Central**: Central Portal has no trusted publishing, so the `maven-central` environment holds a Portal user
-  token (`CENTRAL_TOKEN_USERNAME` / `CENTRAL_TOKEN_PASSWORD`, namespace `xyz.erupt`) and the signing key
-  (`MAVEN_GPG_PRIVATE_KEY`, `MAVEN_GPG_PASSPHRASE`).
 - **Go**: nothing; the module proxy picks the tag up.
 - **GitHub**: Settings → Actions → General → allow GitHub Actions to create pull requests (used by
   `sync-schema.yml`).

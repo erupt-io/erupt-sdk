@@ -4,9 +4,9 @@ Java needs no separate SDK: **`erupt-cloud-node`** is the reference implementati
 that the Python, Go and TypeScript SDKs in this repository follow. A Java service declares models with the
 regular erupt annotations and becomes a node by adding one dependency.
 
-**No Spring? Use [`jvm/`](../jvm).** `xyz.erupt:erupt-cloud-node` needs Spring Boot; `xyz.erupt:erupt-sdk`
-serves the same `@Erupt` / `@EruptField` classes from plain Java, Kotlin, Quarkus, Micronaut, Vert.x or Ktor on
-the JDK's HTTP server (or mounted in your own), with `erupt-annotation` as its only dependency.
+**No Spring? Use `xyz.erupt:erupt-cloud-node-lite`** ([`jvm/`](../jvm)), also released with erupt: the same
+`@Erupt` / `@EruptField` classes from plain Java, Kotlin, Solon (`-solon`), Quarkus (`-quarkus`) or Vert.x
+(`-vertx`), on the JDK's HTTP server or mounted in your own.
 
 ```xml
 <!-- with the JPA data layer (most services) -->

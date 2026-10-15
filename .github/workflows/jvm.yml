@@ -1,12 +1,19 @@
 name: jvm
 
+# The JVM node is erupt-cloud-node-lite in the erupt repository; here only its examples and the conformance
+# suite run, against the erupt branch / tag given (develop by default).
 on:
   # also run by release.yml before anything is published
   workflow_call:
+  workflow_dispatch:
+    inputs:
+      erupt-ref:
+        description: branch or tag of erupts/erupt to build erupt-cloud-node-lite from
+        default: develop
   push:
-    paths: ["jvm/**", "conformance/**", ".github/workflows/jvm.yml"]
+    paths: ["jvm/**", "schema/**", "conformance/**", ".github/workflows/jvm.yml"]
   pull_request:
-    paths: ["jvm/**", "conformance/**", ".github/workflows/jvm.yml"]
+    paths: ["jvm/**", "schema/**", "conformance/**", ".github/workflows/jvm.yml"]
 
 permissions:
   contents: read
@@ -17,26 +24,25 @@ jobs:
     strategy:
       matrix:
         java: ["17", "21", "25"]
-    defaults:
-      run:
-        working-directory: jvm
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: erupts/erupt
+          ref: ${{ inputs.erupt-ref || 'develop' }}
+          path: erupt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
-      # the build JSON comes from erupt-annotation itself: no generated code to check against schema/
-      - name: Unit tests
-        run: mvn -B verify
+      - name: erupt-cloud-node-lite
+        working-directory: erupt
+        run: mvn -B -q install -pl erupt-cloud/erupt-cloud-node-lite -am -DskipTests
       - name: Examples (Java conformance fixture, Kotlin blog)
-        run: |
-          mvn -B -q install -DskipTests
-          mvn -B -f examples/pom.xml package
+        run: mvn -B -f jvm/examples/pom.xml package -Derupt.version="$(mvn -q -f erupt/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Conformance
-        working-directory: .
         run: python conformance/run.py -- java -jar jvm/examples/conformance/target/erupt-conformance.jar

@@ -60,7 +60,7 @@ jobs:
           (cd dotnet && dotnet run --project tools/GenTypes -- ../schema)
           (cd rust && cargo run --bin gen-types -- ../schema)
           (cd ruby && ruby tools/gen_types.rb ../schema)
-          # jvm/ declares models with erupt-annotation itself: nothing to generate, bump erupt.version instead
+          # jvm/ is erupt-cloud-node-lite in the erupt repository, built from erupt-annotation itself: nothing to generate
           (cd python && PYTHONPATH=src python -m unittest discover -s tests)
       - name: Open a pull request
         run: |

@@ -28,8 +28,10 @@ final class Model
     public readonly array $power;
     /** @var list<array{0: string, 1: bool}> default sort, [field, descending] */
     public readonly array $orderBy;
-    /** @var array<string, FieldSpec> in declaration order */
+    /** @var array<string, FieldSpec> stored and served, in declaration order */
     public readonly array $fields;
+    /** @var list<FieldSpec> every field in order, virtual ones included, for the build */
+    public readonly array $declared;
     /** @var array<string, OperationSpec> */
     public readonly array $operations;
     private readonly array $raw;
@@ -71,14 +73,18 @@ final class Model
         }
         $this->power = array_merge($defaults, $decl->power);
 
-        $fields = [];
+        $fields = $declared = [];
         foreach ($class->getProperties() as $property) {
             $field = $property->getAttributes(Field::class)[0] ?? null;
             if ($field !== null) {
-                $fields[$property->getName()] = $this->field($property, $field->newInstance());
+                $declared[] = $spec = $this->field($property, $field->newInstance());
+                if (!$spec->decl->virtual) {
+                    $fields[$property->getName()] = $spec;
+                }
             }
         }
         $this->fields = $fields;
+        $this->declared = $declared;
         $pks = array_keys(array_filter($fields, fn(FieldSpec $f) => $f->isPk()));
         if (count($pks) > 1) {
             throw new \InvalidArgumentException("$this->name: at most one #[Field(pk: true)]");
@@ -132,7 +138,7 @@ final class Model
         $type = match (true) {
             $decl->ref !== null => $decl->tree !== null ? 'REFERENCE_TREE' : 'REFERENCE_TABLE',
             $decl->type !== null => $decl->type,
-            $decl->choices !== null => 'CHOICE',
+            $decl->choices !== null && $hint !== 'array' => 'CHOICE',
             $hint === 'bool' => 'BOOLEAN',
             $hint === 'int', $hint === 'float' => 'NUMBER',
             $hint !== null && is_a($hint, \DateTimeInterface::class, true) => 'DATE_TIME',
@@ -141,7 +147,12 @@ final class Model
         if (!isset(Schema::defaults()['fields'][$type])) {
             throw new \InvalidArgumentException("$path: edit type $type is not supported yet");
         }
-        $spec = new FieldSpec($name, $decl, $type);
+        $json = $decl->ref === null ? match ($hint) {
+            'array' => FieldSpec::JSON_ARRAY,
+            'object', \stdClass::class => FieldSpec::JSON_OBJECT,
+            default => null,
+        } : null;
+        $spec = new FieldSpec($name, $decl, $type, $json);
         if ($spec->isReference()) {
             $target = Model::of($decl->ref);
             if ($target->pk === null) {
@@ -179,7 +190,7 @@ final class Model
         return [
             'eruptName' => $this->name,
             'eruptJson' => self::merge($erupt, $this->raw),
-            'eruptFieldModels' => array_values(array_map(fn(FieldSpec $f) => $f->build(), $this->fields)),
+            'eruptFieldModels' => array_map(fn(FieldSpec $f) => $f->build(), $this->declared),
             'searchCondition' => new \stdClass(),
             'extraRow' => false,
             'tags' => new \stdClass(),

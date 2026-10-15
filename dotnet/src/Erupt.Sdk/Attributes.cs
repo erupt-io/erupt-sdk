@@ -53,6 +53,12 @@ public sealed class FieldAttribute(string title = "") : Attribute
     /// <summary>Shown in the add / edit form.</summary>
     public bool Form { get; set; } = true;
 
+    /// <summary>
+    /// In the build only, like a JPA <c>@Transient</c> field: a layout field (DIVIDE, CALLOUT, EMPTY, GROUP by a raw
+    /// edit type) that has no column and is never read or written.
+    /// </summary>
+    public bool Virtual { get; set; }
+
     /// <summary>The referenced model, for a property that holds a primary key (e.g. <c>long?</c>).</summary>
     public Type? Ref { get; set; }
 

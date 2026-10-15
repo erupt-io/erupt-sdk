@@ -31,6 +31,8 @@ type field struct {
 	name, title, typ              string
 	pk, search, notNull, sortable bool
 	table, form                   bool
+	virtual                       bool // declared in the build only: no column, never read or written
+	json                          bool // a slice or map: a JSON value, stored as JSON text by SQL repositories
 	choices                       []choice
 	ref, label, tree              string
 	target                        *Model
@@ -38,6 +40,17 @@ type field struct {
 }
 
 func (f *field) isReference() bool { return f.typ == typeReferenceTable || f.typ == typeReferenceTree }
+
+// stored lists the fields a repository keeps, in declaration order: every field but the virtual ones.
+func (m *Model) stored() []*field {
+	fields := make([]*field, 0, len(m.fields))
+	for _, f := range m.fields {
+		if !f.virtual {
+			fields = append(fields, f)
+		}
+	}
+	return fields
+}
 
 // Model is a declared erupt model: the struct it was declared from only describes it, records travel as
 // Record maps keyed by field name.
@@ -126,10 +139,12 @@ func WithOperations(ops ...Operation) ModelOption {
 //	pk                    the primary key
 //	title=Title           column and form label
 //	search, notNull, sortable, hideTable, hideForm
+//	virtual               in the build only (DIVIDE, CALLOUT, EMPTY, GROUP): no column, never read or written
 //	type=TEXTAREA         an EditType; otherwise inferred from the Go type
 //	choices=a:A,b:B       a CHOICE field
 //	ref=Category          references a record of another model (registered first); label=name, tree=parent
 //
+// A slice or map field (MULTI_CHOICE, KEY_VALUE) holds a JSON value, kept as JSON text by SQL repositories.
 // The field name is the json tag name, else the Go field name. Every raw attribute is checked against the
 // erupt annotation schema here, so a misspelt key fails at declaration instead of in the browser.
 func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error) {
@@ -251,6 +266,8 @@ func parseField(model string, sf reflect.StructField, tag string) (*field, error
 			f.table = false
 		case "hideForm":
 			f.form = false
+		case "virtual":
+			f.virtual = true
 		case "type":
 			if err := checkEnum(EditTypeValues, value, "EditType", path+".type"); err != nil {
 				return nil, err
@@ -279,6 +296,17 @@ func parseField(model string, sf reflect.StructField, tag string) (*field, error
 		return f, nil
 	}
 	f.typ = resolveType(f, sf.Type)
+	ft := sf.Type
+	for ft.Kind() == reflect.Pointer {
+		ft = ft.Elem()
+	}
+	f.json = ft.Kind() == reflect.Map || (ft.Kind() == reflect.Slice && ft.Elem().Kind() != reflect.Uint8)
+	if f.virtual && (f.search || f.sortable || f.notNull) {
+		return nil, fmt.Errorf("%s: a virtual field cannot be searched, sorted or required", path)
+	}
+	if f.json && (f.search || f.sortable) {
+		return nil, fmt.Errorf("%s: a JSON field cannot be searched or sorted", path)
+	}
 	if _, ok := defaults.Fields[f.typ]; !ok {
 		return nil, fmt.Errorf("%s: edit type %s is not supported yet", path, f.typ)
 	}
@@ -425,7 +453,7 @@ func (f *field) build() map[string]any {
 	if !f.table {
 		efj["views"] = []any{}
 	}
-	if f.typ == "CHOICE" {
+	if len(f.choices) > 0 { // a CHOICE, or a MULTI_CHOICE by raw edit: the options travel as componentValue
 		options := make([]any, len(f.choices))
 		for i, c := range f.choices {
 			options[i] = M{"value": c.value, "label": c.label, "desc": nil, "color": nil, "disable": false}
@@ -485,6 +513,13 @@ func (f *field) coerce(v any) (any, error) {
 	}
 	if v == nil || v == "" {
 		return nil, nil
+	}
+	if f.json {
+		switch v.(type) {
+		case []any, map[string]any:
+			return v, nil
+		}
+		return nil, fmt.Errorf("illegal value '%s'", str(v))
 	}
 	switch {
 	case f.pk:

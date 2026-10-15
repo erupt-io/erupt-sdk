@@ -57,6 +57,8 @@ export interface FieldOptions {
   view?: View;
   /** raw @Edit attributes, checked against the schema */
   edit?: Edit;
+  /** a form-only element (DIVIDE, CALLOUT, EMPTY, GROUP): in the build, never read or written */
+  virtual?: boolean;
 }
 
 export interface RefOptions extends FieldOptions {
@@ -69,6 +71,8 @@ export interface RefOptions extends FieldOptions {
 /** One column. Create it with the `field.*` factories. */
 export class Field {
   name = "";
+  /** holds a JSON value (MULTI_CHOICE array, KEY_VALUE object): SQL repositories store it as JSON text */
+  json = false;
 
   constructor(
     readonly title: string,
@@ -101,6 +105,10 @@ export class Field {
     return this.options.form !== false;
   }
 
+  get virtual(): boolean {
+    return !!this.options.virtual;
+  }
+
   get isReference(): boolean {
     return REFERENCES.includes(this.type!);
   }
@@ -130,7 +138,7 @@ export class Field {
     merge(edit, (this.options.edit ?? {}) as Json);
     merge(view, (this.options.view ?? {}) as Json);
     if (this.options.table === false) efj.views = [];
-    if (this.type === "CHOICE") {
+    if (this.choices) { // CHOICE, or MULTI_CHOICE over a JSON array
       tpl.componentValue = Object.entries(this.choices ?? {}).map(([value, label]) =>
         ({ value: String(value), label, desc: null, color: null, disable: false }));
     }
@@ -147,6 +155,14 @@ export class Field {
     }
     if (value === null || value === undefined || value === "") return null;
     if (this.pk) return toInteger(value);
+    if (this.json) {
+      const json = typeof value === "string" ? JSON.parse(value) : value;
+      if (typeof json !== "object" || json === null) throw new Error("must be a JSON array or object");
+      if (this.choices && Array.isArray(json) && !json.every((v) => String(v) in this.choices!)) {
+        throw new Error(`illegal option in ${JSON.stringify(json)}`);
+      }
+      return json;
+    }
     switch (this.type) {
       case "BOOLEAN":
         return typeof value === "boolean" ? value : ["true", "1"].includes(String(value).toLowerCase());
@@ -236,6 +252,15 @@ export const field = {
   /** a select over `{value: label}` */
   choice: (title: string, choices: Record<string, string>, options?: FieldOptions) =>
     new Field(title, "CHOICE", options, { ...choices }),
+  /**
+   * a JSON value: an array (MULTI_CHOICE, its options in `choices`) or an object (KEY_VALUE); set the edit
+   * type in `options.edit`
+   */
+  json: (title: string, options?: FieldOptions, choices?: Record<string, string>) => {
+    const f = new Field(title, "INPUT", options, choices ? { ...choices } : null);
+    f.json = true;
+    return f;
+  },
   /** a record of `target`: the repository stores its primary key, the UI shows `label` */
   ref: (target: Model, title: string, options: RefOptions = {}) =>
     new Field(title, options.tree ? "REFERENCE_TREE" : "REFERENCE_TABLE", options, null, target,
@@ -329,7 +354,10 @@ export interface ModelOptions {
 }
 
 export class Model {
+  /** stored and served */
   readonly fields: Record<string, Field> = {};
+  /** every field in order, virtual ones included, for the build */
+  readonly declared: Field[] = [];
   readonly operations: Record<string, Operation> = {};
   readonly power: Power;
   /** null: only usable as an operation form */
@@ -350,7 +378,8 @@ export class Model {
       check("View", f.options.view ?? {}, `${path}.view`);
       check("Edit", f.options.edit ?? {}, `${path}.edit`);
       if (f.isReference) this.checkReference(f);
-      this.fields[attr] = f;
+      this.declared.push(f);
+      if (!f.virtual) this.fields[attr] = f;
     }
     for (const [key, op] of Object.entries(options.operations ?? {})) {
       if (!(op instanceof Operation)) throw new Error(`${name}.${key}: not an operation`);
@@ -393,7 +422,7 @@ export class Model {
     return {
       eruptName: this.name,
       eruptJson,
-      eruptFieldModels: Object.values(this.fields).map((f) => f.build()),
+      eruptFieldModels: this.declared.map((f) => f.build()),
       searchCondition: {},
       extraRow: false,
       tags: {},

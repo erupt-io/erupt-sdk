@@ -60,8 +60,19 @@ class Note:
     text: str = Field("Text")
 
 
+@erupt("Widget")
+class Widget:
+    id: int = Field(pk=True)
+    name: str = Field("Name")
+    basic = Field("Basic", type="INPUT", edit={"type": "DIVIDE"}, virtual=True)
+    roles: list = Field("Roles", search=True, choices={"ADMIN": "Admin", "USER": "User", "GUEST": "Guest"},
+                        edit={"type": "MULTI_CHOICE"})
+    attrs: dict = Field("Attributes", edit={"type": "KEY_VALUE"})
+
+
 class NodeTest(unittest.TestCase):
     repo_factory = staticmethod(lambda: MemoryRepository())
+    widget_factory = staticmethod(lambda: MemoryRepository())
 
     def setUp(self):
         self.node = Node("blog", TOKEN, "http://server")
@@ -71,6 +82,7 @@ class NodeTest(unittest.TestCase):
             {"name": "Tech", "parent": None}, {"name": "Python", "parent": 1}, {"name": "Life", "parent": None}]))
         self.node.register(Article, self.repo_factory())
         self.node.register(Note, MemoryRepository())
+        self.node.register(Widget, self.widget_factory())
         CALLS.clear()
 
     def call(self, method, path, body=None, erupt="Article", headers=None, account="admin"):
@@ -124,7 +136,8 @@ class NodeTest(unittest.TestCase):
         self.assertEqual([], fields["body"]["eruptFieldJson"]["views"])
         self.assertEqual(["draft", "published"], [v["value"] for v in fields["status"]["componentValue"]])
         self.assertTrue(fields["title"]["eruptFieldJson"]["edit"]["notNull"])
-        self.assertFalse(build["power"]["export"])
+        self.assertTrue(build["power"]["export"])  # Excel is done by the server
+        self.assertFalse(build["power"]["cellEdit"])
 
     def test_power_is_declared_and_server(self):
         self.remote["add"] = False
@@ -177,6 +190,28 @@ class NodeTest(unittest.TestCase):
         _, r = self.call("POST", "/erupt-api/data/modify/Article/delete", [pk])
         self.assertTrue(r["success"])
         self.assertEqual(1, self.table()["total"])
+
+    def test_virtual_and_json_fields(self):
+        _, build = self.call("GET", "/erupt-api/build/Widget", erupt="Widget")
+        fields = {f["fieldName"]: f["eruptFieldJson"]["edit"]["type"] for f in build["eruptModel"]["eruptFieldModels"]}
+        self.assertEqual({"id": "NUMBER", "name": "INPUT", "basic": "DIVIDE", "roles": "MULTI_CHOICE", "attrs": "KEY_VALUE"}, fields)
+        for row in ({"name": "A", "roles": ["ADMIN", "USER"], "attrs": {"env": "prod"}, "basic": "ignored"},
+                    {"name": "B", "roles": ["GUEST"], "attrs": {}}):
+            _, r = self.call("POST", "/erupt-api/data/modify/Widget", row, erupt="Widget")
+            self.assertTrue(r["success"], r)
+        _, page = self.call("POST", "/erupt-api/data/table/Widget", {"pageIndex": 1, "pageSize": 10}, erupt="Widget")
+        a = next(r for r in page["list"] if r["name"] == "A")
+        self.assertEqual((["ADMIN", "USER"], {"env": "prod"}), (a["roles"], a["attrs"]))
+        self.assertNotIn("basic", a)
+        _, r = self.call("POST", "/erupt-api/data/modify/Widget", {"name": "C", "roles": ["ROOT"]}, erupt="Widget")
+        self.assertFalse(r["success"])
+        self.assertEqual(["Admin", "User", "Guest"], [o["label"] for o in next(
+            f for f in build["eruptModel"]["eruptFieldModels"] if f["fieldName"] == "roles")["componentValue"]])
+        _, page = self.call("POST", "/erupt-api/data/table/Widget", {"condition": [{"key": "roles", "expression": "IN", "value": ["GUEST"]}]},
+                            erupt="Widget")
+        self.assertEqual(["B"], [r["name"] for r in page["list"]])
+        _, r = self.call("GET", f"/erupt-api/data/Widget/{a['id']}", erupt="Widget")
+        self.assertEqual(["ADMIN", "USER"], r["roles"])
 
     def test_reference(self):
         status, build = self.call("GET", "/erupt-api/build/Article/category")
@@ -270,6 +305,7 @@ class SqliteNodeTest(NodeTest):
     def setUp(self):
         self.db = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
         self.repo_factory = lambda: SqliteRepository(self.db, "article")
+        self.widget_factory = lambda: SqliteRepository(self.db, "widget")
         super().setUp()
 
     def tearDown(self):

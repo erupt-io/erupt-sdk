@@ -12,7 +12,7 @@ final class Node
     public const VERSION = '0.1.0';
 
     // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-    private const UNSUPPORTED_POWER = ['export' => false, 'importable' => false, 'cellEdit' => false, 'print' => false, 'ai' => false];
+    private const UNSUPPORTED_POWER = ['cellEdit' => false, 'print' => false, 'ai' => false];
 
     // Rights the server decides per user; the node ANDs them onto the declared power
     private const SERVER_POWER = ['add', 'edit', 'delete', 'viewDetails', 'export', 'importable'];
@@ -242,7 +242,7 @@ final class Node
         $pageSize = min(max((int) (($body['pageSize'] ?? null) ?: 10), 1), self::MAX_PAGE_SIZE);
         $query = new Query([], [], ($pageIndex - 1) * $pageSize, $pageSize);
         foreach ((array) ($body['condition'] ?? []) as $c) {
-            $query->conditions[] = $this->condition($model, is_array($c) ? $c : []);
+            array_push($query->conditions, ...$this->conditions($model, is_array($c) ? $c : []));
         }
         foreach ((array) ($body['sort'] ?? []) as $s) {
             $f = is_array($s) && is_string($s['field'] ?? null) ? ($model->fields[$s['field']] ?? null) : null;
@@ -260,7 +260,8 @@ final class Node
             'sort' => null, 'alert' => null, 'extraContent' => null];
     }
 
-    private function condition(Model $model, array $c): Cond
+    /** @return list<Cond> */
+    private function conditions(Model $model, array $c): array
     {
         $key = $c['key'] ?? null;
         $f = is_string($key) ? ($model->fields[$key] ?? null) : null;
@@ -272,6 +273,20 @@ final class Node
             throw new Fail("illegal operator '" . (is_scalar($op) ? $op : json_encode($op)) . "'");
         }
         $value = $c['value'] ?? null;
+        if ($f->json === null) {
+            return [$this->condition($f, $op, $value)];
+        }
+        // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+        if (!in_array($op, ['EQ', 'IN', 'NEQ', 'NOT_IN'], true)) {
+            throw new Fail("illegal operator '$op' for {$f->decl->title}");
+        }
+        $like = in_array($op, ['EQ', 'IN'], true) ? 'LIKE' : 'NOT_LIKE';
+        $values = is_array($value) && array_is_list($value) ? $value : [$value];
+        return array_map(fn($v) => new Cond($f->name, $like, json_encode(is_scalar($v) ? (string) $v : json_encode($v))), $values);
+    }
+
+    private function condition(FieldSpec $f, string $op, mixed $value): Cond
+    {
         if ($op === 'NULL' || $op === 'NOT_NULL') {
             return new Cond($f->name, $op);
         }

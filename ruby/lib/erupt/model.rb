@@ -86,11 +86,18 @@ module Erupt
   # A field whose kind is another model class references one of its records: the repository stores the
   # referenced primary key, the UI shows +label+. +tree+ names the referenced model's parent field and turns
   # the picker into a tree.
+  #
+  # A field of kind Array or Hash holds a JSON value (MULTI_CHOICE, KEY_VALUE): stored as JSON text by SQL
+  # repositories, served as JSON. +virtual: true+ declares a form-only element (DIVIDE, CALLOUT, EMPTY, GROUP)
+  # that is in the build but never read or written.
   class Field
     attr_reader :name, :title, :type, :choices, :label, :tree, :ref
 
     def initialize(name, title = "", kind = nil, type: nil, pk: false, search: false, not_null: false, sortable: false,
-                   table: true, form: true, choices: nil, ref: nil, label: :name, tree: nil, view: {}, edit: {})
+                   table: true, form: true, choices: nil, ref: nil, label: :name, tree: nil, view: {}, edit: {},
+                   virtual: false)
+      @json, @virtual = [Array, Hash].include?(kind), virtual
+      kind = String if @json
       @name, @title, @pk, @search, @not_null = name.to_s, title, pk, search, not_null
       @sortable, @table, @form = sortable, table, form
       @choices = choices&.to_h { |k, v| [k.to_s, v.to_s] }
@@ -109,7 +116,7 @@ module Erupt
       check_reference(path) if reference?
     end
 
-    %i[pk search not_null sortable table form].each { |flag| define_method(:"#{flag}?") { instance_variable_get(:"@#{flag}") } }
+    %i[pk search not_null sortable table form json virtual].each { |flag| define_method(:"#{flag}?") { instance_variable_get(:"@#{flag}") } }
 
     def reference? = REFERENCES.include?(@type)
 
@@ -138,7 +145,7 @@ module Erupt
       Erupt.merge!(edit, @edit)
       Erupt.merge!(view, @view)
       tpl["eruptFieldJson"]["views"] = [] unless table?
-      if @type == EditType::CHOICE
+      if @choices # CHOICE, or MULTI_CHOICE over an Array
         tpl["componentValue"] = @choices.to_a.map do |value, label|
           { "value" => value, "label" => label, "desc" => nil, "color" => nil, "disable" => false }
         end
@@ -155,6 +162,7 @@ module Erupt
       end
       return nil if value.nil? || value == ""
       return integer(value) if pk?
+      return json(value) if json?
 
       case @type
       when EditType::BOOLEAN then [true, false].include?(value) ? value : %w[true 1].include?(value.to_s.downcase)
@@ -170,6 +178,14 @@ module Erupt
     end
 
     private
+
+    def json(value)
+      value = JSON.parse(value) if value.is_a?(String)
+      raise ArgumentError, "must be a JSON array or object" unless value.is_a?(Array) || value.is_a?(Hash)
+      raise ArgumentError, "illegal option in #{value}" if @choices && value.is_a?(Array) && !(value.map(&:to_s) - @choices.keys).empty?
+
+      value
+    end
 
     def integer(value)
       value.is_a?(String) ? Integer(value.strip, 10) : Integer(value)
@@ -235,12 +251,13 @@ module Erupt
 
   # What +extend Erupt::Model+ declares about a class.
   class ModelSpec
-    attr_reader :cls, :name, :title, :power, :fields, :operations
+    # fields: stored and served; declared: all of them in order, virtual ones included, for the build
+    attr_reader :cls, :name, :title, :power, :fields, :declared, :operations
 
     def initialize(cls)
       @cls, @name = cls, cls.name&.split("::")&.last
       @title, @power, @raw, @order_by = @name, DEFAULTS["power"].dup, {}, nil
-      @fields, @operations = {}, {}
+      @fields, @declared, @operations = {}, [], {}
     end
 
     def configure(title, name, power, order_by, raw)
@@ -252,10 +269,11 @@ module Erupt
     end
 
     def add_field(field)
-      raise ArgumentError, "#{@name}: field '#{field.name}' declared twice" if @fields.key?(field.name)
+      raise ArgumentError, "#{@name}: field '#{field.name}' declared twice" if @declared.any? { |f| f.name == field.name }
       raise ArgumentError, "#{@name}: at most one primary key" if field.pk? && pk
 
-      @fields[field.name] = field
+      @declared << field
+      @fields[field.name] = field unless field.virtual?
     end
 
     def add_operation(op)
@@ -291,7 +309,7 @@ module Erupt
       erupt = Erupt.merge!(Erupt.deep_dup(DEFAULTS["erupt"]), "primaryKeyCol" => pk || "id")
       erupt["rowOperation"] = operations.map(&:build)
       Erupt.merge!(erupt, @raw)
-      { "eruptName" => @name, "eruptJson" => erupt, "eruptFieldModels" => @fields.values.map(&:build),
+      { "eruptName" => @name, "eruptJson" => erupt, "eruptFieldModels" => @declared.map(&:build),
         "searchCondition" => {}, "extraRow" => false, "tags" => {} }
     end
 

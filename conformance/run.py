@@ -249,7 +249,7 @@ def build(n):
     eq("item.status !== 'published'", ops["publish"]["ifExpr"], "ifExpr")
     eq(["publish"], list(b["operationErupts"] or {}), "operationErupts")
     eq(["note"], [x["fieldName"] for x in b["operationErupts"]["publish"]["eruptFieldModels"]], "form fields")
-    eq(False, b["power"]["export"], "unsupported export hidden")
+    eq((True, False), (b["power"]["export"], b["power"]["cellEdit"]), "export passes (Excel is the server's), unsupported cellEdit hidden")
     eq(True, b["power"]["add"], "add")
     status, b = n.call("GET", "/erupt-api/build/Article", account="root")
     eq(["publish", "feature", "rebuild"], [o["code"] for o in b["eruptModel"]["eruptJson"]["rowOperation"]], "operations visible to root")

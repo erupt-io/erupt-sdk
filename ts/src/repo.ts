@@ -40,7 +40,8 @@ function match(value: unknown, cond: Cond): boolean {
   if (cond.op === "NULL") return value == null;
   if (cond.op === "NOT_NULL") return value != null;
   if (value == null) return false;
-  const v = value as Comparable;
+  // a JSON value is matched as its text
+  const v = (typeof value === "object" && !(value instanceof Date) ? JSON.stringify(value) : value) as Comparable;
   switch (cond.op) {
     case "EQ":
       return v === expect;
@@ -309,6 +310,8 @@ export class SqlRepository implements Repository {
       const value = row[f.name];
       if (value == null) {
         record[f.name] = null;
+      } else if (f.json) {
+        record[f.name] = typeof value === "string" ? JSON.parse(value) : value;
       } else if (f.type === "BOOLEAN") {
         record[f.name] = typeof value === "string" ? value === "1" || value === "true" : !!Number(value);
       } else if (f.type === "DATE" || f.type === "DATE_TIME") {
@@ -346,9 +349,15 @@ export class SqlRepository implements Repository {
     return row ? this.record(row) : null;
   }
 
+  /** The columns of a record, a JSON value as its text. */
+  private entries(record: EruptRecord): [string, unknown][] {
+    return Object.entries(record).filter(([k]) => k !== this.model.pk)
+      .map(([k, v]) => [k, this.model.fields[k]?.json && v != null ? JSON.stringify(v) : v]);
+  }
+
   async add(record: EruptRecord): Promise<void> {
     await this.ready;
-    const entries = Object.entries(record).filter(([k]) => k !== this.model.pk);
+    const entries = this.entries(record);
     const p = new Params(this.options.dialect);
     const values = entries.map(([, v]) => p.add(v));
     await this.executor.execute(
@@ -357,7 +366,7 @@ export class SqlRepository implements Repository {
 
   async update(pk: unknown, record: EruptRecord): Promise<void> {
     await this.ready;
-    const entries = Object.entries(record).filter(([k]) => k !== this.model.pk);
+    const entries = this.entries(record);
     if (!entries.length) return;
     const p = new Params(this.options.dialect);
     const sets = entries.map(([k, v]) => `${this.q(k)} = ${p.add(v)}`);

@@ -22,6 +22,9 @@ public partial class EruptModel
 
     internal Dictionary<string, FieldDef> FieldMap { get; } = [];
 
+    /// <summary>The fields a repository keeps, in declaration order: every field but the virtual ones.</summary>
+    internal IEnumerable<FieldDef> Stored => Fields.Where(f => !f.Virtual);
+
     /// <summary>The primary key field; null for a model that only serves as an operation form.</summary>
     internal string? Pk { get; }
 

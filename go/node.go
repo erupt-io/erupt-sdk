@@ -79,7 +79,7 @@ type cachedPower struct {
 }
 
 // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there.
-var unsupportedPower = map[string]bool{"export": false, "importable": false, "cellEdit": false, "print": false, "ai": false}
+var unsupportedPower = map[string]bool{"cellEdit": false, "print": false, "ai": false}
 
 // Rights the server decides per user; the node ANDs them onto the declared power.
 var serverPower = []string{"add", "edit", "delete", "viewDetails", "export", "importable"}
@@ -518,7 +518,7 @@ func (n *Node) initValue(q *request) (any, error) {
 
 func emptyRow(m *Model) M {
 	row := M{}
-	for _, f := range m.fields {
+	for _, f := range m.stored() {
 		row[f.name] = nil
 	}
 	return row
@@ -624,7 +624,7 @@ func (n *Node) rows(_ context.Context, m *Model, records []Record) ([]M, error) 
 	rows := make([]M, len(records))
 	for i, record := range records {
 		row := M{}
-		for _, f := range m.fields {
+		for _, f := range m.stored() {
 			row[f.name] = f.jsonValue(record[f.name])
 		}
 		rows[i] = row
@@ -717,7 +717,7 @@ func primaryKey(m *Model, v any) (any, error) {
 // toRecord coerces and checks the form fields of a body.
 func toRecord(m *Model, body map[string]any) (Record, error) {
 	record := Record{}
-	for _, f := range m.fields {
+	for _, f := range m.stored() {
 		if f.pk || !f.form {
 			continue
 		}

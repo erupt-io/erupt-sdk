@@ -17,7 +17,7 @@ module Erupt
   # mounted in Rails / Sinatra / any Rack server, or served on its own with +serve+.
   class Node
     # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-    UNSUPPORTED_POWER = { "export" => false, "importable" => false, "cellEdit" => false, "print" => false, "ai" => false }.freeze
+    UNSUPPORTED_POWER = { "cellEdit" => false, "print" => false, "ai" => false }.freeze
     # Rights the server decides per user; the node ANDs them onto the declared power
     SERVER_POWER = %w[add edit delete viewDetails export importable].freeze
     OPS = %w[EQ NEQ GT GTE LT LTE LIKE NOT_LIKE RANGE IN NOT_IN NULL NOT_NULL].freeze
@@ -215,7 +215,7 @@ module Erupt
       page_index = [int(body["pageIndex"] || 1), 1].max
       page_size = int(body["pageSize"] || 10).clamp(1, MAX_PAGE_SIZE)
       query = Query.new(offset: (page_index - 1) * page_size, limit: page_size)
-      Array(body["condition"]).each { |c| query.conditions << condition(model, c) }
+      Array(body["condition"]).each { |c| query.conditions.concat(conditions(model, c)) }
       Array(body["sort"]).each do |s|
         f = s.is_a?(Hash) && model.fields[s["field"]]
         raise Fail, "illegal sort field '#{s["field"] if s.is_a?(Hash)}'" unless f && (f.sortable? || f.pk?)
@@ -228,17 +228,25 @@ module Erupt
         "list" => rows(model, records), "sort" => nil, "alert" => nil, "extraContent" => nil }
     end
 
-    def condition(model, c)
+    def conditions(model, c)
       c = {} unless c.is_a?(Hash)
       f = model.fields[c["key"]]
       raise Fail, "illegal search field '#{c["key"]}'" if f.nil? || f.pk? || !f.search?
 
       op = c["expression"] || "EQ"
       raise Fail, "illegal operator '#{op}'" unless OPS.include?(op)
+      return [condition(f, op, c["value"])] unless f.json?
+      # a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+      raise Fail, "illegal operator '#{op}' for #{f.title}" unless %w[EQ IN NEQ NOT_IN].include?(op)
+
+      like = %w[EQ IN].include?(op) ? "LIKE" : "NOT_LIKE"
+      Array(c["value"]).map { |v| Cond.new(f.name, like, JSON.generate(v.to_s)) }
+    end
+
+    def condition(f, op, value)
       return Cond.new(f.name, op) if %w[NULL NOT_NULL].include?(op)
       raise Fail, "illegal operator '#{op}' for a reference" if f.reference? && !%w[EQ NEQ IN NOT_IN].include?(op)
 
-      value = c["value"]
       case op
       when "LIKE", "NOT_LIKE" then Cond.new(f.name, op, value.to_s)
       when "RANGE"

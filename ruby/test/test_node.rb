@@ -55,6 +55,16 @@ module NodeFixture
     field :id, pk: true
     field :text, "Text"
   end
+
+  class Widget
+    extend Erupt::Model
+    erupt "Widget"
+    field :id, pk: true
+    field :name, "Name"
+    field :basic, "Basic", edit: { type: "DIVIDE" }, virtual: true
+    field :roles, "Roles", Array, search: true, choices: { ADMIN: "Admin", USER: "User", GUEST: "Guest" }, edit: { type: "MULTI_CHOICE" }
+    field :attrs, "Attributes", Hash, edit: { type: "KEY_VALUE" }
+  end
 end
 
 class NodeTest < Minitest::Test
@@ -66,6 +76,7 @@ class NodeTest < Minitest::Test
   attr_reader :server
 
   def article_repo = Erupt::MemoryRepository.new
+  def widget_repo = Erupt::MemoryRepository.new
 
   def setup
     @remote = { "add" => true, "edit" => true, "delete" => true, "viewDetails" => true, "export" => true, "importable" => true }
@@ -77,6 +88,7 @@ class NodeTest < Minitest::Test
                                                           { name: "Life", parent: nil }]))
     @node.register(Article, article_repo)
     @node.register(Note, Erupt::MemoryRepository.new)
+    @node.register(Widget, widget_repo)
     CALLS.clear
   end
 
@@ -111,6 +123,28 @@ class NodeTest < Minitest::Test
 
   def titles(page) = page["list"].map { |r| r["title"] }
 
+  def test_virtual_and_json_fields
+    _, build = call("GET", "/erupt-api/build/Widget", erupt: "Widget")
+    fields = build["eruptModel"]["eruptFieldModels"].to_h { |f| [f["fieldName"], f] }
+    assert_equal({ "id" => "NUMBER", "name" => "INPUT", "basic" => "DIVIDE", "roles" => "MULTI_CHOICE", "attrs" => "KEY_VALUE" },
+                 fields.transform_values { |f| f["eruptFieldJson"]["edit"]["type"] })
+    assert_equal %w[Admin User Guest], fields["roles"]["componentValue"].map { |o| o["label"] }
+    [{ name: "A", roles: %w[ADMIN USER], attrs: { env: "prod" }, basic: "ignored" }, { name: "B", roles: ["GUEST"], attrs: {} }].each do |row|
+      _, r = call("POST", "/erupt-api/data/modify/Widget", row, erupt: "Widget")
+      assert r["success"], r
+    end
+    _, r = call("POST", "/erupt-api/data/modify/Widget", { name: "C", roles: ["ROOT"] }, erupt: "Widget")
+    refute r["success"]
+    _, page = call("POST", "/erupt-api/data/table/Widget", { pageIndex: 1, pageSize: 10 }, erupt: "Widget")
+    a = page["list"].find { |row| row["name"] == "A" }
+    assert_equal [%w[ADMIN USER], { "env" => "prod" }], a.values_at("roles", "attrs")
+    refute a.key?("basic")
+    _, page = call("POST", "/erupt-api/data/table/Widget", { condition: [{ key: "roles", expression: "IN", value: ["GUEST"] }] }, erupt: "Widget")
+    assert_equal ["B"], page["list"].map { |row| row["name"] }
+    _, row = call("GET", "/erupt-api/data/Widget/#{a["id"]}", erupt: "Widget")
+    assert_equal %w[ADMIN USER], row["roles"]
+  end
+
   def test_build
     status, build = call("GET", "/erupt-api/build/Article")
     assert_equal 200, status
@@ -135,7 +169,8 @@ class NodeTest < Minitest::Test
     assert_equal [], fields["body"]["eruptFieldJson"]["views"]
     assert_equal %w[draft published], fields["status"]["componentValue"].map { |v| v["value"] }
     assert fields["title"]["eruptFieldJson"]["edit"]["notNull"]
-    refute build["power"]["export"]
+    assert build["power"]["export"] # Excel is done by the server
+    refute build["power"]["cellEdit"]
   end
 
   def test_build_matches_schema
@@ -305,6 +340,8 @@ if SQLITE3
       @db = SQLite3::Database.new(File.join(Dir.mktmpdir, "node.db"))
       Erupt::SqlRepository.new(Erupt::SqlExecutor.sqlite3(@db), "article", auto_create: true)
     end
+
+    def widget_repo = Erupt::SqlRepository.new(Erupt::SqlExecutor.sqlite3(@db), "widget", auto_create: true)
 
     def test_like_escapes_wildcards
       add(title: "100% pure")

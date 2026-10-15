@@ -80,7 +80,7 @@ fn main() -> erupt::Result<()> {
     let env =
         |name: &str, fallback: &str| std::env::var(name).unwrap_or_else(|_| fallback.to_string());
     let mut node = Node::new(
-        "blog",
+        &env("ERUPT_NODE_NAME", "blog"),
         &env("ERUPT_ACCESS_TOKEN", ""),
         [env("ERUPT_SERVER", "http://localhost:8080")],
     );

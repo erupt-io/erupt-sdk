@@ -190,11 +190,11 @@ class NodeTest(unittest.TestCase):
 
         self.add(title="Ref", category={"id": "2", "name": "Python"}, topic={"id": 1, "name": "Tech"})
         row = self.table()["list"][0]
-        self.assertEqual({"id": "2", "name": "Python"}, row["category"])
-        self.assertEqual("Python", row["category_name"])
-        self.assertEqual("Tech", row["topic_name"])
+        # a reference travels as its key; the server resolves labels and flattened columns
+        self.assertEqual((2, 1), (row["category"], row["topic"]))
+        self.assertNotIn("category_name", row)
         _, got = self.call("GET", f"/erupt-api/data/Article/{row['id']}")
-        self.assertEqual({"id": "2", "name": "Python"}, got["category"])
+        self.assertEqual(2, got["category"])
         hit = self.table([{"key": "category", "expression": "EQ", "value": {"id": 2, "name": "Python"}}])
         self.assertEqual(1, hit["total"])
         miss = self.table([{"key": "category", "expression": "IN", "value": [{"id": 1}, {"id": 3}]}])
@@ -202,13 +202,8 @@ class NodeTest(unittest.TestCase):
         _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "category", "expression": "LIKE", "value": "x"}]})
         self.assertFalse(r["success"])
 
-    def test_reference_tree(self):
-        status, tree = self.call("GET", "/erupt-api/data/Article/reference-tree/topic")
-        self.assertEqual(200, status)
-        self.assertEqual(["Tech", "Life"], [n["label"] for n in tree])
-        self.assertEqual(["Python"], [n["label"] for n in tree[0]["children"]])
-        self.assertEqual(2, tree[0]["children"][0]["level"])
-        self.assertEqual(404, self.call("GET", "/erupt-api/data/Article/reference-tree/category")[0])
+    def test_reference_tree_is_the_servers(self):
+        self.assertEqual(404, self.call("GET", "/erupt-api/data/Article/reference-tree/topic")[0])
 
     def test_operations(self):
         self.add(title="A")

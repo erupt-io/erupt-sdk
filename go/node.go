@@ -50,6 +50,9 @@ type Config struct {
 	Heartbeat time.Duration
 	// Logger receives errors and warnings; log.Default() when nil.
 	Logger *log.Logger
+	// RequireSignature refuses server calls without a valid Erupt-Signature, so the plain access token
+	// alone no longer passes (servers sign since erupt 2.3.x).
+	RequireSignature bool
 }
 
 // Node serves registered models to an erupt cloud server (erupt-cloud/PROTOCOL.md). It is an
@@ -85,8 +88,7 @@ var queryOps = map[string]bool{"EQ": true, "NEQ": true, "GT": true, "GTE": true,
 	"NOT_LIKE": true, "RANGE": true, "IN": true, "NOT_IN": true, "NULL": true, "NOT_NULL": true}
 
 const (
-	maxPageSize  = 1000
-	maxTreeNodes = 10000
+	maxPageSize = 1000
 )
 
 // NewNode creates a node; register models on it before serving.
@@ -151,12 +153,13 @@ type reply struct{ status int }
 func (r reply) Error() string { return http.StatusText(r.status) }
 
 type request struct {
-	r     *http.Request
-	ctx   context.Context
-	model *Model
-	repo  Repository
-	args  []string
-	body  []byte
+	r        *http.Request
+	ctx      context.Context
+	model    *Model
+	repo     Repository
+	args     []string
+	body     []byte
+	enforced map[string]bool // checks the server ran, from a verified Erupt-Enforced
 }
 
 type route struct {
@@ -170,7 +173,6 @@ var routes = []route{
 	{"GET", regexp.MustCompile(`^/erupt-api/build/([^/]+)/([^/]+)$`), (*Node).buildByField},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/table/([^/]+)$`), (*Node).table},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/([^/]+)/reference-table/([^/]+)$`), (*Node).referenceTable},
-	{"GET", regexp.MustCompile(`^/erupt-api/data/([^/]+)/reference-tree/([^/]+)$`), (*Node).referenceTree},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$`), (*Node).operationFormValue},
 	{"POST", regexp.MustCompile(`^/erupt-api/data/([^/]+)/operator/([^/]+)$`), (*Node).operation},
 	{"GET", regexp.MustCompile(`^/erupt-api/data/init-value/([^/]+)$`), (*Node).initValue},
@@ -246,8 +248,13 @@ func (n *Node) dispatch(hr *http.Request) (any, error) {
 	if hr.Header.Get("Origin") != "" {
 		return nil, reply{403}
 	}
-	if subtle.ConstantTimeCompare([]byte(hr.Header.Get("Access-Token")), []byte(n.cfg.AccessToken)) != 1 {
-		return nil, reply{403}
+	body, err := io.ReadAll(io.LimitReader(hr.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	enforced, err := n.authenticate(hr, body)
+	if err != nil {
+		return nil, err
 	}
 	erupt := hr.Header.Get("erupt")
 	for _, rt := range routes {
@@ -282,13 +289,43 @@ func (n *Node) dispatch(hr *http.Request) (any, error) {
 			}
 			ctx = context.WithValue(ctx, userKey{}, &user)
 		}
-		body, err := io.ReadAll(io.LimitReader(hr.Body, 32<<20))
-		if err != nil {
-			return nil, err
-		}
-		return rt.handle(n, &request{r: hr, ctx: ctx, model: reg.model, repo: reg.repo, args: groups[2:], body: body})
+		return rt.handle(n, &request{r: hr, ctx: ctx, model: reg.model, repo: reg.repo, args: groups[2:], body: body, enforced: enforced})
 	}
 	return nil, reply{404}
+}
+
+// authenticate admits a server call: a signed call must verify and then stands for the token; its
+// Erupt-Enforced is trusted only then. Unsigned calls present the access token.
+func (n *Node) authenticate(hr *http.Request, body []byte) (map[string]bool, error) {
+	signature := hr.Header.Get(HeaderSignature)
+	if signature == "" {
+		if n.cfg.RequireSignature || subtle.ConstantTimeCompare([]byte(hr.Header.Get("Access-Token")), []byte(n.cfg.AccessToken)) != 1 {
+			return nil, reply{403}
+		}
+		return nil, nil
+	}
+	pathAndQuery := hr.URL.EscapedPath()
+	if hr.URL.RawQuery != "" {
+		pathAndQuery += "?" + hr.URL.RawQuery
+	}
+	signed := body
+	if strings.Contains(hr.Header.Get("Content-Type"), "multipart/form-data") {
+		signed = nil
+	} else if signed == nil {
+		signed = []byte{}
+	}
+	enforced := hr.Header.Get(HeaderEnforced)
+	if !VerifySignature(n.cfg.AccessToken, hr.Method, pathAndQuery, hr.Header.Get(HeaderTimestamp), enforced,
+		hr.Header.Get("user"), signed, signature, time.Now().Unix()) {
+		return nil, reply{403}
+	}
+	checks := map[string]bool{}
+	for _, c := range strings.Split(enforced, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			checks[c] = true
+		}
+	}
+	return checks, nil
 }
 
 // json decodes the request body, nil when empty.
@@ -355,74 +392,6 @@ func (n *Node) referenceTable(q *request) (any, error) {
 		return nil, err
 	}
 	return n.page(q.ctx, f.target, repo, body)
-}
-
-type treeNode struct {
-	ID       string      `json:"id"`
-	Label    *string     `json:"label"`
-	Pid      *string     `json:"pid"`
-	Root     bool        `json:"root"`
-	Level    int         `json:"level"`
-	Children []*treeNode `json:"children"`
-}
-
-func (n *Node) referenceTree(q *request) (any, error) {
-	f, err := referenceField(q.model, q.args[0], typeReferenceTree)
-	if err != nil {
-		return nil, err
-	}
-	target := f.target
-	repo, err := n.repoOf(target)
-	if err != nil {
-		return nil, err
-	}
-	_, records, err := repo.Page(q.ctx, Query{Limit: maxTreeNodes})
-	if err != nil {
-		return nil, err
-	}
-	nodes := map[string]*treeNode{}
-	var ordered []*treeNode
-	optional := func(v any) *string {
-		if v == nil {
-			return nil
-		}
-		s := str(v)
-		return &s
-	}
-	for _, rec := range records {
-		node := &treeNode{ID: str(rec[target.pk]), Label: optional(rec[f.label]), Pid: optional(rec[f.tree]), Level: 1}
-		if nodes[node.ID] == nil {
-			ordered = append(ordered, node)
-		}
-		nodes[node.ID] = node
-	}
-	roots := []*treeNode{}
-	for _, node := range ordered {
-		var parent *treeNode
-		if node.Pid != nil {
-			parent = nodes[*node.Pid]
-		}
-		if parent == nil || parent == node {
-			node.Root = true
-			roots = append(roots, node)
-		} else {
-			parent.Children = append(parent.Children, node)
-		}
-	}
-	seen := map[*treeNode]bool{}
-	var level func([]*treeNode, int)
-	level = func(list []*treeNode, depth int) {
-		for _, node := range list {
-			if seen[node] { // a pid cycle would otherwise recurse forever
-				continue
-			}
-			seen[node] = true
-			node.Level = depth
-			level(node.Children, depth+1)
-		}
-	}
-	level(roots, 1)
-	return roots, nil
 }
 
 func referenceField(m *Model, name, editType string) (*field, error) {
@@ -649,43 +618,14 @@ func (n *Node) delete(q *request) (any, error) {
 	return r(true, nil, nil), nil
 }
 
-// rows turns records into browser rows. A reference becomes {<id>: "1", <label>: "News"} for the form
-// plus the flattened <field>_<label> column the table reads.
-func (n *Node) rows(ctx context.Context, m *Model, records []Record) ([]M, error) {
-	cache := map[string]Record{}
+// rows turns records into browser rows. A reference stays its key: the server resolves its label, the
+// flattened <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
+func (n *Node) rows(_ context.Context, m *Model, records []Record) ([]M, error) {
 	rows := make([]M, len(records))
 	for i, record := range records {
 		row := M{}
 		for _, f := range m.fields {
 			row[f.name] = f.jsonValue(record[f.name])
-		}
-		for _, f := range m.fields {
-			if !f.isReference() {
-				continue
-			}
-			rid := record[f.name]
-			if rid == nil {
-				row[f.name] = nil
-				continue
-			}
-			key := f.target.name + "\x00" + str(rid)
-			target, ok := cache[key]
-			if !ok {
-				repo, err := n.repoOf(f.target)
-				if err != nil {
-					return nil, err
-				}
-				if target, err = repo.Get(ctx, rid); err != nil {
-					return nil, err
-				}
-				cache[key] = target
-			}
-			var label any
-			if target != nil {
-				label = f.target.byName[f.label].jsonValue(target[f.label])
-			}
-			row[f.name] = M{f.target.pk: str(rid), f.label: label}
-			row[f.name+"_"+f.label] = label
 		}
 		rows[i] = row
 	}

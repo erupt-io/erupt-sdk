@@ -21,6 +21,13 @@ Shared repository rules (not all reachable over HTTP, so each SDK also unit-test
 rows come back by primary key ascending; SQL repositories bind every value, quote whitelisted identifiers
 and escape LIKE with `ESCAPE '!'`, which every database reads the same way.
 
+Server calls are checked both ways: with the plain `Access-Token`, and signed (`Erupt-Signature`, no token)
+the way erupt 2.3.x servers call. A node verifies the signature with the algorithm of
+[`signature-vectors.json`](signature-vectors.json) (computed by the Java reference; every SDK unit-tests
+against it), trusts `Erupt-Enforced` only under a valid signature, and skips the `erupt-power` callback when it
+lists `power`. A reference travels as its key: the server resolves labels, flattened columns and trees, so a
+node answers 404 for `reference-tree`.
+
 ## Fixture
 
 Node name `conformance`. Every repository is in memory (PHP: a temporary SQLite file, since `php -S` keeps

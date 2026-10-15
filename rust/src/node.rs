@@ -1,7 +1,7 @@
 //! Erupt cloud node runtime: registers with the server, then answers the requests it forwards. The wire
 //! contract is erupt-cloud/PROTOCOL.md (Level 0, references and row operations).
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{TcpListener, ToSocketAddrs, UdpSocket};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +13,7 @@ use serde_json::{json, Map, Value};
 use crate::http::{self, base64_decode, decode, encode, Request, Response};
 use crate::model::{json_value, Field, Model, OpContext, REFERENCES};
 use crate::repo::{Cond, Query, Repository};
+use crate::signature;
 use crate::types::{QueryExpression, RowOperationMode};
 use crate::values::{as_f64, text};
 use crate::{Error, Record, Result};
@@ -31,11 +32,12 @@ const SERVER_POWER: [&str; 6] = [
     "importable",
 ];
 const MAX_PAGE_SIZE: u64 = 1000;
-const MAX_TREE_NODES: u64 = 10_000;
 const POWER_TTL: Duration = Duration::from_secs(5);
 
 thread_local! {
     static USER: RefCell<Option<Value>> = const { RefCell::new(None) };
+    // the server checked the user's rights (a signed `Erupt-Enforced: power`) for the request on this thread
+    static POWER_ENFORCED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// The acting user of the request being served on this thread: `{"uid", "account", "name", "tenantId"}`.
@@ -76,6 +78,7 @@ fn fail<T>(message: impl Into<String>) -> std::result::Result<T, Reply> {
 pub struct Node {
     name: String,
     access_token: String,
+    require_signature: bool,
     servers: Vec<String>,
     address: Option<String>,
     heartbeat: Duration,
@@ -100,6 +103,7 @@ impl Node {
         Node {
             name: name.to_string(),
             access_token: access_token.to_string(),
+            require_signature: false,
             servers: servers
                 .into_iter()
                 .map(|s| s.into().trim_end_matches('/').to_string())
@@ -117,6 +121,13 @@ impl Node {
     /// The URL the server reaches this node at; detected from the network otherwise.
     pub fn address(mut self, url: &str) -> Self {
         self.address = Some(url.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Refuse server calls without a valid `Erupt-Signature`, so the plain access token alone no longer
+    /// passes (servers sign since erupt 2.3.x).
+    pub fn require_signature(mut self, required: bool) -> Self {
+        self.require_signature = required;
         self
     }
 
@@ -178,6 +189,7 @@ impl Node {
     pub fn handle(&self, request: &Request) -> Response {
         let result = self.dispatch(request);
         USER.with(|u| *u.borrow_mut() = None);
+        POWER_ENFORCED.with(|p| *p.borrow_mut() = false);
         match result {
             Ok(Value::String(text)) => Response::text(200, &text),
             Ok(value) => Response::json(200, &value),
@@ -208,12 +220,7 @@ impl Node {
         if req.get_header("origin").is_some() {
             return Err(Reply::Status(403));
         }
-        if !constant_time_eq(
-            req.get_header("access-token").unwrap_or("").as_bytes(),
-            self.access_token.as_bytes(),
-        ) {
-            return Err(Reply::Status(403));
-        }
+        self.authenticate(req)?;
         let segments: Vec<&str> = rest.split('/').collect();
         let m = req.method.as_str();
         let route = match (m, segments.as_slice()) {
@@ -222,9 +229,6 @@ impl Node {
             ("POST", ["data", "table", e]) => Some((*e, Route::Table)),
             ("POST", ["data", e, "reference-table", f]) => {
                 Some((*e, Route::ReferenceTable(decode(f))))
-            }
-            ("GET", ["data", e, "reference-tree", f]) => {
-                Some((*e, Route::ReferenceTree(decode(f))))
             }
             ("POST", ["data", e, "operator", c, "form-value"]) => {
                 Some((*e, Route::FormValue(decode(c))))
@@ -277,9 +281,6 @@ impl Node {
             Route::ReferenceTable(field) => {
                 let target = reference_field(model, &field, Some("REFERENCE_TABLE"))?.target();
                 self.page(target, self.repo_of(target)?, &body_object(req)?)
-            }
-            Route::ReferenceTree(field) => {
-                self.reference_tree(reference_field(model, &field, Some("REFERENCE_TREE"))?)
             }
             Route::FormValue(code) => {
                 let op = operation_of(model, &code)?;
@@ -395,86 +396,21 @@ impl Node {
         }))
     }
 
-    /// Records to browser rows. A reference becomes `{<id>: "1", <label>: "News"}` for the form plus the
-    /// flattened `<field>_<label>` column the table reads.
+    /// Records to browser rows. A reference stays its key: the server resolves its label, the flattened
+    /// `<field>_<label>` column and the tree (erupt-cloud/PROTOCOL.md §7.3).
     fn rows(&self, model: &Model, records: Vec<Record>) -> std::result::Result<Vec<Value>, Reply> {
-        let refs: Vec<&Field> = model.fields.iter().filter(|f| f.is_reference()).collect();
-        let mut cache: HashMap<(String, String), Value> = HashMap::new();
-        let mut rows = Vec::with_capacity(records.len());
-        for record in records {
-            let mut row: Map<String, Value> = model
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), json_value(record.get(&f.name))))
-                .collect();
-            for f in &refs {
-                let rid = record.get(&f.name).cloned().unwrap_or(Value::Null);
-                if rid.is_null() {
-                    row.insert(f.name.clone(), Value::Null);
-                    continue;
-                }
-                let target = f.target();
-                let key = (target.name().to_string(), text(&rid));
-                if !cache.contains_key(&key) {
-                    let found = self
-                        .repo_of(target)?
-                        .get(&rid)?
-                        .map(Value::Object)
-                        .unwrap_or(json!({}));
-                    cache.insert(key.clone(), found);
-                }
-                let label = cache[&key].get(&f.label).cloned().unwrap_or(Value::Null);
-                let mut reference = Map::new();
-                reference.insert(
-                    target.pk().unwrap_or("id").to_string(),
-                    Value::String(text(&rid)),
-                );
-                reference.insert(f.label.clone(), label.clone());
-                row.insert(f.name.clone(), Value::Object(reference));
-                row.insert(format!("{}_{}", f.name, f.label), label);
-            }
-            rows.push(Value::Object(row));
-        }
-        Ok(rows)
-    }
-
-    fn reference_tree(&self, f: &Field) -> Out {
-        let target = f.target();
-        let (pk, pid) = (target.pk().unwrap_or("id"), f.tree.as_deref().unwrap_or(""));
-        let query = Query {
-            limit: MAX_TREE_NODES,
-            ..Query::default()
-        };
-        let (_, records) = self.repo_of(target)?.page(&query)?;
-        let present = |r: &Record, key: &str| r.get(key).filter(|v| !v.is_null()).map(text);
-        let mut nodes: Vec<TreeNode> = records
-            .iter()
-            .map(|r| TreeNode {
-                id: text(r.get(pk).unwrap_or(&Value::Null)),
-                label: present(r, &f.label),
-                pid: present(r, pid),
-                parent: None,
+        Ok(records
+            .into_iter()
+            .map(|record| {
+                Value::Object(
+                    model
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.clone(), json_value(record.get(&f.name))))
+                        .collect(),
+                )
             })
-            .collect();
-        let index: HashMap<String, usize> = nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.id.clone(), i))
-            .collect();
-        for (i, node) in nodes.iter_mut().enumerate() {
-            node.parent = node
-                .pid
-                .as_ref()
-                .and_then(|p| index.get(p).copied())
-                .filter(|p| *p != i);
-        }
-        let mut seen = HashSet::new();
-        let roots = (0..nodes.len()).filter(|i| nodes[*i].parent.is_none());
-        Ok(Value::Array(
-            roots
-                .filter_map(|i| tree_node(&nodes, i, 1, &mut seen))
-                .collect(),
-        ))
+            .collect())
     }
 
     fn operation(&self, model: &Model, repo: &dyn Repository, req: &Request, code: &str) -> Out {
@@ -530,6 +466,52 @@ impl Node {
         }
     }
 
+    // ------------------------------------------------------------------ authentication (PROTOCOL.md §4.3)
+
+    /// A signed call must verify, and then stands for the token; its `Erupt-Enforced` is trusted only then.
+    fn authenticate(&self, req: &Request) -> std::result::Result<(), Reply> {
+        let Some(given) = req.get_header(signature::HEADER_SIGNATURE) else {
+            let token_ok = constant_time_eq(
+                req.get_header("access-token").unwrap_or("").as_bytes(),
+                self.access_token.as_bytes(),
+            );
+            return if self.require_signature || !token_ok {
+                Err(Reply::Status(403))
+            } else {
+                Ok(())
+            };
+        };
+        let multipart = req
+            .get_header("content-type")
+            .is_some_and(|t| t.contains("multipart/form-data"));
+        let path_and_query = if req.query.is_empty() {
+            req.path.clone()
+        } else {
+            format!("{}?{}", req.path, req.query)
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let enforced = req.get_header(signature::HEADER_ENFORCED);
+        if !signature::verify(
+            &self.access_token,
+            &req.method,
+            &path_and_query,
+            req.get_header(signature::HEADER_TIMESTAMP),
+            enforced,
+            req.get_header("user"),
+            if multipart { None } else { Some(&req.body) },
+            given,
+            now,
+        ) {
+            return Err(Reply::Status(403));
+        }
+        let power = enforced.is_some_and(|e| e.split(',').any(|v| v.trim() == "power"));
+        POWER_ENFORCED.with(|p| *p.borrow_mut() = power);
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ permissions (PROTOCOL.md §6.1)
 
     fn require(&self, model: &Model, req: &Request, right: &str) -> std::result::Result<(), Reply> {
@@ -541,6 +523,15 @@ impl Node {
     }
 
     fn power(&self, model: &Model, req: &Request) -> Map<String, Value> {
+        if POWER_ENFORCED.with(|p| *p.borrow()) {
+            // the server checked the user's rights and restricts the build's power itself: the model's own
+            // declaration is all that is left to apply here
+            let mut power = model.power.clone();
+            for right in UNSUPPORTED_POWER {
+                power.insert(right.to_string(), Value::Bool(false));
+            }
+            return power;
+        }
         let token = req.get_header("token").unwrap_or("").to_string();
         let key = (token.clone(), model.name().to_string());
         if let Some((expires, power)) = self.power_cache.lock().expect("power cache").get(&key) {
@@ -723,34 +714,11 @@ impl Node {
     }
 }
 
-struct TreeNode {
-    id: String,
-    label: Option<String>,
-    pid: Option<String>,
-    parent: Option<usize>,
-}
-
-fn tree_node(nodes: &[TreeNode], i: usize, depth: u64, seen: &mut HashSet<usize>) -> Option<Value> {
-    if !seen.insert(i) {
-        return None; // a pid cycle would otherwise recurse forever
-    }
-    let children: Vec<Value> = (0..nodes.len())
-        .filter(|c| nodes[*c].parent == Some(i))
-        .filter_map(|c| tree_node(nodes, c, depth + 1, seen))
-        .collect();
-    let n = &nodes[i];
-    Some(json!({
-        "id": n.id, "label": n.label, "pid": n.pid, "root": depth == 1, "level": depth,
-        "children": if children.is_empty() { Value::Null } else { Value::Array(children) },
-    }))
-}
-
 enum Route {
     Build,
     BuildByField(String),
     Table,
     ReferenceTable(String),
-    ReferenceTree(String),
     FormValue(String),
     Operation(String),
     InitValue,

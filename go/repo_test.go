@@ -182,10 +182,14 @@ func TestNodeOverSQLite(t *testing.T) {
 	}
 	row := list[0].(map[string]any)
 	want := map[string]any{"title": "100% pure", "views": 7.0, "featured": true, "publish_date": "2026-03-01",
-		"review_at": "2026-03-01T08:15:00.000", "category_name": "Python", "category": map[string]any{"id": "2", "name": "Python"}}
+		"review_at": "2026-03-01T08:15:00.000", "category": 2.0}
 	for k, v := range want {
 		if !reflect.DeepEqual(row[k], v) {
 			t.Errorf("%s: got %#v, want %#v", k, row[k], v)
 		}
+	}
+	// a reference travels as its key; the server adds the label and the flattened column
+	if _, ok := row["category_name"]; ok {
+		t.Errorf("category_name is the server's to add: %v", row)
 	}
 }

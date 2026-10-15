@@ -81,6 +81,8 @@ func TestRepositories(t *testing.T) {
 			check("IN", titles(Query{Conditions: []Cond{{"views", "IN", []any{int64(0), int64(3)}}}, Sort: asc, Limit: 10}), []string{"100% pure", "plain"})
 			check("empty IN", titles(Query{Conditions: []Cond{{"views", "IN", []any{}}}, Limit: 10}), []string{})
 			check("NULL", titles(Query{Conditions: []Cond{{"body", "NULL", nil}}, Sort: asc, Limit: 10}), []string{"100% pure", "100 points", "under_score", "plain"})
+			check("default order is primary key ascending", titles(Query{Limit: 10}), []string{"100% pure", "100 points", "under_score", "plain"})
+			check("LIKE escapes !", titles(Query{Conditions: []Cond{{"title", "LIKE", "!"}}, Limit: 10}), []string{})
 			check("sort desc + page", titles(Query{Sort: []Order{{Field: "views", Desc: true}}, Offset: 1, Limit: 2}), []string{"under_score", "100 points"})
 
 			_, records, _ := repo.Page(ctx, Query{Sort: asc, Limit: 1})

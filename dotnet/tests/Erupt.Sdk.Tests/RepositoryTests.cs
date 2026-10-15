@@ -40,6 +40,11 @@ public sealed class RepositoryTests : IDisposable
 
         Assert.Equal(["100% pure"], await Titles(repo, new Cond("title", "LIKE", "100%")));
         Assert.Equal(["under_score"], await Titles(repo, new Cond("title", "LIKE", "R_S")));
+        await repo.AddAsync(new Record { ["title"] = "wow!" });
+        Assert.Equal(["wow!"], await Titles(repo, new Cond("title", "LIKE", "w!")));
+        var (_, unsorted) = await repo.PageAsync(new Query { Limit = 100 });
+        Assert.Equal(["100% pure", "100 points", "under_score", "wow!"], unsorted.Select(r => r["title"] as string));
+        await repo.DeleteAsync([unsorted[3]["id"]!]);
         Assert.Equal(["100 points", "under_score"], await Titles(repo, new Cond("title", "NOT_LIKE", "pure")));
         Assert.Equal(["100% pure"], await Titles(repo, new Cond("views", "GT", 5L)));
         Assert.Equal(["100 points"], await Titles(repo, new Cond("featured", "EQ", false)));
@@ -71,8 +76,18 @@ public sealed class RepositoryTests : IDisposable
         var repo = new DbRepository(() => throw new InvalidOperationException(), "t");
         var parameters = new List<object?>();
         var where = repo.Where([new Cond("title", "LIKE", "a%' OR 1=1 --"), new Cond("views", "IN", new List<object?> { 1L, 2L })], parameters);
-        Assert.Equal(" WHERE \"title\" LIKE @p0 ESCAPE '\\' AND \"views\" IN (@p1, @p2)", where);
-        Assert.Equal(["%a\\%' OR 1=1 --%", 1L, 2L], parameters);
+        Assert.Equal(" WHERE \"title\" LIKE @p0 ESCAPE '!' AND \"views\" IN (@p1, @p2)", where);
+        Assert.Equal(["%a!%' OR 1=1 --%", 1L, 2L], parameters);
         Assert.Equal("\"we\"\"ird\"", repo.Q("we\"ird"));
+    }
+
+    [Fact]
+    public void OracleUsesColonParameters()
+    {
+        var repo = new DbRepository(() => throw new InvalidOperationException(), "t") { ParameterPrefix = ":", Paging = Paging.OffsetFetch };
+        var parameters = new List<object?>();
+        Assert.Equal(" WHERE \"title\" = :p0 AND \"views\" LIKE :p1 ESCAPE '!'",
+            repo.Where([new Cond("title", "EQ", "a"), new Cond("views", "LIKE", "1!_")], parameters));
+        Assert.Equal(["a", "%1!!!_%"], parameters);
     }
 }

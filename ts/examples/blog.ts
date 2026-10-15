@@ -28,11 +28,13 @@ const Article = model("Article", {
   orderBy: "id desc",
   operations: {
     publish: operation("Publish", { icon: "fa fa-paper-plane", form: PublishForm, ifExpr: "item.status !== 'published'" },
-      (op) => {
-        for (const row of op.rows) op.repo.update(row.id, { status: "published", publish_date: op.param!.publish_date });
+      async (op) => {
+        for (const row of op.rows) await op.repo.update(row.id, { status: "published", publish_date: op.param!.publish_date });
       }),
     feature: operation("Feature", { mode: "SINGLE", icon: "fa fa-star", confirm: "Feature this article on the home page?" },
-      (op) => op.repo.update(op.rows[0].id, { featured: true })),
+      async (op) => {
+        await op.repo.update(op.rows[0].id, { featured: true });
+      }),
   },
 });
 

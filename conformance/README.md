@@ -16,6 +16,10 @@ The command starts the fixture below, reading `ERUPT_ACCESS_TOKEN`, `ERUPT_SERVE
 environment, listening on `127.0.0.1:$PORT`, registering `nodeAddress` `http://127.0.0.1:$PORT`, and
 deregistering on SIGINT. Set `CONFORMANCE_TRACE=1` for stack traces.
 
+Shared repository rules (not all reachable over HTTP, so each SDK also unit-tests them): without a sort,
+rows come back by primary key ascending; SQL repositories bind every value, quote whitelisted identifiers
+and escape LIKE with `ESCAPE '!'`, which every database reads the same way.
+
 ## Fixture
 
 Node name `conformance`. Every repository is in memory (PHP: a temporary SQLite file, since `php -S` keeps

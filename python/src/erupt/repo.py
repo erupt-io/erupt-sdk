@@ -1,9 +1,13 @@
 """Storage adapters. A repository only sees field names the node has already checked against the model,
 so it may use them as identifiers; values always travel as parameters."""
 import datetime
+import decimal
 import sqlite3
+import sys
 import threading
 from dataclasses import dataclass, field
+
+from .model import _parse_datetime
 
 
 @dataclass
@@ -115,101 +119,207 @@ _SQL_OPS = {"EQ": "=", "NEQ": "<>", "GT": ">", "GTE": ">=", "LT": "<", "LTE": "<
 _SQLITE_TYPES = {"NUMBER": "NUMERIC", "BOOLEAN": "INTEGER", "DATE": "DATE", "DATE_TIME": "TIMESTAMP",
                  "REFERENCE_TABLE": "INTEGER", "REFERENCE_TREE": "INTEGER"}
 
+# dialect -> (identifier quotes, paging); LIMIT/OFFSET or the SQL:2008 OFFSET ... FETCH form
+_DIALECTS = {
+    "sqlite": ('"', '"', "limit"), "postgres": ('"', '"', "limit"), "mysql": ("`", "`", "limit"),
+    "mssql": ("[", "]", "fetch"), "oracle": ('"', '"', "fetch"),
+}
 
-class SqliteRepository(Repository):
-    """SQLite table, created on first use when missing."""
+_PARAMSTYLES = ("qmark", "format", "pyformat", "numeric", "named")
 
-    def __init__(self, path, table):
-        self.path, self.table = path, table
-        self._local = threading.local()
 
-    def _conn(self):
-        if not hasattr(self._local, "conn"):
-            conn = sqlite3.connect(self.path, detect_types=sqlite3.PARSE_DECLTYPES)
-            conn.row_factory = sqlite3.Row
-            self._local.conn = conn
-        return self._local.conn
+class _Sql:
+    """SQL text with ``\0`` markers for parameters, rendered once the driver's paramstyle is known."""
 
-    @staticmethod
-    def _q(identifier):
-        return '"' + identifier.replace('"', '""') + '"'
+    def __init__(self):
+        self.parts, self.params = [], []
+
+    def p(self, value):
+        self.params.append(value)
+        return "\0"
+
+    def render(self, sql, paramstyle):
+        pieces = sql.split("\0")
+        marks = {"qmark": lambda i: "?", "format": lambda i: "%s", "pyformat": lambda i: f"%(p{i})s",
+                 "numeric": lambda i: f":{i + 1}", "named": lambda i: f":p{i}"}[paramstyle]
+        text = pieces[0] + "".join(marks(i) + piece for i, piece in enumerate(pieces[1:]))
+        if paramstyle in ("pyformat", "named"):
+            return text, {f"p{i}": v for i, v in enumerate(self.params)}
+        return text, list(self.params)
+
+
+class SqlRepository(Repository):
+    """A table behind any DB-API 2.0 (PEP 249) driver: sqlite3, psycopg, PyMySQL / mysqlclient, oracledb,
+    pyodbc / pymssql. ``connect()`` returns a connection; ``release(conn)`` hands it back after every call
+    (``conn.close()`` by default, ``pool.putconn`` for a pool). The driver's ``paramstyle`` is detected from
+    its module unless given. Column names are the model's field names (quoted, so case sensitive on
+    PostgreSQL and Oracle); every value is a bound parameter. Without a sort, rows come back by primary key
+    ascending. ``auto_create`` only applies to SQLite: create production tables yourself."""
+
+    def __init__(self, connect, table, *, dialect="sqlite", paramstyle=None, release=None, auto_create=False):
+        if dialect not in _DIALECTS:
+            raise ValueError(f"dialect must be one of {', '.join(_DIALECTS)}")
+        if paramstyle is not None and paramstyle not in _PARAMSTYLES:
+            raise ValueError(f"paramstyle must be one of {', '.join(_PARAMSTYLES)}")
+        if not table.replace("_", "a").isalnum() or table[0].isdigit():
+            raise ValueError(f"illegal table name '{table}'")
+        self.connect, self.table, self.dialect = connect, table, dialect
+        self.paramstyle, self.auto_create = paramstyle, auto_create
+        self.release = release or (lambda conn: conn.close())
+
+    def _q(self, identifier):
+        open_, close, _ = _DIALECTS[self.dialect]
+        return open_ + identifier.replace(close, close + close) + close
+
+    # ------------------------------------------------------------------ execution
+
+    def _run(self, sql, write=False):
+        """Execute a ``_Sql`` (text, builder) and return rows as dicts keyed by field name."""
+        text, builder = sql
+        conn = self.connect()
+        try:
+            style = self.paramstyle or _driver_paramstyle(conn)
+            rendered, params = builder.render(text, style)
+            cursor = conn.cursor()
+            try:
+                cursor.execute(rendered, params)
+                rows = [] if write or cursor.description is None else self._rows(cursor)
+            finally:
+                cursor.close()
+            conn.commit()  # also ends the read transaction PostgreSQL opens for a SELECT
+            return rows
+        except Exception:
+            _rollback(conn)
+            raise
+        finally:
+            self.release(conn)
+
+    def _rows(self, cursor):
+        # match columns to fields case-insensitively: Oracle and unquoted DDL may report upper case
+        names = {name.lower(): name for name in self.model.fields}
+        columns = [names.get(d[0].lower(), d[0]) for d in cursor.description]
+        return [self._record(dict(zip(columns, row))) for row in cursor.fetchall()]
+
+    def _record(self, record):
+        for f in self.model.fields.values():
+            value = record.get(f.name)
+            if value is None:
+                continue
+            if f.type == "BOOLEAN":
+                record[f.name] = bool(value)
+            elif isinstance(value, decimal.Decimal):  # NUMERIC columns of PostgreSQL / MySQL / Oracle
+                record[f.name] = int(value) if value == value.to_integral_value() else float(value)
+            elif f.type in ("DATE", "DATE_TIME") and isinstance(value, str):
+                value = _parse_datetime(value)
+                record[f.name] = value.date() if f.type == "DATE" else value
+            elif f.type == "DATE" and isinstance(value, datetime.datetime):
+                record[f.name] = value.date()
+        return record
+
+    # ------------------------------------------------------------------ Repository
 
     def bind(self, model):
         super().bind(model)
+        if not (self.auto_create and self.dialect == "sqlite"):
+            return
         cols = []
         for f in model.fields.values():
             if f.pk:
                 cols.append(f"{self._q(f.name)} INTEGER PRIMARY KEY AUTOINCREMENT")
             else:
                 cols.append(f"{self._q(f.name)} {_SQLITE_TYPES.get(f.type, 'TEXT')}")
-        with self._conn() as conn:
-            conn.execute(f"CREATE TABLE IF NOT EXISTS {self._q(self.table)} ({', '.join(cols)})")
+        self._run((f"CREATE TABLE IF NOT EXISTS {self._q(self.table)} ({', '.join(cols)})", _Sql()), write=True)
 
-    def _where(self, conditions):
-        clauses, params = [], []
+    def _where(self, conditions, b):
+        clauses = []
         for c in conditions:
             col = self._q(c.field)
             if c.op in _SQL_OPS:
-                clauses.append(f"{col} {_SQL_OPS[c.op]} ?")
-                params.append(c.value)
+                clauses.append(f"{col} {_SQL_OPS[c.op]} {b.p(c.value)}")
             elif c.op in ("LIKE", "NOT_LIKE"):
-                clauses.append(f"{col} {'NOT ' if c.op == 'NOT_LIKE' else ''}LIKE ? ESCAPE '\\'")
-                escaped = str(c.value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                params.append(f"%{escaped}%")
+                # '!' rather than a backslash: MySQL reads a backslash inside a string literal as an escape itself
+                escaped = str(c.value).replace("!", "!!").replace("%", "!%").replace("_", "!_")
+                clauses.append(f"{col} {'NOT ' if c.op == 'NOT_LIKE' else ''}LIKE {b.p(f'%{escaped}%')} ESCAPE '!'")
             elif c.op == "RANGE":
-                clauses.append(f"{col} BETWEEN ? AND ?")
-                params.extend(c.value[:2])
+                clauses.append(f"{col} BETWEEN {b.p(c.value[0])} AND {b.p(c.value[1])}")
             elif c.op in ("IN", "NOT_IN"):
                 if not c.value:
                     clauses.append("1=0" if c.op == "IN" else "1=1")
                     continue
-                clauses.append(f"{col} {'NOT ' if c.op == 'NOT_IN' else ''}IN ({', '.join('?' * len(c.value))})")
-                params.extend(c.value)
+                clauses.append(f"{col} {'NOT ' if c.op == 'NOT_IN' else ''}IN ({', '.join(b.p(v) for v in c.value)})")
             elif c.op in ("NULL", "NOT_NULL"):
                 clauses.append(f"{col} IS {'NOT ' if c.op == 'NOT_NULL' else ''}NULL")
-        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+        return (" WHERE " + " AND ".join(clauses)) if clauses else ""
 
     def page(self, query):
-        where, params = self._where(query.conditions)
         table = self._q(self.table)
-        conn = self._conn()
-        total = conn.execute(f"SELECT COUNT(*) FROM {table}{where}", params).fetchone()[0]
-        order = ", ".join(f"{self._q(n)} {'DESC' if d else 'ASC'}" for n, d in query.sort) or self._q(self.model.pk) + " DESC"
-        rows = conn.execute(f"SELECT * FROM {table}{where} ORDER BY {order} LIMIT ? OFFSET ?",
-                            [*params, query.limit, query.offset]).fetchall()
-        return total, [self._record(r) for r in rows]
-
-    def _record(self, row):
-        record = dict(row)
-        for f in self.model.fields.values():
-            if f.type == "BOOLEAN" and record.get(f.name) is not None:
-                record[f.name] = bool(record[f.name])
-        return record
+        b = _Sql()
+        where = self._where(query.conditions, b)
+        total = next(iter(self._run((f"SELECT COUNT(*) AS n FROM {table}{where}", b))[0].values()))
+        b = _Sql()
+        where = self._where(query.conditions, b)
+        order = ", ".join(f"{self._q(n)} {'DESC' if d else 'ASC'}" for n, d in query.sort) or self._q(self.model.pk) + " ASC"
+        if _DIALECTS[self.dialect][2] == "limit":
+            paging = f"LIMIT {b.p(query.limit)} OFFSET {b.p(query.offset)}"
+        else:
+            paging = f"OFFSET {b.p(query.offset)} ROWS FETCH NEXT {b.p(query.limit)} ROWS ONLY"
+        return total, self._run((f"SELECT * FROM {table}{where} ORDER BY {order} {paging}", b))
 
     def get(self, pk):
-        row = self._conn().execute(f"SELECT * FROM {self._q(self.table)} WHERE {self._q(self.model.pk)} = ?", [pk]).fetchone()
-        return self._record(row) if row else None
+        b = _Sql()
+        rows = self._run((f"SELECT * FROM {self._q(self.table)} WHERE {self._q(self.model.pk)} = {b.p(pk)}", b))
+        return rows[0] if rows else None
 
     def add(self, record):
         record = {k: v for k, v in record.items() if k != self.model.pk}
-        cols = ", ".join(self._q(k) for k in record)
-        with self._conn() as conn:
-            conn.execute(f"INSERT INTO {self._q(self.table)} ({cols}) VALUES ({', '.join('?' * len(record))})",
-                         list(record.values()))
+        b = _Sql()
+        values = ", ".join(b.p(v) for v in record.values())
+        self._run((f"INSERT INTO {self._q(self.table)} ({', '.join(self._q(k) for k in record)}) VALUES ({values})", b), write=True)
 
     def update(self, pk, record):
         record = {k: v for k, v in record.items() if k != self.model.pk}
-        sets = ", ".join(f"{self._q(k)} = ?" for k in record)
-        with self._conn() as conn:
-            conn.execute(f"UPDATE {self._q(self.table)} SET {sets} WHERE {self._q(self.model.pk)} = ?",
-                         [*record.values(), pk])
+        if not record:
+            return
+        b = _Sql()
+        sets = ", ".join(f"{self._q(k)} = {b.p(v)}" for k, v in record.items())
+        self._run((f"UPDATE {self._q(self.table)} SET {sets} WHERE {self._q(self.model.pk)} = {b.p(pk)}", b), write=True)
 
     def delete(self, pks):
         if not pks:
             return
-        with self._conn() as conn:
-            conn.execute(f"DELETE FROM {self._q(self.table)} WHERE {self._q(self.model.pk)} IN ({', '.join('?' * len(pks))})",
-                         list(pks))
+        b = _Sql()
+        marks = ", ".join(b.p(pk) for pk in pks)
+        self._run((f"DELETE FROM {self._q(self.table)} WHERE {self._q(self.model.pk)} IN ({marks})", b), write=True)
+
+
+def _driver_paramstyle(conn):
+    module = sys.modules.get(type(conn).__module__.split(".")[0])
+    style = getattr(module, "paramstyle", None)
+    if style not in _PARAMSTYLES:
+        raise ValueError(f"cannot detect the paramstyle of {type(conn).__module__}; pass paramstyle=")
+    return style
+
+
+def _rollback(conn):
+    try:
+        conn.rollback()
+    except Exception:  # the original error matters more than a failed rollback
+        pass
+
+
+class SqliteRepository(SqlRepository):
+    """SQLite table, created on first use when missing. One connection per thread, kept open."""
+
+    def __init__(self, path, table):
+        self.path = path
+        self._local = threading.local()
+        super().__init__(self._thread_conn, table, dialect="sqlite", paramstyle="qmark",
+                         release=lambda conn: None, auto_create=True)
+
+    def _thread_conn(self):
+        if not hasattr(self._local, "conn"):
+            self._local.conn = sqlite3.connect(self.path, detect_types=sqlite3.PARSE_DECLTYPES)
+        return self._local.conn
 
 
 sqlite3.register_adapter(datetime.datetime, lambda v: v.isoformat(" "))

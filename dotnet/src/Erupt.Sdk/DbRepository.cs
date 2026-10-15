@@ -9,14 +9,15 @@ public enum Paging
     /// <summary><c>LIMIT n OFFSET m</c>: SQLite, PostgreSQL, MySQL.</summary>
     LimitOffset,
 
-    /// <summary><c>OFFSET m ROWS FETCH NEXT n ROWS ONLY</c>: SQL Server, Oracle.</summary>
+    /// <summary><c>OFFSET m ROWS FETCH NEXT n ROWS ONLY</c>: SQL Server 2012+, Oracle 12c+.</summary>
     OffsetFetch,
 }
 
 /// <summary>
 /// A table over any ADO.NET provider. Identifiers come from the model (checked when it was declared) and are
-/// quoted; every value is a parameter (<c>@p0</c>, understood by SQLite, SQL Server, PostgreSQL and MySQL
-/// providers). Dates are stored as ISO text so they compare and sort the same everywhere.
+/// quoted; every value is a parameter (<c>@p0</c> for SQLite, SQL Server, PostgreSQL and MySQL providers,
+/// <c>:p0</c> for Oracle via <see cref="ParameterPrefix"/>). Dates are bound as <c>DateOnly</c> / <c>DateTime</c>
+/// for the provider to map (ISO text on SQLite). Without a sort, rows come back by primary key ascending.
 /// </summary>
 public sealed class DbRepository(Func<DbConnection> connect, string table) : IRepository
 {
@@ -26,6 +27,9 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
     public (string Open, string Close) Quote { get; init; } = ("\"", "\"");
 
     public Paging Paging { get; init; } = Paging.LimitOffset;
+
+    /// <summary>Marker of a named parameter in SQL text: <c>@</c> by default, <c>:</c> for Oracle.</summary>
+    public string ParameterPrefix { get; init; } = "@";
 
     /// <summary>Create the table when missing, with SQLite column types. Leave off for any other database.</summary>
     public bool AutoCreateSqlite { get; init; }
@@ -49,7 +53,7 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
         var total = Convert.ToInt64(await Command(conn, $"SELECT COUNT(*) FROM {Q(table)}{where}", parameters).ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
         var order = query.Sort.Count > 0
             ? string.Join(", ", query.Sort.Select(s => $"{Q(s.Field)} {(s.Desc ? "DESC" : "ASC")}"))
-            : $"{Q(_model.Pk!)} DESC";
+            : $"{Q(_model.Pk!)} ASC";
         var limit = P(parameters, query.Limit);
         var offset = P(parameters, query.Offset);
         var paging = Paging == Paging.LimitOffset ? $"LIMIT {limit} OFFSET {offset}" : $"OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY";
@@ -108,7 +112,7 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
                 "GTE" => $"{col} >= {P(parameters, c.Value)}",
                 "LT" => $"{col} < {P(parameters, c.Value)}",
                 "LTE" => $"{col} <= {P(parameters, c.Value)}",
-                "LIKE" or "NOT_LIKE" => $"{col} {(c.Op == "NOT_LIKE" ? "NOT " : "")}LIKE {P(parameters, "%" + Escape(Values.Str(c.Value)) + "%")} ESCAPE '\\'",
+                "LIKE" or "NOT_LIKE" => $"{col} {(c.Op == "NOT_LIKE" ? "NOT " : "")}LIKE {P(parameters, "%" + Escape(Values.Str(c.Value)) + "%")} ESCAPE '!'",
                 "RANGE" => $"{col} BETWEEN {P(parameters, list![0])} AND {P(parameters, list[1])}",
                 "IN" or "NOT_IN" when list!.Count == 0 => c.Op == "IN" ? "1=0" : "1=1",
                 "IN" or "NOT_IN" => $"{col} {(c.Op == "NOT_IN" ? "NOT " : "")}IN ({string.Join(", ", list!.Select(v => P(parameters, v)))})",
@@ -122,12 +126,13 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
 
     internal string Q(string identifier) => Quote.Open + identifier.Replace(Quote.Close, Quote.Close + Quote.Close) + Quote.Close;
 
-    private static string Escape(string text) => text.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+    // '!' rather than a backslash: MySQL reads a backslash inside a string literal as an escape itself
+    private static string Escape(string text) => text.Replace("!", "!!").Replace("%", "!%").Replace("_", "!_");
 
-    private static string P(List<object?> parameters, object? value)
+    private string P(List<object?> parameters, object? value)
     {
         parameters.Add(value);
-        return "@p" + (parameters.Count - 1).ToString(CultureInfo.InvariantCulture);
+        return ParameterPrefix + "p" + (parameters.Count - 1).ToString(CultureInfo.InvariantCulture);
     }
 
     private DbConnection Open()
@@ -137,27 +142,29 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
         return conn;
     }
 
-    private static DbCommand Command(DbConnection conn, string sql, List<object?> parameters)
+    private DbCommand Command(DbConnection conn, string sql, List<object?> parameters)
     {
         var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         for (var i = 0; i < parameters.Count; i++)
         {
             var p = cmd.CreateParameter();
-            p.ParameterName = "@p" + i.ToString(CultureInfo.InvariantCulture);
+            // SqlClient, Npgsql, MySqlConnector and Sqlite take the marker in the name, Oracle does not
+            p.ParameterName = (ParameterPrefix == "@" ? "@p" : "p") + i.ToString(CultureInfo.InvariantCulture);
             p.Value = ToDb(parameters[i]);
             cmd.Parameters.Add(p);
         }
         return cmd;
     }
 
-    private static void Execute(DbConnection conn, string sql, List<object?> parameters) => Command(conn, sql, parameters).ExecuteNonQuery();
+    private void Execute(DbConnection conn, string sql, List<object?> parameters) => Command(conn, sql, parameters).ExecuteNonQuery();
 
+    // Dates go to the provider as DateOnly / DateTime: Npgsql types a string parameter as text, which PostgreSQL
+    // refuses for date and timestamp columns, while Microsoft.Data.Sqlite stores both as ISO text anyway
     private static object ToDb(object? value) => value switch
     {
         null => DBNull.Value,
-        DateOnly d => d.ToString(Values.DateFormat, CultureInfo.InvariantCulture),
-        DateTime t => t.ToString("yyyy-MM-dd HH:mm:ss.fffffff", CultureInfo.InvariantCulture),
+        DateOnly or DateTime => value,
         _ => Values.Normalize(value)!,
     };
 
@@ -183,7 +190,12 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
     {
         null => null,
         _ when field.Type == "BOOLEAN" => value is bool b ? b : Convert.ToInt64(value, CultureInfo.InvariantCulture) != 0,
-        _ when field.Type == "DATE" => value is DateTime dt ? DateOnly.FromDateTime(dt) : DateOnly.FromDateTime(Values.ParseDateTime(value)),
+        _ when field.Type == "DATE" => value switch
+        {
+            DateOnly d => d,
+            DateTime dt => DateOnly.FromDateTime(dt),
+            _ => DateOnly.FromDateTime(Values.ParseDateTime(value)),
+        },
         _ when field.Type == FieldDef.TemplateDateTime => value is DateTime t ? t : Values.ParseDateTime(value),
         _ => Values.Normalize(value),
     };

@@ -13,14 +13,18 @@ final class PdoRepository implements Repository
     private const SQL_OPS = ['EQ' => '=', 'NEQ' => '<>', 'GT' => '>', 'GTE' => '>=', 'LT' => '<', 'LTE' => '<='];
     private const SQLITE_TYPES = ['NUMBER' => 'NUMERIC', 'BOOLEAN' => 'INTEGER', 'REFERENCE_TABLE' => 'INTEGER', 'REFERENCE_TREE' => 'INTEGER'];
 
+    private const TYPED = ['BOOLEAN', 'NUMBER', 'DATE', 'DATE_TIME'];
+
     private Model $model;
+
+    private ?string $driver = null;
 
     public function __construct(private readonly \PDO $pdo, private readonly string $table, private readonly bool $autoCreate = true)
     {
         if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $table)) {
             throw new \InvalidArgumentException("illegal table name '$table'");
         }
-        $this->pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+        // the connection belongs to the application: its error mode is left alone and every call is checked
     }
 
     public function bind(Model $model): void
@@ -33,7 +37,7 @@ final class PdoRepository implements Repository
         foreach ($model->fields as $f) {
             $columns[] = $this->q($f->name) . ' ' . ($f->isPk() ? 'INTEGER PRIMARY KEY AUTOINCREMENT' : (self::SQLITE_TYPES[$f->type] ?? 'TEXT'));
         }
-        $this->pdo->exec('CREATE TABLE IF NOT EXISTS ' . $this->q($this->table) . ' (' . implode(', ', $columns) . ')');
+        $this->checked($this->pdo->exec('CREATE TABLE IF NOT EXISTS ' . $this->q($this->table) . ' (' . implode(', ', $columns) . ')'), $this->pdo);
     }
 
     private function q(string $identifier): string
@@ -88,13 +92,13 @@ final class PdoRepository implements Repository
         // nulls last ascending and first descending on every database, like MemoryRepository
         $order = implode(', ', array_map(fn($s) => '(' . $this->q($s[0]) . ' IS NULL)' . ($s[1] ? ' DESC, ' : ' ASC, ')
             . $this->q($s[0]) . ($s[1] ? ' DESC' : ' ASC'), $query->sort)) ?: $this->q($this->model->pk) . ' ASC';
-        $statement = $this->pdo->prepare("SELECT * FROM $table$where ORDER BY $order LIMIT ? OFFSET ?");
+        $statement = $this->prepare("SELECT * FROM $table$where ORDER BY $order LIMIT ? OFFSET ?");
         foreach (array_values($params) as $i => $value) {
             $this->bindValue($statement, $i + 1, $value);
         }
         $statement->bindValue(count($params) + 1, $query->limit, \PDO::PARAM_INT);
         $statement->bindValue(count($params) + 2, $query->offset, \PDO::PARAM_INT);
-        $statement->execute();
+        $this->checked($statement->execute(), $statement);
         return [$total, array_map([$this, 'record'], $statement->fetchAll(\PDO::FETCH_ASSOC))];
     }
 
@@ -130,11 +134,14 @@ final class PdoRepository implements Repository
             . implode(', ', array_fill(0, count($pks), '?')) . ')', array_values($pks));
     }
 
+    // Drivers disagree on types (pdo_mysql returns numbers as strings, every database its own datetime text),
+    // so values are read back through the same coercion the node applies to the browser's input
     private function record(array $row): array
     {
         foreach ($this->model->fields as $f) {
-            if ($f->type === 'BOOLEAN' && isset($row[$f->name])) {
-                $row[$f->name] = (bool) $row[$f->name];
+            $value = $row[$f->name] ?? null;
+            if ($value !== null && ($f->isPk() || $f->isReference() || in_array($f->type, self::TYPED, true))) {
+                $row[$f->name] = $f->coerce($value);
             }
         }
         return $row;
@@ -142,12 +149,28 @@ final class PdoRepository implements Repository
 
     private function run(string $sql, array $params): \PDOStatement
     {
-        $statement = $this->pdo->prepare($sql);
+        $statement = $this->prepare($sql);
         foreach (array_values($params) as $i => $value) {
             $this->bindValue($statement, $i + 1, $value);
         }
-        $statement->execute();
+        $this->checked($statement->execute(), $statement);
         return $statement;
+    }
+
+    private function prepare(string $sql): \PDOStatement
+    {
+        $statement = $this->pdo->prepare($sql);
+        $this->checked($statement, $this->pdo);
+        return $statement;
+    }
+
+    // Under ERRMODE_SILENT / WARNING a failure is only a false return; raise it the way ERRMODE_EXCEPTION would
+    private function checked(mixed $result, \PDO|\PDOStatement $source): void
+    {
+        if ($result === false) {
+            $error = $source->errorInfo();
+            throw new \RuntimeException('database error ' . ($error[0] ?? '') . ': ' . ($error[2] ?? 'unknown'));
+        }
     }
 
     private function bindValue(\PDOStatement $statement, int $position, mixed $value): void
@@ -155,12 +178,18 @@ final class PdoRepository implements Repository
         if ($value instanceof \DateTimeInterface) {
             $value = $value->format('Y-m-d\TH:i:s.v');
         }
-        $type = match (true) {
+        if (is_bool($value)) {
+            // PostgreSQL's boolean takes no integer; SQLite and MySQL store booleans as 0 / 1
+            $this->driver ??= $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+            $this->driver === 'pgsql'
+                ? $statement->bindValue($position, $value, \PDO::PARAM_BOOL)
+                : $statement->bindValue($position, (int) $value, \PDO::PARAM_INT);
+            return;
+        }
+        $statement->bindValue($position, $value, match (true) {
             $value === null => \PDO::PARAM_NULL,
-            is_bool($value) => \PDO::PARAM_BOOL,
             is_int($value) => \PDO::PARAM_INT,
             default => \PDO::PARAM_STR,
-        };
-        $statement->bindValue($position, is_bool($value) ? (int) $value : $value, is_bool($value) ? \PDO::PARAM_INT : $type);
+        });
     }
 }

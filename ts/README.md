@@ -74,9 +74,42 @@ A returned string is executed as JavaScript in the browser, so return only code 
 
 ## Storage
 
-A `Repository` implements `bind`, `page`, `get`, `add`, `update`, `delete` (sync or async);
-`MemoryRepository` and `SqliteRepository` (node:sqlite) ship with it. `currentUser()` returns the acting
-user inside a repository or operation call.
+A `Repository` implements `bind`, `page`, `get`, `add`, `update`, `delete` (sync or async).
+`currentUser()` returns the acting user inside a repository or operation call. Shipped:
+
+- `MemoryRepository(seed?)`: in process, for tests and demos.
+- `SqliteRepository(path, table)`: node:sqlite (Node 22.5+), creates the table when missing.
+- `SqlRepository(executor, table, { dialect })`: any SQL database. The SDK has no driver dependency; wrap the
+  driver you already use in an executor. `dialect` (`sqlite` | `postgres` | `mysql` | `mssql`) picks the
+  placeholders, identifier quotes and paging; values are always bound, LIKE escapes with `!`, PostgreSQL
+  searches with `ILIKE` so every database matches case-insensitively. The table must exist (`autoCreate`
+  is SQLite only); column names are the model's field names.
+
+```ts
+import pg from "pg";                               // node-postgres
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+node.register(Article, new SqlRepository(pgExecutor(pool), "article", { dialect: "postgres" }));
+
+import mysql from "mysql2/promise";
+const db = mysql.createPool({ uri: process.env.DATABASE_URL, dateStrings: true });
+node.register(Article, new SqlRepository(mysqlExecutor(db), "article", { dialect: "mysql" }));
+
+import sql from "mssql";
+const mssqlPool = await sql.connect(process.env.DATABASE_URL!);
+node.register(Article, new SqlRepository(mssqlExecutor(mssqlPool), "article", { dialect: "mssql" }));
+```
+
+Any other driver works through a two-method object: `{ query(sql, params) => rows, execute(sql, params) }`.
+
+Without a sort, every repository returns rows by primary key ascending.
+
+**Dates.** The SDK keeps DATE / DATE_TIME as wall-clock strings (`2026-01-05`, `2026-01-05T10:30:00.000`)
+and binds them as such, so store them in columns without a time zone (`date`, `timestamp`, `datetime`).
+Prefer drivers that return those columns as strings — mysql2 `dateStrings: true`; node-postgres
+`pg.types.setTypeParser(1082, String)` and `(1114, String)`. A `Date` the driver does return is read with
+its local fields, which is how pg and mysql2 build it from a column without a time zone; for mssql set
+`options: { useUTC: false }`, since it builds them in UTC by default. Numbers that drivers return as text or bigint (pg
+`bigint` / `numeric`) come back as numbers when they are exact.
 
 Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload,
 Excel, i18n of messages.

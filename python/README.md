@@ -64,8 +64,28 @@ executed as JavaScript in the browser, so return only code you wrote.
 
 ## Storage
 
-Storage is any `Repository` (`page`, `get`, `add`, `update`, `delete`); `MemoryRepository` and
-`SqliteRepository` ship with it. `erupt.current_user()` returns the acting user inside a repository call.
+Storage is any `Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:
+
+- `MemoryRepository` for tests and demos;
+- `SqliteRepository(path, table)`, which creates the table;
+- `SqlRepository(connect, table, dialect=..., release=..., paramstyle=...)` over any DB-API 2.0 driver.
+  `dialect` (`sqlite`, `postgres`, `mysql`, `mssql`, `oracle`) decides identifier quotes and paging; the
+  driver's paramstyle is detected. Create the tables yourself, with columns named like the fields.
+
+```python
+import psycopg                      # PostgreSQL
+repo = SqlRepository(lambda: psycopg.connect(DSN), "article", dialect="postgres")
+
+from psycopg_pool import ConnectionPool
+pool = ConnectionPool(DSN)          # pooled: hand connections back instead of closing them
+repo = SqlRepository(pool.getconn, "article", dialect="postgres", release=pool.putconn)
+
+import pymysql                      # MySQL
+repo = SqlRepository(lambda: pymysql.connect(**MYSQL), "article", dialect="mysql")
+```
+
+Without a sort, every repository returns rows by primary key ascending. `erupt.current_user()` returns the
+acting user inside a repository call.
 
 Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload, Excel, i18n of messages.
 

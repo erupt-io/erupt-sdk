@@ -25,7 +25,7 @@ annotation attributes are typed from and validated against `schema/`.
 it (`mvn -pl erupt-test -Pnode-schema test`); here the `sync-schema` workflow (weekly, or run by hand with
 a branch / tag of erupts/erupt) pulls it, regenerates every language's code and opens a pull request.
 Each language's workflow fails on a generated file that no longer matches `schema/` and runs the
-conformance suite. A pull request opened with the workflow token does not trigger other workflows: close
+conformance suite; `databases` runs every SDK's SQL repository against real PostgreSQL and MySQL. A pull request opened with the workflow token does not trigger other workflows: close
 and reopen it (or push to its branch) to run them.
 
 ## Releasing

@@ -179,12 +179,32 @@ $test('repositories filter, sort and page alike', function () use ($repositories
         eq(['a_b'], $titles([new Cond('views', 'NULL')]), "$kind NULL");
         eq(['100 points', '100% pure', 'a_b'], $titles([], [['views', false]]), "$kind nulls last");
         eq(3, $repo->page(new Query([], [], 0, 1))[0], "$kind total");
+        eq(['100% pure', '100 points', 'a_b'], $titles([]), "$kind default order is primary key ascending");
         $repo->update(1, ['title' => 'renamed']);
         eq('renamed', $repo->get(1)['title'], "$kind update");
         eq(true, $repo->get(1)['live'], "$kind bool round trip");
         $repo->delete([1, 2]);
         eq(['a_b'], $titles([]), "$kind delete");
     }
+});
+
+$test('PdoRepository leaves the error mode alone and still raises errors', function () {
+    $pdo = new \PDO('sqlite::memory:');
+    $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_SILENT);
+    $repo = new PdoRepository($pdo, 'post', autoCreate: false);
+    $repo->bind(Model::of(Post::class));
+    eq(\PDO::ERRMODE_SILENT, $pdo->getAttribute(\PDO::ATTR_ERRMODE), 'error mode untouched');
+    $failure = function (string $mode) use ($repo): string {
+        try {
+            $repo->get(1);
+        } catch (\RuntimeException $e) {  // PDOException extends RuntimeException
+            return $e->getMessage();
+        }
+        throw new \RuntimeException("missing table under $mode: nothing thrown");
+    };
+    eq(1, preg_match('/^database error HY000: no such table/', $failure('ERRMODE_SILENT')), 'raised under ERRMODE_SILENT');
+    $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+    eq(1, preg_match('/no such table/', $failure('ERRMODE_EXCEPTION')), 'raised under ERRMODE_EXCEPTION');
 });
 
 $test('handle() serves the protocol', function () {

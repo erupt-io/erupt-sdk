@@ -4,9 +4,9 @@ name: databases
 
 on:
   push:
-    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", "rust/**", ".github/workflows/databases.yml"]
+    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", "rust/**", "ruby/**", "jvm/**", ".github/workflows/databases.yml"]
   pull_request:
-    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", "rust/**", ".github/workflows/databases.yml"]
+    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", "rust/**", "ruby/**", "jvm/**", ".github/workflows/databases.yml"]
 
 permissions:
   contents: read
@@ -62,6 +62,14 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
       # each language runs even when an earlier one failed; the job fails if any did
       - name: Python
         if: success() || failure()
@@ -92,3 +100,13 @@ jobs:
         if: success() || failure()
         working-directory: rust
         run: cargo test --features postgres,mysql --test databases -- --nocapture
+      - name: Ruby
+        if: success() || failure()
+        working-directory: ruby
+        run: |
+          gem install --no-document pg:1.7.0 mysql2:0.5.7 sqlite3:2.10.0
+          ruby -Ilib test/test_databases.rb
+      - name: JVM
+        if: success() || failure()
+        working-directory: jvm
+        run: mvn -B test -Dtest=DatabaseTest -Dsurefire.failIfNoSpecifiedTests=false

@@ -49,6 +49,17 @@ final class Post
     }
 }
 
+#[Erupt('Widget')]
+final class Widget
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Name')] public string $name;
+    #[Field('Basic', edit: ['type' => 'DIVIDE'], virtual: true)] public ?string $basic;
+    #[Field('Roles', search: true, choices: ['ADMIN' => 'Admin', 'USER' => 'User', 'GUEST' => 'Guest'], edit: ['type' => 'MULTI_CHOICE'])]
+    public array $roles;
+    #[Field('Attributes', edit: ['type' => 'KEY_VALUE'])] public object $attrs;
+}
+
 #[Erupt('Bad1')] final class BadEditKey { #[Field(pk: true)] public int $id; #[Field('T', edit: ['inputTyp' => ['length' => 9]])] public string $t; }
 #[Erupt('Bad2')] final class BadViewType { #[Field(pk: true)] public int $id; #[Field('T', view: ['sortable' => 'yes'])] public string $t; }
 #[Erupt('Bad3')] final class BadEditType { #[Field(pk: true)] public int $id; #[Field('T', type: 'INPUTT')] public string $t; }
@@ -280,6 +291,39 @@ $test('handle() serves the protocol', function () {
         proc_terminate($server);
         proc_close($server);
     }
+});
+
+$test('virtual and JSON fields', function () {
+    $db = tempnam(sys_get_temp_dir(), 'erupt-php');
+    foreach ([new MemoryRepository(), new PdoRepository(new \PDO("sqlite:$db"), 'widget')] as $repo) {
+        $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Widget::class, $repo);
+        $call = function (string $method, string $target, mixed $body = null) use ($node) {
+            $raw = $body === null ? '' : json_encode($body);
+            $ts = time();
+            $headers = ['erupt' => 'Widget', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
+            $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', 'dXNlcg==', $raw);
+            return json_decode($node->handle($method, $target, $headers, $raw, [], $target)->body, true);
+        };
+        $build = $call('GET', '/erupt-api/build/Widget');
+        $fields = $build['eruptModel']['eruptFieldModels'];
+        eq(['id' => 'NUMBER', 'name' => 'INPUT', 'basic' => 'DIVIDE', 'roles' => 'MULTI_CHOICE', 'attrs' => 'KEY_VALUE'],
+            array_column(array_map(fn($f) => [$f['fieldName'], $f['eruptFieldJson']['edit']['type']], $fields), 1, 0), 'types');
+        eq(['Admin', 'User', 'Guest'], array_column($fields[3]['componentValue'], 'label'), 'options');
+        eq(true, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'A', 'roles' => ['ADMIN', 'USER'], 'attrs' => ['env' => 'prod'], 'basic' => 'x'])['success'], 'add A');
+        eq(true, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'B', 'roles' => ['GUEST'], 'attrs' => new \stdClass()])['success'], 'add B');
+        eq(false, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'C', 'roles' => ['ROOT']])['success'], 'illegal option');
+        $page = $call('POST', '/erupt-api/data/table/Widget', ['pageIndex' => 1, 'pageSize' => 10]);
+        eq(['id' => 1, 'name' => 'A', 'roles' => ['ADMIN', 'USER'], 'attrs' => ['env' => 'prod']], $page['list'][0], 'row');
+        $ts = time();
+        $body = json_encode(['pageIndex' => 1, 'pageSize' => 10]);
+        $headers = ['erupt' => 'Widget', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power',
+            'Erupt-Signature' => Signature::sign('secret', 'POST', '/erupt-api/data/table/Widget', $ts, 'power', 'dXNlcg==', $body)];
+        eq('{}', json_encode(json_decode($node->handle('POST', '/erupt-api/data/table/Widget', $headers, $body)->body)->list[1]->attrs), 'empty object stays {}');
+        $found = $call('POST', '/erupt-api/data/table/Widget', ['condition' => [['key' => 'roles', 'expression' => 'IN', 'value' => ['GUEST']]]]);
+        eq(['B'], array_column($found['list'], 'name'), 'search');
+        eq(['env' => 'prod'], $call('GET', '/erupt-api/data/Widget/1')['attrs'], 'by id');
+    }
+    unlink($db);
 });
 
 $failed = 0;

@@ -43,7 +43,7 @@ public sealed partial class EruptNode
     public const string Version = "0.1.0";
 
     // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-    private static readonly string[] Unsupported = ["export", "importable", "cellEdit", "print", "ai"];
+    private static readonly string[] Unsupported = ["cellEdit", "print", "ai"];
 
     // Rights the server decides per user; the node ANDs them onto the declared power
     private static readonly string[] ServerPower = ["add", "edit", "delete", "viewDetails", "export", "importable"];
@@ -339,7 +339,7 @@ public sealed partial class EruptNode
     private async Task<JsonNode?> InitValue(Request r, string[] _)
     {
         await Require(r, "add");
-        return new JsonObject(r.Model.Fields.Select(f => KeyValuePair.Create(f.Name, (JsonNode?)null)));
+        return new JsonObject(r.Model.Stored.Select(f => KeyValuePair.Create(f.Name, (JsonNode?)null)));
     }
 
     private async Task<JsonNode?> Get(Request r, string[] args)
@@ -385,7 +385,7 @@ public sealed partial class EruptNode
         foreach (var record in records)
         {
             var row = new JsonObject();
-            foreach (var f in model.Fields) row[f.Name] = Values.ToJson(record.GetValueOrDefault(f.Name));
+            foreach (var f in model.Stored) row[f.Name] = Values.ToJson(record.GetValueOrDefault(f.Name));
             rows.Add(row);
         }
         return Task.FromResult(rows);
@@ -445,7 +445,7 @@ public sealed partial class EruptNode
     private static Record ToRecord(EruptModel model, JsonObject body)
     {
         var record = new Record();
-        foreach (var f in model.Fields.Where(f => !f.IsPk && f.Form))
+        foreach (var f in model.Stored.Where(f => !f.IsPk && f.Form))
         {
             object? value;
             try

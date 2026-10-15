@@ -86,6 +86,9 @@ final class MemoryRepository implements Repository
         if ($value === null) {
             return false;
         }
+        if (is_array($value) || $value instanceof \stdClass) {
+            $value = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); // a JSON value is matched as its text
+        }
         return match ($c->op) {
             'EQ' => self::same($value, $expect),
             'NEQ' => !self::same($value, $expect),

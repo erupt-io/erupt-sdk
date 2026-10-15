@@ -220,8 +220,7 @@ impl SqlRepository {
         let mut record = Record::new();
         for (column, value) in row {
             let Some(f) = model
-                .fields
-                .iter()
+                .stored()
                 .find(|f| f.name.eq_ignore_ascii_case(&column))
             else {
                 record.insert(column, value);
@@ -229,6 +228,7 @@ impl SqlRepository {
             };
             let value = match (&value, f.kind.as_str()) {
                 (Value::Null, _) => Value::Null,
+                (Value::String(s), _) if f.json => serde_json::from_str(s).unwrap_or(value),
                 (_, "BOOLEAN") => Value::Bool(match &value {
                     Value::Bool(b) => *b,
                     Value::String(s) => s == "1" || s.eq_ignore_ascii_case("true"),
@@ -252,10 +252,20 @@ impl SqlRepository {
     fn writable(&self, record: Record) -> Vec<(String, Value)> {
         let pk = self.pk().to_string();
         self.model()
-            .fields
-            .iter()
+            .stored()
             .filter(|f| f.name != pk)
-            .filter_map(|f| record.get(&f.name).map(|v| (f.name.clone(), v.clone())))
+            .filter_map(|f| {
+                record.get(&f.name).map(|v| {
+                    let v = match v {
+                        // JSON text: a parameter is a scalar in every dialect
+                        Value::Array(_) | Value::Object(_) if f.json => {
+                            Value::String(v.to_string())
+                        }
+                        _ => v.clone(),
+                    };
+                    (f.name.clone(), v)
+                })
+            })
             .collect()
     }
 }
@@ -283,8 +293,7 @@ impl Repository for SqlRepository {
         if self.auto_create && self.dialect == Dialect::Sqlite {
             let columns: Vec<String> = self
                 .model()
-                .fields
-                .iter()
+                .stored()
                 .map(|f| {
                     let kind = match f.kind.as_str() {
                         _ if f.is_pk() => "INTEGER PRIMARY KEY AUTOINCREMENT",

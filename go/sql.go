@@ -3,6 +3,7 @@ package erupt
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -40,8 +41,9 @@ func (r *SQLRepository) Bind(m *Model) error {
 	if !r.AutoCreate {
 		return nil
 	}
-	cols := make([]string, len(m.fields))
-	for i, f := range m.fields {
+	stored := m.stored()
+	cols := make([]string, len(stored))
+	for i, f := range stored {
 		if f.pk {
 			cols[i] = r.q(f.name) + " INTEGER PRIMARY KEY AUTOINCREMENT"
 		} else {
@@ -128,8 +130,9 @@ func (r *SQLRepository) where(b *sqlBuilder, conds []Cond) string {
 }
 
 func (r *SQLRepository) columns() string {
-	cols := make([]string, len(r.model.fields))
-	for i, f := range r.model.fields {
+	stored := r.model.stored()
+	cols := make([]string, len(stored))
+	for i, f := range stored {
 		cols[i] = r.q(f.name)
 	}
 	return strings.Join(cols, ", ")
@@ -175,7 +178,8 @@ func (r *SQLRepository) query(ctx context.Context, query string, args ...any) ([
 	defer rows.Close()
 	records := []Record{}
 	for rows.Next() {
-		values := make([]any, len(r.model.fields))
+		stored := r.model.stored()
+		values := make([]any, len(stored))
 		ptrs := make([]any, len(values))
 		for i := range values {
 			ptrs[i] = &values[i]
@@ -184,7 +188,7 @@ func (r *SQLRepository) query(ctx context.Context, query string, args ...any) ([
 			return nil, err
 		}
 		record := Record{}
-		for i, f := range r.model.fields {
+		for i, f := range stored {
 			record[f.name] = r.fromDB(f, values[i])
 		}
 		records = append(records, record)
@@ -204,7 +208,7 @@ func (r *SQLRepository) Get(ctx context.Context, pk any) (Record, error) {
 // writable lists the record's columns in declaration order, without the primary key.
 func (r *SQLRepository) writable(record Record) []*field {
 	var fields []*field
-	for _, f := range r.model.fields {
+	for _, f := range r.model.stored() {
 		if _, ok := record[f.name]; ok && !f.pk {
 			fields = append(fields, f)
 		}
@@ -258,6 +262,12 @@ func (r *SQLRepository) Delete(ctx context.Context, pks []any) error {
 
 // toDB stores dates as ISO text, which every dialect accepts and which sorts correctly.
 func (r *SQLRepository) toDB(f *field, v any) any {
+	if f != nil && f.json && v != nil {
+		text, err := json.Marshal(v)
+		if err == nil {
+			return string(text)
+		}
+	}
 	if t, ok := v.(time.Time); ok {
 		if f != nil && f.typ == "DATE" {
 			return t.Format(dateLayout)
@@ -276,6 +286,11 @@ func (r *SQLRepository) fromDB(f *field, v any) any {
 		return nil
 	}
 	switch {
+	case f.json:
+		var value any
+		if s, ok := v.(string); ok && json.Unmarshal([]byte(s), &value) == nil {
+			return value
+		}
 	case f.typ == "BOOLEAN":
 		if n, ok := toFloat(v); ok {
 			return n != 0

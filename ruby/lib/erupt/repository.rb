@@ -88,6 +88,7 @@ module Erupt
     end
 
     def match_value?(value, op, expect)
+      value = JSON.generate(value) if value.is_a?(Array) || value.is_a?(Hash) # a JSON value is matched as its text
       case op
       when "EQ" then value == expect
       when "NEQ" then value != expect

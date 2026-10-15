@@ -29,6 +29,13 @@ internal sealed class FieldDef
     internal bool Sortable { get; init; }
     internal bool Table { get; init; } = true;
     internal bool Form { get; init; } = true;
+
+    /// <summary>In the build only: no column, never read or written.</summary>
+    internal bool Virtual { get; init; }
+
+    /// <summary>A list or dictionary property (MULTI_CHOICE, KEY_VALUE): a JSON value, kept as JSON text by <see cref="DbRepository"/>.</summary>
+    internal bool IsJson { get; init; }
+
     internal List<(string Value, string Label)>? Choices { get; init; }
     internal Type? Ref { get; init; }
     internal string Label { get; init; } = "name";
@@ -72,10 +79,13 @@ internal sealed class FieldDef
         else if (clr == typeof(DateOnly)) type = "DATE";
         else type = "INPUT";
         if (!Templates.ContainsKey(type) || type == "id") throw new ArgumentException($"{path}: edit type {type} is not supported yet");
+        var json = clr != typeof(string) && typeof(System.Collections.IEnumerable).IsAssignableFrom(clr);
+        if (a.Virtual && (a.Search || a.Sortable || a.NotNull)) throw new ArgumentException($"{path}: a virtual field cannot be searched, sorted or required");
+        if (json && (a.Search || a.Sortable)) throw new ArgumentException($"{path}: a JSON field cannot be searched or sorted");
         var field = new FieldDef
         {
             Model = model, Property = property, Name = name, Title = a.Title, Type = type,
-            Search = a.Search, NotNull = a.NotNull, Sortable = a.Sortable, Table = a.Table, Form = a.Form,
+            Search = a.Search, NotNull = a.NotNull, Sortable = a.Sortable, Table = a.Table, Form = a.Form, Virtual = a.Virtual, IsJson = json,
             Choices = choices.Count > 0 ? choices : null, Ref = reference, Label = a.Label, Tree = a.Tree,
         };
         if (reference is not null) field.CheckReference(path);
@@ -127,7 +137,7 @@ internal sealed class FieldDef
         Json.Merge(edit, EditRaw);
         Json.Merge(view, ViewRaw);
         if (!Table) efj["views"] = new JsonArray();
-        if (Type == "CHOICE")
+        if (Choices is not null) // a CHOICE, or a MULTI_CHOICE by raw edit type: the options travel as componentValue
         {
             tpl["componentValue"] = new JsonArray(Choices!.Select(c => (JsonNode)new JsonObject
             {
@@ -148,6 +158,7 @@ internal sealed class FieldDef
         }
         if (IsPk) return CoercePk(value);
         if (value is null || value is "") return null;
+        if (IsJson) return value is IList<object?> or IDictionary<string, object?> ? value : throw new FormatException($"illegal value '{Values.Str(value)}'");
         switch (Type)
         {
             case "BOOLEAN":

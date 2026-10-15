@@ -110,14 +110,14 @@ final class PdoRepository implements Repository
 
     public function add(array $record): void
     {
-        unset($record[$this->model->pk]);
+        $record = $this->store($record);
         $columns = implode(', ', array_map([$this, 'q'], array_keys($record)));
         $this->run('INSERT INTO ' . $this->q($this->table) . " ($columns) VALUES (" . implode(', ', array_fill(0, count($record), '?')) . ')', array_values($record));
     }
 
     public function update(int|string $pk, array $record): void
     {
-        unset($record[$this->model->pk]);
+        $record = $this->store($record);
         if (!$record) {
             return;
         }
@@ -134,13 +134,25 @@ final class PdoRepository implements Repository
             . implode(', ', array_fill(0, count($pks), '?')) . ')', array_values($pks));
     }
 
+    // Values as columns hold them: a JSON value as its text
+    private function store(array $record): array
+    {
+        unset($record[$this->model->pk]);
+        foreach ($record as $name => $value) {
+            if ($value !== null && ($this->model->fields[$name] ?? null)?->json !== null) {
+                $record[$name] = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            }
+        }
+        return $record;
+    }
+
     // Drivers disagree on types (pdo_mysql returns numbers as strings, every database its own datetime text),
     // so values are read back through the same coercion the node applies to the browser's input
     private function record(array $row): array
     {
         foreach ($this->model->fields as $f) {
             $value = $row[$f->name] ?? null;
-            if ($value !== null && ($f->isPk() || $f->isReference() || in_array($f->type, self::TYPED, true))) {
+            if ($value !== null && ($f->isPk() || $f->isReference() || $f->json !== null || in_array($f->type, self::TYPED, true))) {
                 $row[$f->name] = $f->coerce($value);
             }
         }

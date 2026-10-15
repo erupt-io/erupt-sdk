@@ -21,7 +21,7 @@ use crate::{Error, Record, Result};
 pub const VERSION: &str = "0.1.0";
 
 /// Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there.
-const UNSUPPORTED_POWER: [&str; 5] = ["export", "importable", "cellEdit", "print", "ai"];
+const UNSUPPORTED_POWER: [&str; 3] = ["cellEdit", "print", "ai"];
 /// Rights the server decides per user; the node ANDs them onto the declared power.
 const SERVER_POWER: [&str; 6] = [
     "add",
@@ -297,8 +297,7 @@ impl Node {
                 self.require(model, req, "add")?;
                 Ok(Value::Object(
                     model
-                        .fields
-                        .iter()
+                        .stored()
                         .map(|f| (f.name.clone(), Value::Null))
                         .collect(),
                 ))
@@ -404,8 +403,7 @@ impl Node {
             .map(|record| {
                 Value::Object(
                     model
-                        .fields
-                        .iter()
+                        .stored()
                         .map(|f| (f.name.clone(), json_value(record.get(&f.name))))
                         .collect(),
                 )
@@ -838,7 +836,7 @@ fn condition(model: &Model, c: &Value) -> std::result::Result<Cond, Reply> {
 /// A write body to a record: every form field coerced, required ones present.
 fn record(model: &Model, body: &Map<String, Value>) -> std::result::Result<Record, Reply> {
     let mut record = Record::new();
-    for f in model.fields.iter().filter(|f| !f.is_pk() && f.form) {
+    for f in model.stored().filter(|f| !f.is_pk() && f.form) {
         let value = f
             .coerce(body.get(&f.name).unwrap_or(&Value::Null))
             .map_err(|e| Reply::Fail(format!("{}: {e}", f.title)))?;

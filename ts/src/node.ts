@@ -18,7 +18,7 @@ export function currentUser(): User | null {
 }
 
 // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-const UNSUPPORTED_POWER: Power = { export: false, importable: false, cellEdit: false, print: false, ai: false };
+const UNSUPPORTED_POWER: Power = { cellEdit: false, print: false, ai: false };
 
 // Rights the server decides per user; the node ANDs them onto the declared power
 const SERVER_POWER = ["add", "edit", "delete", "viewDetails", "export", "importable"];
@@ -216,7 +216,7 @@ export class Node {
     const pageIndex = Math.max(Math.trunc(Number(body.pageIndex)) || 1, 1);
     const pageSize = Math.min(Math.max(Math.trunc(Number(body.pageSize)) || 10, 1), MAX_PAGE_SIZE);
     const query: Query = { conditions: [], sort: [], offset: (pageIndex - 1) * pageSize, limit: pageSize };
-    for (const c of asList(body.condition)) query.conditions.push(condition(model, c));
+    for (const c of asList(body.condition)) query.conditions.push(...conditions(model, c));
     for (const s of asList(body.sort)) {
       const f = isObject(s) ? model.fields[s.field] : undefined;
       if (!f || !(f.sortable || f.pk)) throw new Fail(`illegal sort field '${isObject(s) ? s.field : s}'`);
@@ -451,13 +451,21 @@ function referenceField(model: Model, field: string, editType?: string): Field {
   return f;
 }
 
-function condition(model: Model, c: unknown): Cond {
+function conditions(model: Model, c: unknown): Cond[] {
   const key = isObject(c) ? c.key : undefined;
   const f = typeof key === "string" ? model.fields[key] : undefined;
   if (!f || f.pk || !f.search) throw new Fail(`illegal search field '${key}'`);
   const op = String((c as Record<string, unknown>).expression || "EQ");
   if (!OPS.has(op)) throw new Fail(`illegal operator '${op}'`);
   const value = (c as Record<string, unknown>).value;
+  if (!f.json) return [condition(f, op, value)];
+  // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+  if (!["EQ", "IN", "NEQ", "NOT_IN"].includes(op)) throw new Fail(`illegal operator '${op}' for ${f.title}`);
+  const like: Operator = op === "EQ" || op === "IN" ? "LIKE" : "NOT_LIKE";
+  return (Array.isArray(value) ? value : [value]).map((v) => ({ field: f.name, op: like, value: JSON.stringify(String(v)) }));
+}
+
+function condition(f: Field, op: string, value: unknown): Cond {
   const cond = (v?: unknown): Cond => ({ field: f.name, op: op as Operator, value: v });
   if (op === "NULL" || op === "NOT_NULL") return cond();
   if (f.isReference && !["EQ", "NEQ", "IN", "NOT_IN"].includes(op)) throw new Fail(`illegal operator '${op}' for a reference`);

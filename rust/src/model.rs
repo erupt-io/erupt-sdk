@@ -54,6 +54,10 @@ pub struct Field {
     pub(crate) table: bool,
     pub(crate) form: bool,
     pub(crate) choices: Vec<(String, String)>,
+    /// in the build only (DIVIDE, CALLOUT, EMPTY, GROUP): no column, never read or written
+    pub(crate) transient: bool,
+    /// a JSON array or object (MULTI_CHOICE, KEY_VALUE), kept as JSON text by SQL repositories
+    pub(crate) json: bool,
     pub(crate) target: Option<Arc<Model>>,
     pub(crate) label: String,
     pub(crate) tree: Option<String>,
@@ -73,6 +77,8 @@ impl Field {
             table: true,
             form: true,
             choices: Vec::new(),
+            transient: false,
+            json: false,
             target: None,
             label: "name".to_string(),
             tree: None,
@@ -143,6 +149,18 @@ impl Field {
     /// Keep the field out of the form (read only for users).
     pub fn hide_form(mut self) -> Self {
         self.form = false;
+        self
+    }
+    /// Declared in the build only, like a JPA `@Transient` field: a layout field (DIVIDE, CALLOUT, EMPTY,
+    /// GROUP via a raw edit type) that has no column and is never read or written.
+    pub fn transient(mut self) -> Self {
+        self.transient = true;
+        self
+    }
+    /// The value is a JSON array or object (MULTI_CHOICE, KEY_VALUE via a raw edit type), kept as JSON text
+    /// by SQL repositories and returned as JSON.
+    pub fn json(mut self) -> Self {
+        self.json = true;
         self
     }
     /// The referenced model's field shown for a reference (`name` by default).
@@ -224,7 +242,8 @@ impl Field {
         if !self.table {
             efj["views"] = json!([]);
         }
-        if self.kind == "CHOICE" {
+        // a CHOICE, or a MULTI_CHOICE by raw edit type: the options travel as componentValue
+        if !self.choices.is_empty() {
             tpl["componentValue"] = Value::Array(
                 self.choices
                     .iter()
@@ -249,6 +268,13 @@ impl Field {
         }
         if value.is_null() || value.as_str() == Some("") {
             return Ok(Value::Null);
+        }
+        if self.json {
+            return if value.is_array() || value.is_object() {
+                Ok(value.clone())
+            } else {
+                Err(format!("illegal value '{}'", text(value)))
+            };
         }
         if self.is_pk() {
             return match value {
@@ -489,6 +515,11 @@ impl Model {
         self.fields.iter().find(|f| f.name == name)
     }
 
+    /// The fields a repository keeps, in declaration order: every field but the transient ones.
+    pub(crate) fn stored(&self) -> impl Iterator<Item = &Field> {
+        self.fields.iter().filter(|f| !f.transient)
+    }
+
     pub(crate) fn build_erupt(&self, operations: &[&Operation]) -> Value {
         let mut erupt = defaults()["erupt"].clone();
         merge(
@@ -582,6 +613,14 @@ impl ModelBuilder {
                     .contains_key(&f.kind)
             {
                 return fail(format!("{path}: edit type {} is not supported yet", f.kind));
+            }
+            if f.transient && (f.search || f.sortable || f.not_null) {
+                return fail(format!(
+                    "{path}: a transient field cannot be searched, sorted or required"
+                ));
+            }
+            if f.json && (f.search || f.sortable) {
+                return fail(format!("{path}: a JSON field cannot be searched or sorted"));
             }
             check("View", &f.view, &format!("{path}.view"), true).map_err(Error::Declaration)?;
             check("Edit", &f.edit, &format!("{path}.edit"), true).map_err(Error::Declaration)?;

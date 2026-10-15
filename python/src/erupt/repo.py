@@ -2,6 +2,7 @@
 so it may use them as identifiers; values always travel as parameters."""
 import datetime
 import decimal
+import json
 import sqlite3
 import sys
 import threading
@@ -60,10 +61,11 @@ def _match(value, cond):
         return value == expect
     if op == "NEQ":
         return value != expect
+    text = json.dumps(value) if isinstance(value, (list, dict)) else str(value)  # a JSON value is matched as its text
     if op == "LIKE":
-        return str(expect).lower() in str(value).lower()
+        return str(expect).lower() in text.lower()
     if op == "NOT_LIKE":
-        return str(expect).lower() not in str(value).lower()
+        return str(expect).lower() not in text.lower()
     if op == "IN":
         return value in expect
     if op == "NOT_IN":
@@ -205,7 +207,9 @@ class SqlRepository(Repository):
             value = record.get(f.name)
             if value is None:
                 continue
-            if f.type == "BOOLEAN":
+            if f.json:
+                record[f.name] = json.loads(value) if isinstance(value, str) else value
+            elif f.type == "BOOLEAN":
                 record[f.name] = bool(value)
             elif isinstance(value, decimal.Decimal):  # NUMERIC columns of PostgreSQL / MySQL / Oracle
                 record[f.name] = int(value) if value == value.to_integral_value() else float(value)
@@ -270,14 +274,19 @@ class SqlRepository(Repository):
         rows = self._run((f"SELECT * FROM {self._q(self.table)} WHERE {self._q(self.model.pk)} = {b.p(pk)}", b))
         return rows[0] if rows else None
 
+    def _store(self, record):
+        """Values as columns hold them: a JSON value as its text."""
+        return {k: json.dumps(v) if self.model.fields[k].json and v is not None else v
+                for k, v in record.items() if k != self.model.pk}
+
     def add(self, record):
-        record = {k: v for k, v in record.items() if k != self.model.pk}
+        record = self._store(record)
         b = _Sql()
         values = ", ".join(b.p(v) for v in record.values())
         self._run((f"INSERT INTO {self._q(self.table)} ({', '.join(self._q(k) for k in record)}) VALUES ({values})", b), write=True)
 
     def update(self, pk, record):
-        record = {k: v for k, v in record.items() if k != self.model.pk}
+        record = self._store(record)
         if not record:
             return
         b = _Sql()

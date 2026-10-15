@@ -134,14 +134,14 @@ module Erupt
     end
 
     def add(record)
-      record = keys(record).except(model.pk)
+      record = store(record)
       p = Params.new(@dialect)
       values = record.values.map { |v| p << v }
       @executor.call("INSERT INTO #{q(@table)} (#{record.keys.map { |k| q(k) }.join(", ")}) VALUES (#{values.join(", ")})", p.values)
     end
 
     def update(pk, record)
-      record = keys(record).except(model.pk)
+      record = store(record)
       return if record.empty?
 
       p = Params.new(@dialect)
@@ -164,6 +164,11 @@ module Erupt
     end
 
     private
+
+    # Values as columns hold them: a JSON value as its text
+    def store(record)
+      keys(record).except(model.pk).to_h { |k, v| [k, model.fields[k]&.json? && !v.nil? ? JSON.generate(v) : v] }
+    end
 
     def where(conditions, p)
       clauses = conditions.map do |c|
@@ -200,6 +205,8 @@ module Erupt
     end
 
     def normalize(field, value)
+      return value.is_a?(String) ? JSON.parse(value) : value if field.json?
+
       case field.type
       when EditType::BOOLEAN then [true, 1, "1", "t", "true"].include?(value)
       when EditType::DATE then Erupt.parse_time(value).to_date

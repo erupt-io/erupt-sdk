@@ -38,7 +38,7 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
     {
         _model = model;
         if (!AutoCreateSqlite) return;
-        var columns = model.Fields.Select(f => f.IsPk
+        var columns = model.Stored.Select(f => f.IsPk
             ? $"{Q(f.Name)} INTEGER PRIMARY KEY AUTOINCREMENT"
             : $"{Q(f.Name)} {(f.Type is "NUMBER" ? "NUMERIC" : f.Type is "BOOLEAN" || f.IsReference ? "INTEGER" : "TEXT")}");
         using var conn = Open();
@@ -70,7 +70,7 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
 
     public async Task AddAsync(Record record, CancellationToken ct = default)
     {
-        var values = record.Where(e => e.Key != _model.Pk).ToList();
+        var values = record.Where(e => e.Key != _model.Pk).Select(Column).ToList();
         var parameters = new List<object?>();
         var placeholders = values.Select(e => P(parameters, e.Value)).ToList();
         await using var conn = Open();
@@ -79,7 +79,7 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
 
     public async Task UpdateAsync(object pk, Record record, CancellationToken ct = default)
     {
-        var values = record.Where(e => e.Key != _model.Pk).ToList();
+        var values = record.Where(e => e.Key != _model.Pk).Select(Column).ToList();
         if (values.Count == 0) return;
         var parameters = new List<object?>();
         var sets = string.Join(", ", values.Select(e => $"{Q(e.Key)} = {P(parameters, e.Value)}"));
@@ -186,9 +186,16 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
         return rows;
     }
 
+    // a JSON field goes in as JSON text: a parameter is a scalar for every provider
+    private KeyValuePair<string, object?> Column(KeyValuePair<string, object?> e) =>
+        e.Value is not null && _model.FieldMap.TryGetValue(e.Key, out var f) && f.IsJson
+            ? KeyValuePair.Create(e.Key, (object?)Values.ToJson(e.Value)!.ToJsonString())
+            : e;
+
     private static object? FromDb(FieldDef field, object? value) => value switch
     {
         null => null,
+        string text when field.IsJson => Values.Plain(System.Text.Json.Nodes.JsonNode.Parse(text)),
         _ when field.Type == "BOOLEAN" => value is bool b ? b : Convert.ToInt64(value, CultureInfo.InvariantCulture) != 0,
         _ when field.Type == "DATE" => value switch
         {

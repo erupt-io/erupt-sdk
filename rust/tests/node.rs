@@ -197,4 +197,5 @@ fn power_fails_closed() {
     let power: &Map<String, Value> = build["power"].as_object().unwrap();
     assert_eq!(Some(&json!(false)), power.get("add"));
     assert_eq!(Some(&json!(false)), power.get("export"));
+    assert_eq!(Some(&json!(false)), power.get("cellEdit"));
 }

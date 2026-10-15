@@ -29,7 +29,7 @@ __version__ = "0.1.0"
 _user = contextvars.ContextVar("erupt_user", default=None)
 
 # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-_UNSUPPORTED_POWER = {"export": False, "importable": False, "cellEdit": False, "print": False, "ai": False}
+_UNSUPPORTED_POWER = {"cellEdit": False, "print": False, "ai": False}
 
 # Rights the server decides per user; the node ANDs them onto the declared power
 _SERVER_POWER = ("add", "edit", "delete", "viewDetails", "export", "importable")
@@ -212,7 +212,7 @@ class Node:
         page_size = min(max(int(body.get("pageSize") or 10), 1), _MAX_PAGE_SIZE)
         query = Query(offset=(page_index - 1) * page_size, limit=page_size)
         for c in body.get("condition") or []:
-            query.conditions.append(self._condition(model, c))
+            query.conditions.extend(self._conditions(model, c))
         for s in body.get("sort") or []:
             f = model.fields.get(s.get("field"))
             if f is None or not (f.sortable or f.pk):
@@ -226,7 +226,7 @@ class Node:
                 "sort": None, "alert": None, "extraContent": None}
 
     @staticmethod
-    def _condition(model, c):
+    def _conditions(model, c):
         f = model.fields.get(c.get("key"))
         if f is None or f.pk or not f.search:
             raise _Fail(f"illegal search field '{c.get('key')}'")
@@ -234,6 +234,16 @@ class Node:
         if op not in _OPS:
             raise _Fail(f"illegal operator '{op}'")
         value = c.get("value")
+        if f.json:
+            # a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+            if op not in ("EQ", "IN", "NEQ", "NOT_IN"):
+                raise _Fail(f"illegal operator '{op}' for {f.title}")
+            like = "LIKE" if op in ("EQ", "IN") else "NOT_LIKE"
+            return [Cond(f.name, like, json.dumps(str(v))) for v in (value if isinstance(value, list) else [value])]
+        return [Node._condition(f, op, value)]
+
+    @staticmethod
+    def _condition(f, op, value):
         if op in ("NULL", "NOT_NULL"):
             return Cond(f.name, op)
         if f.type in ("REFERENCE_TABLE", "REFERENCE_TREE") and op not in ("EQ", "NEQ", "IN", "NOT_IN"):

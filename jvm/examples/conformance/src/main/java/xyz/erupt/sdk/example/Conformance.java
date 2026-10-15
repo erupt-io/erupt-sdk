@@ -15,9 +15,9 @@ import xyz.erupt.annotation.sub_field.sub_edit.InputType;
 import xyz.erupt.annotation.sub_field.sub_edit.ReferenceTreeType;
 import xyz.erupt.annotation.sub_field.sub_edit.Search;
 import xyz.erupt.annotation.sub_field.sub_edit.VL;
-import xyz.erupt.sdk.MemoryRepository;
-import xyz.erupt.sdk.Node;
-import xyz.erupt.sdk.User;
+import xyz.erupt.cloud.node.lite.MemoryRepository;
+import xyz.erupt.cloud.node.lite.Node;
+import xyz.erupt.cloud.node.lite.User;
 
 import java.util.Date;
 import java.util.List;

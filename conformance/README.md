@@ -11,7 +11,7 @@ python conformance/run.py -- node ts/dist/examples/conformance.js
 python conformance/run.py -- php php/examples/conformance.php
 (cd rust && cargo build --release --example conformance) && python conformance/run.py -- rust/target/release/examples/conformance
 python conformance/run.py -- ruby ruby/examples/conformance.rb
-(cd jvm && mvn -B -q install -DskipTests && mvn -B -q -f examples/pom.xml -pl conformance package) && python conformance/run.py -- java -jar jvm/examples/conformance/target/erupt-conformance.jar
+mvn -B -q -f jvm/examples/pom.xml -pl conformance package && python conformance/run.py -- java -jar jvm/examples/conformance/target/erupt-conformance.jar
 (cd dotnet && dotnet build -c Release) && python conformance/run.py -- dotnet dotnet/examples/Conformance/bin/Release/net8.0/Conformance.dll
 ```
 

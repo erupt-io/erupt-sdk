@@ -14,8 +14,8 @@ import xyz.erupt.annotation.sub_field.EditType
 import xyz.erupt.annotation.sub_field.View
 import xyz.erupt.annotation.sub_field.sub_edit.ReferenceTreeType
 import xyz.erupt.annotation.sub_field.sub_edit.Search
-import xyz.erupt.sdk.JdbcRepository
-import xyz.erupt.sdk.Node
+import xyz.erupt.cloud.node.lite.JdbcRepository
+import xyz.erupt.cloud.node.lite.Node
 import java.time.LocalDate
 import java.time.LocalDateTime
 

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- The examples, built against the installed SDK (mvn -f jvm/pom.xml install) and never published -->
+<!-- The examples, built against xyz.erupt:erupt-cloud-node-lite (released with erupt, or installed from an erupt
+     checkout: mvn install -pl erupt-cloud/erupt-cloud-node-lite -am -DskipTests) and never published -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -18,7 +19,7 @@
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <erupt-sdk.version>0.1.0</erupt-sdk.version>
+        <erupt.version>2.3.0</erupt.version>
         <maven.deploy.skip>true</maven.deploy.skip>
         <maven.install.skip>true</maven.install.skip>
     </properties>
@@ -26,8 +27,8 @@
     <dependencies>
         <dependency>
             <groupId>xyz.erupt</groupId>
-            <artifactId>erupt-sdk</artifactId>
-            <version>${erupt-sdk.version}</version>
+            <artifactId>erupt-cloud-node-lite</artifactId>
+            <version>${erupt.version}</version>
         </dependency>
     </dependencies>
 

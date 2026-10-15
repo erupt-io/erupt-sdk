@@ -47,6 +47,9 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
       - name: Regenerate every language
         run: |
           # python copies the schema into schema/ (and its package); the others generate from schema/
@@ -56,6 +59,8 @@ jobs:
           (cd php && php tools/gen-types.php ../schema)
           (cd dotnet && dotnet run --project tools/GenTypes -- ../schema)
           (cd rust && cargo run --bin gen-types -- ../schema)
+          (cd ruby && ruby tools/gen_types.rb ../schema)
+          # jvm/ declares models with erupt-annotation itself: nothing to generate, bump erupt.version instead
           (cd python && PYTHONPATH=src python -m unittest discover -s tests)
       - name: Open a pull request
         run: |

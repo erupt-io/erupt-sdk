@@ -1,4 +1,5 @@
-# Publishes one language per tag: python/v1.2.3, ts/v1.2.3, go/v1.2.3, php/v1.2.3, dotnet/v1.2.3, rust/v1.2.3.
+# Publishes one language per tag: python/v1.2.3, ts/v1.2.3, go/v1.2.3, php/v1.2.3, dotnet/v1.2.3, rust/v1.2.3,
+# ruby/v1.2.3, jvm/v1.2.3.
 # Each runs that language's full CI first and refuses a tag that differs from the package version.
 # Publishing uses OpenID Connect trusted publishing; no registry token is stored in this repository.
 # One-time setup per registry: see RELEASING.md.
@@ -6,7 +7,7 @@ name: release
 
 on:
   push:
-    tags: ["python/v*", "ts/v*", "go/v*", "php/v*", "dotnet/v*", "rust/v*"]
+    tags: ["python/v*", "ts/v*", "go/v*", "php/v*", "dotnet/v*", "rust/v*", "ruby/v*", "jvm/v*"]
 
 permissions:
   contents: read
@@ -22,7 +23,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          [[ "$TAG" =~ ^(python|ts|go|php|dotnet|rust)/v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?)$ ]] || { echo "illegal tag $TAG"; exit 1; }
+          [[ "$TAG" =~ ^(python|ts|go|php|dotnet|rust|ruby|jvm)/v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?)$ ]] || { echo "illegal tag $TAG"; exit 1; }
           echo "lang=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
           echo "version=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
 
@@ -218,10 +219,77 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+  # ---------------------------------------------------------------- ruby -> RubyGems
+
+  ruby-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'ruby'
+    uses: ./.github/workflows/ruby.yml
+
+  ruby:
+    needs: [meta, ruby-ci]
+    runs-on: ubuntu-latest
+    environment: rubygems
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        working-directory: ruby
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - name: Tag matches the package version
+        run: grep -qx "  VERSION = \"$VERSION\"" lib/erupt/version.rb || { echo "VERSION in lib/erupt/version.rb is not $VERSION"; exit 1; }
+      # trusted publishing: exchanges the workflow's OIDC token for a short-lived RubyGems API key
+      - uses: rubygems/configure-rubygems-credentials@v1.0.0
+      - run: gem build erupt-sdk.gemspec
+      - run: gem push "erupt-sdk-$VERSION.gem"
+
+  # ---------------------------------------------------------------- jvm -> Maven Central
+
+  jvm-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'jvm'
+    uses: ./.github/workflows/jvm.yml
+
+  jvm:
+    needs: [meta, jvm-ci]
+    runs-on: ubuntu-latest
+    environment: maven-central
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        working-directory: jvm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          server-id: central
+          server-username: CENTRAL_USERNAME
+          server-password: CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - name: Tag matches the package version
+        run: |
+          [ "$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)" = "$VERSION" ] || { echo "pom.xml is not $VERSION"; exit 1; }
+          grep -q "public static final String VERSION = \"$VERSION\";" src/main/java/xyz/erupt/sdk/Node.java || { echo "VERSION in Node.java is not $VERSION"; exit 1; }
+      - run: mvn -B -P release deploy -DskipTests
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+
   # ---------------------------------------------------------------- GitHub release
 
   github-release:
-    needs: [meta, python, ts, go, php, dotnet, rust]
+    needs: [meta, python, ts, go, php, dotnet, rust, ruby, jvm]
     # exactly one language job ran; the others are skipped
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest

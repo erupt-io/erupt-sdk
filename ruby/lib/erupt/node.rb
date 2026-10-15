@@ -1,0 +1,492 @@
+# frozen_string_literal: true
+
+require "json"
+require "net/http"
+require "openssl"
+require "securerandom"
+require "socket"
+require "stringio"
+require "uri"
+
+module Erupt
+  # The acting user of the request being served: <tt>{"uid", "account", "name", "tenantId"}</tt>.
+  def self.current_user = Thread.current[:erupt_user]
+
+  # Erupt cloud node runtime: registers with the server, then answers the requests it forwards. The wire
+  # contract is erupt-cloud/PROTOCOL.md (Level 0). A node is a Rack application (+call(env)+), so it can be
+  # mounted in Rails / Sinatra / any Rack server, or served on its own with +serve+.
+  class Node
+    # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
+    UNSUPPORTED_POWER = { "export" => false, "importable" => false, "cellEdit" => false, "print" => false, "ai" => false }.freeze
+    # Rights the server decides per user; the node ANDs them onto the declared power
+    SERVER_POWER = %w[add edit delete viewDetails export importable].freeze
+    OPS = %w[EQ NEQ GT GTE LT LTE LIKE NOT_LIKE RANGE IN NOT_IN NULL NOT_NULL].freeze
+    MAX_PAGE_SIZE = 1000
+    POWER_TTL = 5
+
+    ROUTES = [
+      ["GET", %r{\A/erupt-api/build/([^/]+)\z}, :build],
+      ["GET", %r{\A/erupt-api/build/([^/]+)/([^/]+)\z}, :build_by_field],
+      ["POST", %r{\A/erupt-api/data/table/([^/]+)\z}, :table],
+      ["POST", %r{\A/erupt-api/data/([^/]+)/reference-table/([^/]+)\z}, :reference_table],
+      ["POST", %r{\A/erupt-api/data/([^/]+)/operator/([^/]+)/form-value\z}, :operation_form_value],
+      ["POST", %r{\A/erupt-api/data/([^/]+)/operator/([^/]+)\z}, :operation],
+      ["GET", %r{\A/erupt-api/data/init-value/([^/]+)\z}, :init_value],
+      ["GET", %r{\A/erupt-api/data/([^/]+)/([^/]+)\z}, :get],
+      ["POST", %r{\A/erupt-api/data/modify/([^/]+)\z}, :add],
+      ["POST", %r{\A/erupt-api/data/modify/([^/]+)/update\z}, :update],
+      ["POST", %r{\A/erupt-api/data/modify/([^/]+)/delete\z}, :delete]
+    ].freeze
+
+    # Answered with a bare status
+    class Reply < StandardError
+      attr_reader :status
+
+      def initialize(status)
+        super(status.to_s)
+        @status = status
+      end
+    end
+
+    # A business error shown to the user as an R message
+    class Fail < StandardError; end
+
+    # Logs to $stderr unless a logger (Rails.logger, Logger.new(...)) is given.
+    class StderrLog
+      %i[info warn error].each { |level| define_method(level) { |msg| $stderr.puts("[erupt] #{level.upcase} #{msg}") } }
+      def debug(_msg) = nil
+    end
+
+    attr_reader :name, :address, :models
+
+    # +require_signature+ refuses server calls without a valid Erupt-Signature, so the plain access token alone
+    # no longer passes (servers sign since erupt 2.3.x).
+    def initialize(name, access_token, servers, address: nil, heartbeat: 15, require_signature: false, logger: nil)
+      raise ArgumentError, "access_token is required" if access_token.to_s.empty?
+
+      @name, @access_token, @require_signature = name, access_token, require_signature
+      @servers = Array(servers).map { |s| s.chomp("/") }
+      @address, @heartbeat, @log = address, heartbeat, logger || StderrLog.new
+      @models = {}
+      @tick = 0
+      @power_cache = {}
+      @lock = Mutex.new
+    end
+
+    def register(cls, repository)
+      model = cls.respond_to?(:erupt_model) ? cls.erupt_model : raise(ArgumentError, "#{cls} does not extend Erupt::Model")
+      model.validate!
+      raise ArgumentError, "erupt '#{model.name}' registered twice" if @models.key?(model.name)
+      raise ArgumentError, "#{model.name} has no primary key; only an operation form may omit it" if model.pk.nil?
+
+      repository.bind(model)
+      @models[model.name] = [model, repository]
+      self
+    end
+
+    # ---------------------------------------------------------------- Rack
+
+    def call(env)
+      status, body = begin
+        dispatch(env)
+      rescue Reply => e
+        [e.status, ""]
+      rescue Fail => e
+        [200, r(success: false, message: e.message)]
+      rescue StandardError => e # never leak internals: message only, the stack stays in the node log
+        @log.error("erupt node error: #{e.class}: #{e.message}\n#{e.backtrace&.join("\n")}")
+        [500, { "path" => env["PATH_INFO"], "status" => 500, "error" => "erupt exception", "message" => e.message }]
+      ensure
+        Thread.current[:erupt_user] = nil
+      end
+      payload, type = body.is_a?(String) ? [body, "text/plain; charset=utf-8"] : [JSON.generate(body), "application/json; charset=utf-8"]
+      [status, { "content-type" => type, "content-length" => payload.bytesize.to_s }, [payload]]
+    end
+
+    # Serve until SIGINT / SIGTERM: HTTP first (the server probes /node-health while registering), then the
+    # heartbeat; deregisters on the way out. Mount the node in a Rack server instead and call +start+ / +stop+.
+    def serve(host: "0.0.0.0", port: 9090)
+      http = HttpServer.new(self, host, port)
+      start(port: port)
+      http.run
+    rescue SignalException
+      nil
+    ensure
+      stop
+      http&.close
+    end
+
+    # Start registering (and the heartbeat) for a node served by a Rack server listening on +port+.
+    def start(port:)
+      @instance_id = SecureRandom.hex(3)
+      @address = (@address || "http://#{local_ip(@servers.first)}:#{port}").chomp("/")
+      @heartbeat_thread = Thread.new { heartbeat_loop }
+      @log.info("erupt node '#{@name}' at #{@address} -> #{@servers.join(", ")}")
+      self
+    end
+
+    # Stop the heartbeat and deregister.
+    def stop
+      return unless @heartbeat_thread
+
+      @heartbeat_thread.kill
+      @heartbeat_thread = nil
+      deregister
+    end
+
+    private
+
+    def dispatch(env)
+      path, method = env["PATH_INFO"].to_s, env["REQUEST_METHOD"]
+      return [200, @name] if path == "/node-health"
+      raise Reply, 404 unless path.start_with?("/erupt-api/")
+      # server-to-server only: an Origin header means a browser reached the node directly
+      raise Reply, 403 unless env["HTTP_ORIGIN"].to_s.empty?
+
+      authenticate(env)
+      ROUTES.each do |verb, pattern, handler|
+        match = verb == method && pattern.match(path)
+        next unless match
+
+        name = unescape(match[1])
+        raise Reply, 404 if env["HTTP_ERUPT"] != name || !@models.key?(name)
+
+        parent = env["HTTP_ERUPTPARENT"] || query_param(env, "_eruptParent")
+        # nesting is not supported yet, so a parent can only vouch for itself
+        raise Reply, 404 if parent && !parent.empty? && parent[/[^.]*\z/] != name
+
+        user = env["HTTP_USER"].to_s
+        Thread.current[:erupt_user] = user.empty? ? nil : JSON.parse(user.unpack1("m"))
+        model, repo = @models[name]
+        return [200, send(handler, model, repo, env, *match.captures.drop(1).map { |g| unescape(g) })]
+      end
+      raise Reply, 404
+    end
+
+    # A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then.
+    def authenticate(env)
+      env["erupt.enforced"] = []
+      signature = env["HTTP_ERUPT_SIGNATURE"]
+      if signature.nil?
+        raise Reply, 403 if @require_signature || !OpenSSL.secure_compare(env["HTTP_ACCESS_TOKEN"].to_s, @access_token)
+
+        return
+      end
+      enforced = env["HTTP_ERUPT_ENFORCED"]
+      multipart = env["CONTENT_TYPE"].to_s.include?("multipart/form-data")
+      ok = Signature.verify(@access_token, env["REQUEST_METHOD"], path_and_query(env), env["HTTP_ERUPT_TIMESTAMP"], enforced,
+                            env["HTTP_USER"], multipart ? nil : body(env), signature, Time.now.to_i)
+      raise Reply, 403 unless ok
+
+      env["erupt.enforced"] = enforced.to_s.split(",").reject(&:empty?)
+    end
+
+    # ---------------------------------------------------------------- endpoints
+
+    def build(model, _repo, env) = model.build_model(power(model, env), Erupt.current_user)
+
+    # the reference picker: build of the referenced model, requested under the host model's name
+    def build_by_field(model, _repo, env, field)
+      target = reference_field(model, field).target
+      target.build_model(power(target, env), Erupt.current_user)
+    end
+
+    def table(model, repo, env)
+      require_power(model, env, "query")
+      page(model, repo, read_object(env))
+    end
+
+    def reference_table(model, _repo, env, field)
+      target = reference_field(model, field, EditType::REFERENCE_TABLE).target
+      entry = @models[target.name]
+      raise ArgumentError, "referenced erupt '#{target.name}' is not registered on this node" unless entry&.first.equal?(target)
+
+      page(target, entry.last, read_object(env))
+    end
+
+    def reference_field(model, field, edit_type = nil)
+      f = model.fields[field]
+      raise Reply, 404 unless f&.reference? && (edit_type.nil? || f.type == edit_type)
+
+      f
+    end
+
+    def page(model, repo, body)
+      page_index = [int(body["pageIndex"] || 1), 1].max
+      page_size = int(body["pageSize"] || 10).clamp(1, MAX_PAGE_SIZE)
+      query = Query.new(offset: (page_index - 1) * page_size, limit: page_size)
+      Array(body["condition"]).each { |c| query.conditions << condition(model, c) }
+      Array(body["sort"]).each do |s|
+        f = s.is_a?(Hash) && model.fields[s["field"]]
+        raise Fail, "illegal sort field '#{s["field"] if s.is_a?(Hash)}'" unless f && (f.sortable? || f.pk?)
+
+        query.sort << [f.name, s["direction"].to_s.upcase == "DESC"]
+      end
+      query.sort = model.order.dup if query.sort.empty?
+      total, records = repo.page(query)
+      { "pageIndex" => page_index, "pageSize" => page_size, "total" => total, "totalPage" => (total + page_size - 1) / page_size,
+        "list" => rows(model, records), "sort" => nil, "alert" => nil, "extraContent" => nil }
+    end
+
+    def condition(model, c)
+      c = {} unless c.is_a?(Hash)
+      f = model.fields[c["key"]]
+      raise Fail, "illegal search field '#{c["key"]}'" if f.nil? || f.pk? || !f.search?
+
+      op = c["expression"] || "EQ"
+      raise Fail, "illegal operator '#{op}'" unless OPS.include?(op)
+      return Cond.new(f.name, op) if %w[NULL NOT_NULL].include?(op)
+      raise Fail, "illegal operator '#{op}' for a reference" if f.reference? && !%w[EQ NEQ IN NOT_IN].include?(op)
+
+      value = c["value"]
+      case op
+      when "LIKE", "NOT_LIKE" then Cond.new(f.name, op, value.to_s)
+      when "RANGE"
+        raise Fail, "range needs two values" unless value.is_a?(Array) && value.size == 2
+
+        Cond.new(f.name, op, value.map { |v| coerce(f, v) })
+      when "IN", "NOT_IN" then Cond.new(f.name, op, (value.is_a?(Array) ? value : [value]).map { |v| coerce(f, v) })
+      else Cond.new(f.name, op, coerce(f, value))
+      end
+    end
+
+    def init_value(model, _repo, env)
+      require_power(model, env, "add")
+      model.fields.keys.to_h { |name| [name, nil] }
+    end
+
+    def get(model, repo, env, pk)
+      granted = power(model, env)
+      raise Reply, 403 unless granted["edit"] || granted["viewDetails"]
+
+      record = repo.get(pk_of(model, pk)) or raise Fail, "record not found"
+      rows(model, [record]).first
+    end
+
+    def add(model, repo, env)
+      require_power(model, env, "add")
+      repo.add(record(model, read_object(env)))
+      r
+    end
+
+    def update(model, repo, env)
+      require_power(model, env, "edit")
+      body = read_object(env)
+      pk = pk_of(model, body[model.pk])
+      raise Fail, "record not found" if repo.get(pk).nil?
+
+      repo.update(pk, record(model, body))
+      r
+    end
+
+    def delete(model, repo, env)
+      require_power(model, env, "delete")
+      ids = read_json(env)
+      raise Fail, "a list of ids is required" unless ids.is_a?(Array)
+
+      repo.delete(ids.map { |pk| pk_of(model, pk) })
+      r
+    end
+
+    # Records to browser rows. A reference stays its key: the server resolves its label, the flattened
+    # <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
+    def rows(model, records)
+      records.map do |rec|
+        model.fields.keys.to_h { |name| [name, Erupt.json_value(rec.key?(name) ? rec[name] : rec[name.to_sym])] }
+      end
+    end
+
+    def operation_of(model, code)
+      op = model.operations[code]
+      raise Reply, 404 if op.nil?
+      # a hidden operation does not exist for this user, exactly like the Java proxy filters it out
+      raise Reply, 403 unless op.visible?(Erupt.current_user)
+
+      op
+    end
+
+    def operation_form_value(model, _repo, _env, code)
+      op = operation_of(model, code)
+      raise Reply, 404 unless op.form # the browser ignores a 404 here and opens an empty form
+
+      op.form_model.fields.keys.to_h { |name| [name, nil] }
+    end
+
+    def operation(model, repo, env, code)
+      op = operation_of(model, code)
+      body = read_object(env)
+      param = op.form && record(op.form_model, body["param"].is_a?(Hash) ? body["param"] : {})
+      selected = []
+      unless op.mode == RowOperationMode::BUTTON
+        ids = body["ids"]
+        raise Fail, "select at least one row" unless ids.is_a?(Array) && !ids.empty?
+        raise Fail, "select exactly one row" if op.mode == RowOperationMode::SINGLE && ids.size != 1
+
+        selected = ids.map { |pk| repo.get(pk_of(model, pk)) || raise(Fail, "record '#{pk}' not found") }
+      end
+      result = op.handler.call(OperationContext.new(rows: selected, param: param, repo: repo, model: model, user: Erupt.current_user))
+      result.is_a?(String) && !result.empty? ? r(data: result) : r(message: "Executed successfully")
+    end
+
+    def pk_of(model, value) = coerce(model.fields[model.pk], value)
+
+    def coerce(field, value)
+      field.coerce(value)
+    rescue ArgumentError, TypeError => e
+      raise Fail, e.message
+    end
+
+    def record(model, body)
+      model.fields.each_value.reject { |f| f.pk? || !f.form? }.to_h do |f|
+        value = begin
+          f.coerce(body[f.name])
+        rescue ArgumentError, TypeError => e
+          raise Fail, "#{f.title}: #{e.message}"
+        end
+        raise Fail, "#{f.title} cannot be empty" if f.not_null? && value.nil?
+
+        [f.name, value]
+      end
+    end
+
+    def r(success: true, message: nil, data: nil)
+      { "success" => success, "status" => success ? "SUCCESS" : "ERROR", "message" => message, "data" => data, "promptWay" => "MESSAGE" }
+    end
+
+    # ---------------------------------------------------------------- permissions (PROTOCOL.md §6.1)
+
+    def require_power(model, env, right)
+      raise Reply, 403 unless power(model, env)[right]
+    end
+
+    def power(model, env)
+      granted = model.power.merge(UNSUPPORTED_POWER)
+      # the server checked the user's rights and restricts the build's power itself: the model's own
+      # declaration is all that is left to apply here
+      return granted if env["erupt.enforced"]&.include?("power")
+
+      key = [env["HTTP_TOKEN"].to_s, model.name]
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      cached = @lock.synchronize { @power_cache[key] }
+      return cached.last if cached && cached.first > now
+
+      remote = begin
+        server_call(:get, "/erupt-cloud-api/erupt-power", query: { nodeName: @name, eruptName: model.name }, headers: { "token" => key.first })
+      rescue StandardError => e # fail closed: without the server's verdict nothing is writable
+        @log.warn("erupt-power unavailable: #{e.message}")
+        {}
+      end
+      remote = {} unless remote.is_a?(Hash)
+      SERVER_POWER.each { |right| granted[right] &&= !!remote[right] }
+      @lock.synchronize do
+        @power_cache.clear if @power_cache.size > 10_000
+        @power_cache[key] = [now + POWER_TTL, granted]
+      end
+      granted
+    end
+
+    # ---------------------------------------------------------------- server calls
+
+    def next_server = @servers[(@tick += 1) % @servers.size]
+
+    # GET with a query (JSON answer), or POST a JSON / form body; raises unless the server answers 2xx.
+    def server_call(method, path, server: next_server, query: nil, json: nil, form: nil, headers: {}, timeout: 5)
+      uri = URI(server + path)
+      uri.query = URI.encode_www_form(query) if query
+      request = method == :get ? Net::HTTP::Get.new(uri, headers) : Net::HTTP::Post.new(uri, headers)
+      if json
+        request.body = JSON.generate(json)
+        request["Content-Type"] = "application/json"
+      end
+      request.set_form_data(form) if form
+      response = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", open_timeout: timeout, read_timeout: timeout) do |http|
+        http.request(request)
+      end
+      raise "#{uri.path} answered HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+      response.body.to_s.empty? ? nil : JSON.parse(response.body)
+    end
+
+    def node_info
+      { "instanceId" => @instance_id, "nodeName" => @name, "accessToken" => @access_token, "version" => "ruby-#{VERSION}",
+        "nodeAddress" => [@address], "eruptModules" => [], "erupts" => @models.keys, "resources" => {} }
+    end
+
+    def heartbeat_loop
+      failing = false
+      loop do
+        server = next_server
+        begin
+          server_call(:post, "/erupt-cloud-api/register-node", server: server, json: node_info, timeout: 10)
+          @log.info("#{server} -> connection success") if failing
+          failing = false
+          sleep(@heartbeat)
+        rescue StandardError => e
+          failing = true
+          @log.error("#{server} -> register failed: #{e.message}")
+          sleep(@heartbeat / 2.0)
+        end
+      end
+    end
+
+    def deregister
+      server_call(:post, "/erupt-cloud-api/remove-instance-node", form: { nodeName: @name, accessToken: @access_token, locations: @address })
+    rescue StandardError => e
+      @log.error("deregister failed: #{e.message}")
+    end
+
+    def read_object(env)
+      body = read_json(env)
+      return {} if body.nil?
+      raise Fail, "a JSON object is required" unless body.is_a?(Hash)
+
+      body
+    end
+
+    def read_json(env)
+      text = body(env)
+      text.empty? ? nil : JSON.parse(text.dup.force_encoding(Encoding::UTF_8))
+    rescue JSON::ParserError
+      raise Fail, "malformed JSON body"
+    end
+
+    # The raw body, read once.
+    def body(env)
+      env["erupt.body"] ||= begin
+        input = env["rack.input"]
+        input&.rewind if input.respond_to?(:rewind)
+        input&.read.to_s.b
+      end
+    end
+
+    def int(value)
+      Integer(value)
+    rescue ArgumentError, TypeError
+      raise Fail, "illegal number '#{value}'"
+    end
+
+    # The request target as the server signed it: the raw path below the mount point, plus the query.
+    def path_and_query(env)
+      query = env["QUERY_STRING"].to_s
+      env["PATH_INFO"].to_s + (query.empty? ? "" : "?#{query}")
+    end
+
+    def unescape(text) = text.b.gsub(/%(\h\h)/) { Regexp.last_match(1).hex.chr }.force_encoding(Encoding::UTF_8)
+
+    def query_param(env, name)
+      URI.decode_www_form(env["QUERY_STRING"].to_s).assoc(name)&.last
+    rescue ArgumentError
+      nil
+    end
+
+    # The interface address the server would see us on.
+    def local_ip(server)
+      UDPSocket.open do |s|
+        s.connect(URI(server).host || "127.0.0.1", 80)
+        s.addr.last
+      end
+    rescue StandardError
+      "127.0.0.1"
+    end
+  end
+end

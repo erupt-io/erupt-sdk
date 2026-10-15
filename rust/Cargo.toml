@@ -1,0 +1,44 @@
+[package]
+name = "erupt-sdk"
+version = "0.1.0"
+edition = "2021"
+# the default build (serde, serde_json, ctrlc, some of them edition 2024) is checked on 1.85 by the msrv job;
+# the database drivers behind features follow their own MSRV (1.88 at the time of writing)
+rust-version = "1.85"
+description = "Serve Rust models as erupt admin pages through an erupt cloud server"
+license = "Apache-2.0"
+repository = "https://github.com/erupt-io/erupt-sdk"
+readme = "README.md"
+keywords = ["erupt", "admin", "low-code", "crud"]
+categories = ["web-programming"]
+include = ["src/**", "tools/**", "examples/**", "tests/**", "*.json", "README.md", "Cargo.toml"]
+
+[lib]
+name = "erupt"
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+postgres = ["dep:postgres", "dep:chrono"]
+mysql = ["dep:mysql"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ctrlc = { version = "3.5", features = ["termination"] }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+mysql = { version = "28", default-features = false, features = ["minimal"], optional = true }
+
+[[bin]]
+name = "gen-types"
+path = "src/bin/gen-types.rs"
+
+[[example]]
+name = "blog"
+required-features = ["sqlite"]
+
+[[test]]
+name = "databases"
+required-features = ["postgres", "mysql"]

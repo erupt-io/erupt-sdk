@@ -16,15 +16,18 @@ git tag python/v0.2.0 && git push origin python/v0.2.0
 | `ts/vX.Y.Z` | npm `erupt-sdk` | `ts/package.json`, `VERSION` in `ts/src/node.ts` |
 | `go/vX.Y.Z` | Go module proxy, `github.com/erupt-io/erupt-sdk/go` | `Version` in `go/node.go` (the tag itself is the release) |
 | `php/vX.Y.Z` | Packagist `erupt-io/erupt-sdk`, through the split repository | `VERSION` in `php/src/Node.php` |
+| `rust/vX.Y.Z` | crates.io `erupt-sdk` | `rust/Cargo.toml`, `VERSION` in `rust/src/node.rs` |
 | `dotnet/vX.Y.Z` | NuGet `Erupt.Sdk` | `<Version>` in `dotnet/src/Erupt.Sdk/Erupt.Sdk.csproj`, `Version` in `dotnet/src/Erupt.Sdk/Node.cs` |
+| `ruby/vX.Y.Z` | RubyGems `erupt-sdk` | `VERSION` in `ruby/lib/erupt/version.rb` (the gemspec and the reported version read it) |
+| `jvm/vX.Y.Z` | Maven Central `xyz.erupt:erupt-sdk` | `<version>` in `jvm/pom.xml` (and `erupt-sdk.version` in `jvm/examples/pom.xml`), `VERSION` in `jvm/src/main/java/xyz/erupt/sdk/Node.java` |
 
-Java has no release here: `xyz.erupt:erupt-cloud-node` ships with erupt.
+Spring Java nodes use `xyz.erupt:erupt-cloud-node`, which ships with erupt.
 
 ## One-time setup
 
 No registry token is stored in this repository. Publishing uses OpenID Connect trusted publishing, so each
 registry is told once that this repository's `release.yml` may publish the package. Each job runs in a
-GitHub environment of the same name (`pypi`, `npm`, `nuget`, `packagist`); add required reviewers there to
+GitHub environment of the same name (`pypi`, `npm`, `nuget`, `packagist`, `crates-io`, `rubygems`, `maven-central`); add required reviewers there to
 approve every release by hand.
 
 - **PyPI**: on pypi.org add a pending trusted publisher for project `erupt-sdk`: owner `erupt-io`,
@@ -40,6 +43,15 @@ approve every release by hand.
   Create `erupt-io/erupt-sdk-php` (or set the repository variable `PHP_SPLIT_REPO`), create a fine-grained
   token with contents write on that repository only and save it as the `packagist` environment secret
   `PHP_SPLIT_TOKEN`, then submit the split repository on packagist.org and enable its GitHub hook.
+- **crates.io**: trusted publishing is configured on an existing crate, so publish the first version by hand
+  (`cd rust && cargo publish`). Then in the crate settings on crates.io add a trusted publisher:
+  `erupt-io/erupt-sdk`, workflow `release.yml`, environment `crates-io`.
+- **RubyGems**: on rubygems.org add a pending trusted publisher for gem `erupt-sdk`: repository
+  `erupt-io/erupt-sdk`, workflow `release.yml`, environment `rubygems`. A pre-release version is written
+  `x.y.z.rc1` (no `-`).
+- **Maven Central**: Central Portal has no trusted publishing, so the `maven-central` environment holds a Portal user
+  token (`CENTRAL_TOKEN_USERNAME` / `CENTRAL_TOKEN_PASSWORD`, namespace `xyz.erupt`) and the signing key
+  (`MAVEN_GPG_PRIVATE_KEY`, `MAVEN_GPG_PASSPHRASE`).
 - **Go**: nothing; the module proxy picks the tag up.
 - **GitHub**: Settings → Actions → General → allow GitHub Actions to create pull requests (used by
   `sync-schema.yml`).

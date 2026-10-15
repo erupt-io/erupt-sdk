@@ -1,0 +1,56 @@
+{
+  "description": "Erupt-Signature test vectors (erupt-cloud/PROTOCOL.md §4.3), computed by the Java reference xyz.erupt.cloud.common.http.CloudSignature. body null = multipart (UNSIGNED-PAYLOAD); bodies are UTF-8.",
+  "accessToken": "conformance-access-token",
+  "vectors": [
+    {
+      "case": "a write, enforced",
+      "method": "POST",
+      "pathAndQuery": "/erupt-api/data/modify/Article",
+      "timestamp": 1800000000,
+      "enforced": "power,record",
+      "user": "eyJ1aWQiOjF9",
+      "body": "{\"title\":\"Hello\"}",
+      "signature": "b5424c718f12c69cb79fc749dcd7f8d16c2bdce3697cf37ed1585394a5350ca4"
+    },
+    {
+      "case": "a read, empty body, nothing enforced",
+      "method": "GET",
+      "pathAndQuery": "/erupt-api/build/Article",
+      "timestamp": 1800000000,
+      "enforced": null,
+      "user": "eyJ1aWQiOjF9",
+      "body": "",
+      "signature": "70a8f03f598df15a9fe4ac3e320f8fa8965c050c913e8cc32469634995f5798d"
+    },
+    {
+      "case": "lower-case method, query string, no user header",
+      "method": "post",
+      "pathAndQuery": "/erupt-api/data/Article/operator/publish/form-value?ids=1&ids=2",
+      "timestamp": 1800000001,
+      "enforced": "power",
+      "user": null,
+      "body": "",
+      "signature": "da194844374aedaf5df8a78dffd42aa4bc2d23699eee2f4053a5df58f124d8df"
+    },
+    {
+      "case": "multipart: body not covered",
+      "method": "POST",
+      "pathAndQuery": "/erupt-api/file/upload/Article/cover",
+      "timestamp": 1800000002,
+      "enforced": "power",
+      "user": "eyJ1aWQiOjF9",
+      "body": null,
+      "signature": "f85a2e4143a4726c27bf596be7cb54bab35e96face0cf3ef048ff0a58d0f6354"
+    },
+    {
+      "case": "UTF-8 body",
+      "method": "POST",
+      "pathAndQuery": "/erupt-api/data/modify/Article",
+      "timestamp": 1800000000,
+      "enforced": "power,record",
+      "user": "eyJ1aWQiOjF9",
+      "body": "{\"title\":\"中文 ✓\"}",
+      "signature": "d3a952d25283065071814f2c92eb79fef90eb0c65742831e30fe363fbececee4"
+    }
+  ]
+}

@@ -70,13 +70,13 @@ public class NodeTests
         var row = page!["list"]![0]!;
         Assert.Equal(7, row["views"]!.GetValue<long>());
         Assert.Equal("2026-01-05T10:30:00.000", row["review_at"]!.GetValue<string>());
-        Assert.Equal("""{"id":"2","name":"Python"}""", row["category"]!.ToJsonString());
-        Assert.Equal("Python", row["category_name"]!.GetValue<string>());
+        // a reference travels as its key; the server resolves labels and flattened columns
+        Assert.Equal(2, row["category"]!.GetValue<long>());
+        Assert.False(row.AsObject().ContainsKey("category_name"));
         var (_, fail) = await Call(node, "POST", "/erupt-api/data/modify/Article", new { status = "draft" });
         Assert.Equal("Title cannot be empty", fail!["message"]!.GetValue<string>());
-        var (_, tree) = await Call(node, "GET", "/erupt-api/data/Article/reference-tree/topic");
-        Assert.Equal("Python", tree![0]!["children"]![0]!["label"]!.GetValue<string>());
-        Assert.Equal(2, tree[0]!["children"]![0]!["level"]!.GetValue<int>());
+        var (treeStatus, _) = await Call(node, "GET", "/erupt-api/data/Article/reference-tree/topic");
+        Assert.Equal(404, treeStatus); // the server builds reference trees
     }
 
     [Fact]

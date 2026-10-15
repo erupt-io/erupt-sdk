@@ -66,10 +66,17 @@ func main() {
 	if port == "" {
 		port = "9090"
 	}
-	node := must(erupt.NewNode(erupt.Config{Name: "blog", AccessToken: os.Getenv("ERUPT_ACCESS_TOKEN"), Servers: []string{server}}))
+	node := must(erupt.NewNode(erupt.Config{Name: envOr("ERUPT_NODE_NAME", "blog"), AccessToken: os.Getenv("ERUPT_ACCESS_TOKEN"), Servers: []string{server}}))
 	check(node.Register(category, erupt.NewMemoryRepository()))
 	check(node.Register(article, erupt.NewMemoryRepository()))
 	check(node.ListenAndServe(":" + port))
+}
+
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func must[T any](v T, err error) T {

@@ -46,7 +46,7 @@ class Article:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    node = Node("blog", os.environ["ERUPT_ACCESS_TOKEN"], os.environ.get("ERUPT_SERVER", "http://localhost:8080"))
+    node = Node(os.environ.get("ERUPT_NODE_NAME", "blog"), os.environ["ERUPT_ACCESS_TOKEN"], os.environ.get("ERUPT_SERVER", "http://localhost:8080"))
     node.register(Category, SqliteRepository("blog.db", "category"))
     node.register(Article, SqliteRepository("blog.db", "article"))
     node.serve(port=int(os.environ.get("PORT", 9090)))

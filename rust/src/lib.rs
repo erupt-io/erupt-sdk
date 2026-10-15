@@ -21,6 +21,7 @@ mod model;
 mod node;
 mod repo;
 pub mod schema;
+pub mod signature;
 mod sql;
 #[rustfmt::skip]
 pub mod types;

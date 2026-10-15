@@ -59,6 +59,6 @@ final class Article
 }
 
 $pdo = new \PDO('sqlite:' . (getenv('ERUPT_DB') ?: __DIR__ . '/blog.db'));
-return (new Node('blog', (string) getenv('ERUPT_ACCESS_TOKEN'), getenv('ERUPT_SERVER') ?: 'http://localhost:8080'))
+return (new Node(getenv('ERUPT_NODE_NAME') ?: 'blog', (string) getenv('ERUPT_ACCESS_TOKEN'), getenv('ERUPT_SERVER') ?: 'http://localhost:8080'))
     ->register(Category::class, new PdoRepository($pdo, 'category'))
     ->register(Article::class, new PdoRepository($pdo, 'article'));

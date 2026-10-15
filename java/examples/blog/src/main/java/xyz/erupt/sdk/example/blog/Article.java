@@ -40,7 +40,7 @@ public class Article extends BaseModel {
     @EruptField(edit = @Edit(title = "Topic", type = EditType.REFERENCE_TREE, referenceTreeType = @ReferenceTreeType(pid = "parent.id")))
     private Category topic;
 
-    @EruptField(views = @View(title = "Status"), edit = @Edit(title = "Status", search = @Search,
+    @EruptField(views = @View(title = "Status"), edit = @Edit(title = "Status", type = EditType.CHOICE, search = @Search,
             choiceType = @ChoiceType(vl = {@VL(value = "draft", label = "Draft"), @VL(value = "published", label = "Published")})))
     private String status;
 

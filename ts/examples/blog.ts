@@ -39,7 +39,7 @@ const Article = model("Article", {
 });
 
 const env = process.env;
-const node = new Node("blog", env.ERUPT_ACCESS_TOKEN!, env.ERUPT_SERVER ?? "http://localhost:8080");
+const node = new Node(env.ERUPT_NODE_NAME ?? "blog", env.ERUPT_ACCESS_TOKEN!, env.ERUPT_SERVER ?? "http://localhost:8080");
 node.register(Category, new SqliteRepository("blog.db", "category"));
 node.register(Article, new SqliteRepository("blog.db", "article"));
 await node.serve(Number(env.PORT ?? 9090));

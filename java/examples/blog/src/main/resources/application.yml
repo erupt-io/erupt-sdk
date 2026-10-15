@@ -17,7 +17,7 @@ spring:
 
 erupt:
   cloud-node:
-    node-name: blog
+    node-name: ${ERUPT_NODE_NAME:blog}
     # Generated on the server: Node Config -> add node "blog" -> View Token. Never commit it.
     access-token: ${ERUPT_ACCESS_TOKEN}
     server-addresses: ${ERUPT_SERVER:http://localhost:8080}

@@ -8,7 +8,7 @@ static string? Env(string name) => Environment.GetEnvironmentVariable(name);
 
 var node = new EruptNode(new NodeOptions
 {
-    Name = "blog",
+    Name = Env("ERUPT_NODE_NAME") ?? "blog",
     AccessToken = Env("ERUPT_ACCESS_TOKEN") ?? throw new InvalidOperationException("set ERUPT_ACCESS_TOKEN"),
     Servers = [Env("ERUPT_SERVER") ?? "http://localhost:8080"],
 });

@@ -29,6 +29,9 @@ public sealed class NodeOptions
     public string? Address { get; set; }
 
     public TimeSpan Heartbeat { get; init; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>Refuse server calls without a valid Erupt-Signature, so the plain access token alone no longer passes.</summary>
+    public bool RequireSignature { get; init; }
 }
 
 /// <summary>
@@ -48,7 +51,6 @@ public sealed partial class EruptNode
     private static readonly HashSet<string> Ops = ["EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE", "NOT_LIKE", "RANGE", "IN", "NOT_IN", "NULL", "NOT_NULL"];
 
     private const int MaxPageSize = 1000;
-    private const int MaxTreeNodes = 10000;
 
     private static readonly AsyncLocal<EruptUser?> User = new();
 
@@ -78,7 +80,6 @@ public sealed partial class EruptNode
             ("GET", Route("^/erupt-api/build/([^/]+)/([^/]+)$"), BuildByField),
             ("POST", Route("^/erupt-api/data/table/([^/]+)$"), Table),
             ("POST", Route("^/erupt-api/data/([^/]+)/reference-table/([^/]+)$"), ReferenceTable),
-            ("GET", Route("^/erupt-api/data/([^/]+)/reference-tree/([^/]+)$"), ReferenceTree),
             ("POST", Route("^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$"), OperationFormValue),
             ("POST", Route("^/erupt-api/data/([^/]+)/operator/([^/]+)$"), Operation),
             ("GET", Route("^/erupt-api/data/init-value/([^/]+)$"), InitValue),
@@ -172,9 +173,8 @@ public sealed partial class EruptNode
         if (!path.StartsWith("/erupt-api/", StringComparison.Ordinal)) throw new Reply(404);
         // server-to-server only: an Origin header means a browser reached the node directly
         if (!string.IsNullOrEmpty(request.Headers.Origin)) throw new Reply(403);
-        if (!CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(request.Headers["Access-Token"].ToString()),
-                Encoding.UTF8.GetBytes(Options.AccessToken)))
-            throw new Reply(403);
+        var raw = await ReadBody(request);
+        Authenticate(context, raw);
         var erupt = request.Headers["erupt"].ToString();
         foreach (var (method, pattern, handler) in _routes)
         {
@@ -188,17 +188,51 @@ public sealed partial class EruptNode
             if (parent.Length > 0 && parent.Split('.')[^1] != name) throw new Reply(404);
             var user = request.Headers["user"].ToString();
             User.Value = user.Length > 0 ? JsonSerializer.Deserialize<EruptUser>(Convert.FromBase64String(user)) : null;
-            var body = await ReadJson(request);
+            var body = ParseJson(raw);
             var args = match.Groups.Cast<Group>().Skip(2).Select(g => g.Value).ToArray();
             return (200, await handler(new Request(context, entry.Model, entry.Repo, body), args));
         }
         throw new Reply(404);
     }
 
-    private static async Task<JsonNode?> ReadJson(HttpRequest request)
+    private static async Task<byte[]> ReadBody(HttpRequest request)
     {
-        using var reader = new StreamReader(request.Body, Encoding.UTF8);
-        var text = await reader.ReadToEndAsync();
+        using var buffer = new MemoryStream();
+        await request.Body.CopyToAsync(buffer);
+        return buffer.ToArray();
+    }
+
+    /// <summary>
+    /// A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then.
+    /// </summary>
+    private void Authenticate(HttpContext context, byte[] body)
+    {
+        var request = context.Request;
+        var signature = request.Headers[Signature.HeaderSignature].ToString();
+        if (signature.Length == 0)
+        {
+            if (Options.RequireSignature || !CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(request.Headers["Access-Token"].ToString()), Encoding.UTF8.GetBytes(Options.AccessToken)))
+                throw new Reply(403);
+            return;
+        }
+        var multipart = (request.ContentType ?? "").Contains("multipart/form-data", StringComparison.OrdinalIgnoreCase);
+        var enforced = request.Headers[Signature.HeaderEnforced].ToString();
+        var pathAndQuery = request.Path.ToUriComponent() + request.QueryString.ToUriComponent();
+        if (!Signature.Verify(Options.AccessToken, request.Method, pathAndQuery, request.Headers[Signature.HeaderTimestamp].ToString(),
+                enforced, request.Headers["user"].ToString(), multipart ? null : body, signature, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
+            throw new Reply(403);
+        context.Items[EnforcedKey] = enforced.Split(',', StringSplitOptions.RemoveEmptyEntries).ToHashSet();
+    }
+
+    private static readonly object EnforcedKey = new();
+
+    private static bool Enforced(HttpContext http, string check) =>
+        http.Items[EnforcedKey] is HashSet<string> enforced && enforced.Contains(check);
+
+    private static JsonNode? ParseJson(byte[] raw)
+    {
+        var text = Encoding.UTF8.GetString(raw);
         if (text.Length == 0) return null;
         try
         {
@@ -238,56 +272,6 @@ public sealed partial class EruptNode
     {
         var target = Target(ReferenceField(r.Model, args[0], "REFERENCE_TABLE"));
         return await Page(target.Model, target.Repo, BodyObject(r), r.Http.RequestAborted);
-    }
-
-    private async Task<JsonNode?> ReferenceTree(Request r, string[] args)
-    {
-        var f = ReferenceField(r.Model, args[0], "REFERENCE_TREE");
-        var target = Target(f);
-        var (_, records) = await target.Repo.PageAsync(new Query { Limit = MaxTreeNodes }, r.Http.RequestAborted);
-        var nodes = new Dictionary<string, JsonObject>();
-        var order = new List<JsonObject>();
-        foreach (var record in records)
-        {
-            var id = Values.Str(record.GetValueOrDefault(target.Model.Pk!));
-            var label = record.GetValueOrDefault(f.Label);
-            var pid = record.GetValueOrDefault(f.Tree!);
-            var node = new JsonObject
-            {
-                ["id"] = id, ["label"] = label is null ? null : Values.Str(label), ["pid"] = pid is null ? null : Values.Str(pid),
-                ["root"] = false, ["level"] = 1, ["children"] = null,
-            };
-            nodes[id] = node;
-            order.Add(node);
-        }
-        var roots = new JsonArray();
-        foreach (var node in order)
-        {
-            var pid = node["pid"]?.GetValue<string>();
-            var parent = pid is null ? null : nodes.GetValueOrDefault(pid);
-            if (parent is null || ReferenceEquals(parent, node))
-            {
-                node["root"] = true;
-                roots.Add(node);
-            }
-            else
-            {
-                if (parent["children"] is not JsonArray children) parent["children"] = children = [];
-                children.Add(node);
-            }
-        }
-        Level(roots, 1, []);
-        return roots;
-
-        static void Level(JsonArray nodes, int depth, HashSet<JsonNode> seen)
-        {
-            foreach (var n in nodes)
-            {
-                if (!seen.Add(n!)) continue; // a pid cycle would otherwise recurse forever
-                n!["level"] = depth;
-                if (n["children"] is JsonArray children) Level(children, depth + 1, seen);
-            }
-        }
     }
 
     private static FieldDef ReferenceField(EruptModel model, string field, string? editType = null) =>
@@ -392,37 +376,19 @@ public sealed partial class EruptNode
     }
 
     /// <summary>
-    /// Records to browser rows. A reference becomes {&lt;id&gt;: "1", &lt;label&gt;: "News"} for the form plus the
-    /// flattened &lt;field&gt;_&lt;label&gt; column the table reads.
+    /// Records to browser rows. A reference stays its key: the server resolves its label, the flattened
+    /// &lt;field&gt;_&lt;label&gt; column and the tree (erupt-cloud/PROTOCOL.md §7.3).
     /// </summary>
-    private async Task<JsonArray> Rows(EruptModel model, IReadOnlyList<Record> records, CancellationToken ct)
+    private static Task<JsonArray> Rows(EruptModel model, IReadOnlyList<Record> records, CancellationToken ct)
     {
-        var refs = model.Fields.Where(f => f.IsReference).ToList();
-        var cache = new Dictionary<(string, string), Record>();
         var rows = new JsonArray();
         foreach (var record in records)
         {
             var row = new JsonObject();
             foreach (var f in model.Fields) row[f.Name] = Values.ToJson(record.GetValueOrDefault(f.Name));
-            foreach (var f in refs)
-            {
-                var rid = record.GetValueOrDefault(f.Name);
-                if (rid is null)
-                {
-                    row[f.Name] = null;
-                    continue;
-                }
-                var (target, repo) = Target(f);
-                var key = (target.Name, Values.Str(rid));
-                if (!cache.TryGetValue(key, out var referenced))
-                    cache[key] = referenced = await repo.GetAsync(rid, ct) ?? [];
-                var label = Values.ToJson(referenced.GetValueOrDefault(f.Label));
-                row[f.Name] = new JsonObject { [target.Pk!] = Values.Str(rid), [f.Label] = label };
-                row[$"{f.Name}_{f.Label}"] = label?.DeepClone();
-            }
             rows.Add(row);
         }
-        return rows;
+        return Task.FromResult(rows);
     }
 
     private static OperationDef OperationOf(EruptModel model, string code)
@@ -507,6 +473,14 @@ public sealed partial class EruptNode
 
     private async Task<JsonObject> Power(EruptModel model, HttpContext http)
     {
+        if (Enforced(http, "power"))
+        {
+            // the server checked the user's rights and restricts the build's power itself: the model's own
+            // declaration is all that is left to apply here
+            var declared = model.PowerJson.DeepClone().AsObject();
+            foreach (var feature in Unsupported) declared[feature] = false;
+            return declared;
+        }
         var token = http.Request.Headers["token"].ToString();
         var key = (token, model.Name);
         if (_powerCache.TryGetValue(key, out var cached) && cached.Expires > DateTime.UtcNow) return cached.Power;

@@ -1,0 +1,3 @@
+.dart_tool/
+# a library does not pin its dependencies
+pubspec.lock

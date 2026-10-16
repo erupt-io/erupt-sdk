@@ -28,8 +28,21 @@ func (n *Node) require(q *request, right string) error {
 }
 
 // power is the declared power ANDed with the server's verdict for the session token, cached 5s. Without
-// the server's verdict nothing is writable.
+// the server's verdict nothing is writable. When a signed call says the server enforced power, the
+// declared power alone.
 func (n *Node) power(q *request, m *Model) map[string]bool {
+	if q.enforced["power"] {
+		// the server checked the user's rights and restricts the build's power itself: the model's own
+		// declaration is all that is left to apply here
+		power := map[string]bool{}
+		for k, v := range m.power {
+			power[k] = v
+		}
+		for k, v := range unsupportedPower {
+			power[k] = v
+		}
+		return power
+	}
 	token := q.r.Header.Get("token")
 	key := [2]string{token, m.name}
 	n.powerMu.Lock()

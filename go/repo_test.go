@@ -182,10 +182,73 @@ func TestNodeOverSQLite(t *testing.T) {
 	}
 	row := list[0].(map[string]any)
 	want := map[string]any{"title": "100% pure", "views": 7.0, "featured": true, "publish_date": "2026-03-01",
-		"review_at": "2026-03-01T08:15:00.000", "category_name": "Python", "category": map[string]any{"id": "2", "name": "Python"}}
+		"review_at": "2026-03-01T08:15:00.000", "category": 2.0}
 	for k, v := range want {
 		if !reflect.DeepEqual(row[k], v) {
 			t.Errorf("%s: got %#v, want %#v", k, row[k], v)
 		}
+	}
+	// a reference travels as its key; the server adds the label and the flattened column
+	if _, ok := row["category_name"]; ok {
+		t.Errorf("category_name is the server's to add: %v", row)
+	}
+}
+
+// A virtual field is in the build only; a slice or map field round-trips as a JSON value.
+func TestVirtualAndJSONFields(t *testing.T) {
+	type Widget struct {
+		ID    int64             `json:"id" erupt:"pk"`
+		Name  string            `json:"name" erupt:"title=Name"`
+		Note  string            `json:"note" erupt:"title=Note;virtual"`
+		Roles []string          `json:"roles" erupt:"title=Roles"`
+		Attrs map[string]string `json:"attrs" erupt:"title=Attrs"`
+	}
+	ctx := context.Background()
+	for name, factory := range repositories(t) {
+		t.Run(name, func(t *testing.T) {
+			m, err := NewModel(Widget{}, "Widget", WithFieldEdit("note", M{"type": "DIVIDE"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			repo := factory()
+			if err := repo.(Binder).Bind(m); err != nil {
+				t.Fatal(err)
+			}
+			build := m.buildErupt(nil)["eruptFieldModels"].([]any)
+			if len(build) != 5 {
+				t.Fatalf("build has %d fields", len(build))
+			}
+			record, err := toRecord(m, M{"name": "A", "note": "ignored", "roles": []any{"ADMIN", "USER"}, "attrs": M{"env": "prod"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := record["note"]; ok {
+				t.Fatal("virtual field reached the record")
+			}
+			if err := repo.Add(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+			_, records, err := repo.Page(ctx, Query{Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := records[0]
+			if !reflect.DeepEqual(got["roles"], []any{"ADMIN", "USER"}) || !reflect.DeepEqual(got["attrs"], map[string]any{"env": "prod"}) {
+				t.Fatalf("json values: %#v %#v", got["roles"], got["attrs"])
+			}
+			if _, ok := got["note"]; ok {
+				t.Fatal("virtual field read back")
+			}
+			if _, err := toRecord(m, M{"name": "B", "roles": "ADMIN"}); err == nil {
+				t.Fatal("a string accepted for a JSON field")
+			}
+		})
+	}
+	type Bad struct {
+		ID   int64    `json:"id" erupt:"pk"`
+		Tags []string `json:"tags" erupt:"search"`
+	}
+	if _, err := NewModel(Bad{}, "Bad"); err == nil {
+		t.Fatal("a searchable JSON field accepted")
 	}
 }

@@ -2,6 +2,7 @@
 // The wire contract is erupt-cloud/PROTOCOL.md in the erupt repository.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { verify } from "./signature.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createSocket } from "node:dgram";
 import { type EruptRecord, type Field, isObject, type Model, type Operation, type Power, toJsonValue, type User } from "./model.js";
@@ -17,7 +18,7 @@ export function currentUser(): User | null {
 }
 
 // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-const UNSUPPORTED_POWER: Power = { export: false, importable: false, cellEdit: false, print: false, ai: false };
+const UNSUPPORTED_POWER: Power = { cellEdit: false, print: false, ai: false };
 
 // Rights the server decides per user; the node ANDs them onto the declared power
 const SERVER_POWER = ["add", "edit", "delete", "viewDetails", "export", "importable"];
@@ -26,7 +27,6 @@ const OPS = new Set(["EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE", "NOT_LIKE", 
 
 const MAX_PAGE_SIZE = 1000;
 
-const MAX_TREE_NODES = 10000;
 
 const MAX_BODY = 16 * 1024 * 1024;
 
@@ -46,6 +46,10 @@ const r = (success = true, message: string | null = null, data: unknown = null) 
 interface Request {
   method: string;
   path: string;
+  /** the request target as received (raw path and query), which the server signs */
+  target: string;
+  /** checks the server ran before forwarding, trusted only under a valid signature */
+  enforced: Set<string>;
   query: URLSearchParams;
   headers: IncomingMessage["headers"];
   body: Buffer;
@@ -58,6 +62,8 @@ export interface NodeOptions {
   address?: string;
   /** heartbeat period in seconds (default 15) */
   heartbeat?: number;
+  /** refuse server calls without a valid Erupt-Signature: the plain access token alone no longer passes */
+  requireSignature?: boolean;
 }
 
 export class Node {
@@ -80,7 +86,6 @@ export class Node {
       ["GET", /^\/erupt-api\/build\/([^/]+)\/([^/]+)$/, this.buildByField],
       ["POST", /^\/erupt-api\/data\/table\/([^/]+)$/, this.table],
       ["POST", /^\/erupt-api\/data\/([^/]+)\/reference-table\/([^/]+)$/, this.referenceTable],
-      ["GET", /^\/erupt-api\/data\/([^/]+)\/reference-tree\/([^/]+)$/, this.referenceTree],
       ["POST", /^\/erupt-api\/data\/([^/]+)\/operator\/([^/]+)\/form-value$/, this.operationFormValue],
       ["POST", /^\/erupt-api\/data\/([^/]+)\/operator\/([^/]+)$/, this.operation],
       ["GET", /^\/erupt-api\/data\/init-value\/([^/]+)$/, this.initValue],
@@ -124,7 +129,7 @@ export class Node {
         if (size > MAX_BODY) throw new Reply(413);
         chunks.push(chunk);
       }
-      [status, body] = await this.dispatch({ method: req.method ?? "GET", path: url.pathname, query: url.searchParams, headers: req.headers, body: Buffer.concat(chunks) });
+      [status, body] = await this.dispatch({ method: req.method ?? "GET", path: url.pathname, target: req.url ?? "/", enforced: new Set(), query: url.searchParams, headers: req.headers, body: Buffer.concat(chunks) });
     } catch (e) {
       if (e instanceof Reply) [status, body] = [e.status, e.body];
       else if (e instanceof Fail) [status, body] = [200, r(false, e.message)];
@@ -148,7 +153,7 @@ export class Node {
     if (!req.path.startsWith("/erupt-api/")) throw new Reply(404);
     // server-to-server only: an Origin header means a browser reached the node directly
     if (req.headers.origin) throw new Reply(403);
-    if (!sameSecret(header(req, "access-token") ?? "", this.accessToken)) throw new Reply(403);
+    this.authenticate(req);
     const erupt = header(req, "erupt");
     for (const [verb, pattern, handler] of this.routes) {
       const match = pattern.exec(req.path);
@@ -169,6 +174,20 @@ export class Node {
       return userStore.run(acting, async () => [200, await handler.call(this, entry[0], entry[1], req, ...args)]);
     }
     throw new Reply(404);
+  }
+
+  /** A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then. */
+  private authenticate(req: Request): void {
+    const signature = header(req, "erupt-signature");
+    if (signature === undefined) {
+      if (this.options.requireSignature || !sameSecret(header(req, "access-token") ?? "", this.accessToken)) throw new Reply(403);
+      return;
+    }
+    const multipart = (header(req, "content-type") ?? "").includes("multipart/form-data");
+    const enforced = header(req, "erupt-enforced");
+    if (!verify(this.accessToken, req.method, req.target, header(req, "erupt-timestamp"), enforced, header(req, "user"),
+      multipart ? null : req.body, signature, Math.floor(Date.now() / 1000))) throw new Reply(403);
+    req.enforced = new Set((enforced ?? "").split(",").filter(Boolean));
   }
 
   // ---------------------------------------------------------------- endpoints
@@ -193,45 +212,11 @@ export class Node {
     return this.page(target, this.repoOf(target), objectBody(req));
   }
 
-  private async referenceTree(model: Model, _repo: Repository, _req: Request, field: string): Promise<unknown> {
-    const f = referenceField(model, field, "REFERENCE_TREE");
-    const target = f.target!;
-    const [, records] = await this.repoOf(target).page({ conditions: [], sort: [], offset: 0, limit: MAX_TREE_NODES });
-    interface TreeNode { id: string; label: string | null; pid: string | null; root: boolean; level: number; children: TreeNode[] | null }
-    const str = (v: unknown) => (v == null ? null : String(v));
-    const nodes = new Map<string, TreeNode>();
-    for (const rec of records) {
-      const id = String(rec[target.pk!]);
-      nodes.set(id, { id, label: str(rec[f.label]), pid: str(rec[f.tree!]), root: false, level: 1, children: null });
-    }
-    const roots: TreeNode[] = [];
-    for (const node of nodes.values()) {
-      const parent = node.pid === null ? undefined : nodes.get(node.pid);
-      if (!parent || parent === node) {
-        node.root = true;
-        roots.push(node);
-      } else {
-        parent.children = [...(parent.children ?? []), node];
-      }
-    }
-    const seen = new Set<TreeNode>();
-    const level = (list: TreeNode[], depth: number): void => {
-      for (const n of list) {
-        if (seen.has(n)) continue; // a pid cycle would otherwise recurse forever
-        seen.add(n);
-        n.level = depth;
-        level(n.children ?? [], depth + 1);
-      }
-    };
-    level(roots, 1);
-    return roots;
-  }
-
   private async page(model: Model, repo: Repository, body: Record<string, any>): Promise<unknown> {
     const pageIndex = Math.max(Math.trunc(Number(body.pageIndex)) || 1, 1);
     const pageSize = Math.min(Math.max(Math.trunc(Number(body.pageSize)) || 10, 1), MAX_PAGE_SIZE);
     const query: Query = { conditions: [], sort: [], offset: (pageIndex - 1) * pageSize, limit: pageSize };
-    for (const c of asList(body.condition)) query.conditions.push(condition(model, c));
+    for (const c of asList(body.condition)) query.conditions.push(...conditions(model, c));
     for (const s of asList(body.sort)) {
       const f = isObject(s) ? model.fields[s.field] : undefined;
       if (!f || !(f.sortable || f.pk)) throw new Fail(`illegal sort field '${isObject(s) ? s.field : s}'`);
@@ -240,7 +225,7 @@ export class Node {
     if (!query.sort.length) query.sort = [...model.orderBy];
     const [total, records] = await repo.page(query);
     return {
-      pageIndex, pageSize, total, totalPage: Math.ceil(total / pageSize), list: await this.rows(model, records),
+      pageIndex, pageSize, total, totalPage: Math.ceil(total / pageSize), list: this.rows(model, records),
       sort: null, alert: null, extraContent: null,
     };
   }
@@ -255,7 +240,7 @@ export class Node {
     if (!(power.edit || power.viewDetails)) throw new Reply(403);
     const record = await repo.get(primaryKey(model, pk));
     if (!record) throw new Fail("record not found");
-    return (await this.rows(model, [record]))[0];
+    return this.rows(model, [record])[0];
   }
 
   private async add(model: Model, repo: Repository, req: Request): Promise<unknown> {
@@ -282,33 +267,12 @@ export class Node {
   }
 
   /**
-   * Records to browser rows. A reference becomes {<id>: "1", <label>: "News"} for the form plus the
-   * flattened <field>_<label> column the table reads.
+   * Records to browser rows. A reference stays its key: the server resolves its label, the flattened
+   * <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
    */
-  private async rows(model: Model, records: EruptRecord[]): Promise<EruptRecord[]> {
+  private rows(model: Model, records: EruptRecord[]): EruptRecord[] {
     const fields = Object.values(model.fields);
-    const refs = fields.filter((f) => f.isReference);
-    const cache = new Map<string, EruptRecord>();
-    const rows: EruptRecord[] = [];
-    for (const record of records) {
-      const row: EruptRecord = {};
-      for (const f of fields) row[f.name] = toJsonValue(record[f.name] ?? null, f.type);
-      for (const f of refs) {
-        const rid = record[f.name];
-        if (rid == null) {
-          row[f.name] = null;
-          continue;
-        }
-        const target = f.target!;
-        const key = `${target.name}\u0000${String(rid)}`;
-        if (!cache.has(key)) cache.set(key, (await this.repoOf(target).get(rid)) ?? {});
-        const label = toJsonValue(cache.get(key)![f.label] ?? null, target.fields[f.label].type);
-        row[f.name] = { [target.pk!]: String(rid), [f.label]: label };
-        row[`${f.name}_${f.label}`] = label;
-      }
-      rows.push(row);
-    }
-    return rows;
+    return records.map((record) => Object.fromEntries(fields.map((f) => [f.name, toJsonValue(record[f.name] ?? null, f.type)])));
   }
 
   private operationOf(model: Model, code: string): Operation {
@@ -350,6 +314,9 @@ export class Node {
   }
 
   private async power(model: Model, req: Request): Promise<Power> {
+    // the server checked the user's rights and restricts the build's power itself: only the model's own
+    // declaration is left to apply here
+    if (req.enforced.has("power")) return { ...model.power, ...UNSUPPORTED_POWER };
     const token = header(req, "token") ?? "";
     const key = `${token}\u0000${model.name}`;
     const cached = this.powerCache.get(key);
@@ -484,13 +451,21 @@ function referenceField(model: Model, field: string, editType?: string): Field {
   return f;
 }
 
-function condition(model: Model, c: unknown): Cond {
+function conditions(model: Model, c: unknown): Cond[] {
   const key = isObject(c) ? c.key : undefined;
   const f = typeof key === "string" ? model.fields[key] : undefined;
   if (!f || f.pk || !f.search) throw new Fail(`illegal search field '${key}'`);
   const op = String((c as Record<string, unknown>).expression || "EQ");
   if (!OPS.has(op)) throw new Fail(`illegal operator '${op}'`);
   const value = (c as Record<string, unknown>).value;
+  if (!f.json) return [condition(f, op, value)];
+  // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+  if (!["EQ", "IN", "NEQ", "NOT_IN"].includes(op)) throw new Fail(`illegal operator '${op}' for ${f.title}`);
+  const like: Operator = op === "EQ" || op === "IN" ? "LIKE" : "NOT_LIKE";
+  return (Array.isArray(value) ? value : [value]).map((v) => ({ field: f.name, op: like, value: JSON.stringify(String(v)) }));
+}
+
+function condition(f: Field, op: string, value: unknown): Cond {
   const cond = (v?: unknown): Cond => ({ field: f.name, op: op as Operator, value: v });
   if (op === "NULL" || op === "NOT_NULL") return cond();
   if (f.isReference && !["EQ", "NEQ", "IN", "NOT_IN"].includes(op)) throw new Fail(`illegal operator '${op}' for a reference`);

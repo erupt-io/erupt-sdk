@@ -15,6 +15,7 @@ use Erupt\OperationContext;
 use Erupt\PdoRepository;
 use Erupt\Query;
 use Erupt\Schema;
+use Erupt\Signature;
 
 require __DIR__ . '/../autoload.php';
 require_once __DIR__ . '/../tools/gen-types.php';
@@ -46,6 +47,17 @@ final class Post
     {
         return 'ok()';
     }
+}
+
+#[Erupt('Widget')]
+final class Widget
+{
+    #[Field(pk: true)] public int $id;
+    #[Field('Name')] public string $name;
+    #[Field('Basic', edit: ['type' => 'DIVIDE'], virtual: true)] public ?string $basic;
+    #[Field('Roles', search: true, choices: ['ADMIN' => 'Admin', 'USER' => 'User', 'GUEST' => 'Guest'], edit: ['type' => 'MULTI_CHOICE'])]
+    public array $roles;
+    #[Field('Attributes', edit: ['type' => 'KEY_VALUE'])] public object $attrs;
 }
 
 #[Erupt('Bad1')] final class BadEditKey { #[Field(pk: true)] public int $id; #[Field('T', edit: ['inputTyp' => ['length' => 9]])] public string $t; }
@@ -207,6 +219,18 @@ $test('PdoRepository leaves the error mode alone and still raises errors', funct
     eq(1, preg_match('/no such table/', $failure('ERRMODE_EXCEPTION')), 'raised under ERRMODE_EXCEPTION');
 });
 
+$test('signature agrees with the Java vectors', function () {
+    $doc = json_decode((string) file_get_contents(__DIR__ . '/../../conformance/signature-vectors.json'), true);
+    foreach ($doc['vectors'] as $v) {
+        eq($v['signature'], Signature::sign($doc['accessToken'], $v['method'], $v['pathAndQuery'], $v['timestamp'], $v['enforced'],
+            $v['user'], $v['body']), $v['case']);
+        eq(true, Signature::verify($doc['accessToken'], $v['method'], $v['pathAndQuery'], (string) $v['timestamp'], $v['enforced'],
+            $v['user'], $v['body'], $v['signature'], $v['timestamp'] + 300), $v['case'] . ' inside the window');
+        eq(false, Signature::verify($doc['accessToken'], $v['method'], $v['pathAndQuery'], (string) $v['timestamp'], $v['enforced'],
+            $v['user'], $v['body'], $v['signature'], $v['timestamp'] + 301), $v['case'] . ' outside the window');
+    }
+});
+
 $test('handle() serves the protocol', function () {
     $socket = stream_socket_server('tcp://127.0.0.1:0');
     $port = (int) substr(strrchr(stream_socket_get_name($socket, false), ':'), 1);
@@ -233,19 +257,73 @@ $test('handle() serves the protocol', function () {
             'at' => '2026-01-05 10:30:00'])[1]['success'], 'add');
         [$status, $page] = $call('POST', '/erupt-api/data/table/Post', ['pageIndex' => 1, 'pageSize' => 10]);
         $row = $page['list'][0];
-        eq([200, 4, ['id' => '2', 'name' => 'Php'], 'Php', '2026-01-05T10:30:00.000'],
-            [$status, $row['views'], $row['tag'], $row['tag_name'], $row['at']], 'row');
+        // a reference travels as its key: the server resolves the label and the flattened column
+        eq([200, 4, 2, '2026-01-05T10:30:00.000'], [$status, $row['views'], $row['tag'], $row['at']], 'row');
+        eq(false, array_key_exists('tag_name', $row), 'no flattened reference column');
         eq(false, $call('POST', '/erupt-api/data/Post/operator/touch', ['ids' => [1, 2]])[1]['success'], 'SINGLE takes one row');
         eq('ok()', $call('POST', '/erupt-api/data/Post/operator/touch', ['ids' => [1]])[1]['data'], 'script');
         $malformed = $node->handle('POST', '/erupt-api/data/modify/Post', ['Access-Token' => 'secret', 'erupt' => 'Post', 'token' => 't1'], '{x');
         eq([200, 'malformed JSON body'], [$malformed->status, json_decode($malformed->body, true)['message']], 'malformed body');
         eq(404, $call('POST', '/erupt-api/data/Post/operator/missing', [])[0], 'unknown operation');
-        eq(404, $call('GET', '/erupt-api/data/Post/reference-tree/tag')[0], 'tree on a table field');
+        eq(404, $call('GET', '/erupt-api/data/Post/reference-tree/tag')[0], 'reference-tree is the server\'s');
         eq(['Tech', 'Php'], array_column($call('POST', '/erupt-api/data/Post/reference-table/tag', [])[1]['list'], 'name'), 'picker');
+        // signed calls: no token needed; Erupt-Enforced: power skips the (failing) erupt-power callback
+        $signed = function (string $method, string $target, mixed $body, ?string $enforced, array $over = []) use ($node) {
+            $raw = $body === null ? '' : json_encode($body);
+            $ts = time();
+            $headers = ['erupt' => 'Post', 'token' => 'down', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts]
+                + ($enforced === null ? [] : ['Erupt-Enforced' => $enforced]);
+            $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, $enforced, 'dXNlcg==', $raw);
+            $path = (string) parse_url($target, PHP_URL_PATH);
+            return $node->handle($method, $path, $over + $headers, $raw, [], $target)->status;
+        };
+        eq(200, $signed('GET', '/erupt-api/build/Post?_probe=1', null, null), 'signed, no token');
+        eq(200, $signed('POST', '/erupt-api/data/modify/Post', ['title' => 'Signed'], 'power,record'), 'enforced power: no callback');
+        eq(403, $signed('POST', '/erupt-api/data/modify/Post', ['title' => 'Signed'], null), 'signed without power: fails closed');
+        eq(403, $signed('GET', '/erupt-api/build/Post', null, null, ['Erupt-Signature' => str_repeat('0', 64)]), 'wrong signature');
+        eq(403, $signed('GET', '/erupt-api/build/Post', null, null, ['Erupt-Enforced' => 'power']), 'enforced added after signing');
+        eq(403, $call('POST', '/erupt-api/data/modify/Post', ['title' => 'x'], ['token' => 'down', 'Erupt-Enforced' => 'power'])[0],
+            'unsigned Erupt-Enforced ignored');
+        $strict = (new Node('n', 'secret', "http://127.0.0.1:$port", 'http://127.0.0.1:1', requireSignature: true))
+            ->register(Tag::class, new MemoryRepository())->register(Post::class, new MemoryRepository());
+        eq(403, $strict->handle('GET', '/erupt-api/build/Post', ['Access-Token' => 'secret', 'erupt' => 'Post'])->status, 'requireSignature');
     } finally {
         proc_terminate($server);
         proc_close($server);
     }
+});
+
+$test('virtual and JSON fields', function () {
+    $db = tempnam(sys_get_temp_dir(), 'erupt-php');
+    foreach ([new MemoryRepository(), new PdoRepository(new \PDO("sqlite:$db"), 'widget')] as $repo) {
+        $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Widget::class, $repo);
+        $call = function (string $method, string $target, mixed $body = null) use ($node) {
+            $raw = $body === null ? '' : json_encode($body);
+            $ts = time();
+            $headers = ['erupt' => 'Widget', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
+            $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', 'dXNlcg==', $raw);
+            return json_decode($node->handle($method, $target, $headers, $raw, [], $target)->body, true);
+        };
+        $build = $call('GET', '/erupt-api/build/Widget');
+        $fields = $build['eruptModel']['eruptFieldModels'];
+        eq(['id' => 'NUMBER', 'name' => 'INPUT', 'basic' => 'DIVIDE', 'roles' => 'MULTI_CHOICE', 'attrs' => 'KEY_VALUE'],
+            array_column(array_map(fn($f) => [$f['fieldName'], $f['eruptFieldJson']['edit']['type']], $fields), 1, 0), 'types');
+        eq(['Admin', 'User', 'Guest'], array_column($fields[3]['componentValue'], 'label'), 'options');
+        eq(true, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'A', 'roles' => ['ADMIN', 'USER'], 'attrs' => ['env' => 'prod'], 'basic' => 'x'])['success'], 'add A');
+        eq(true, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'B', 'roles' => ['GUEST'], 'attrs' => new \stdClass()])['success'], 'add B');
+        eq(false, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'C', 'roles' => ['ROOT']])['success'], 'illegal option');
+        $page = $call('POST', '/erupt-api/data/table/Widget', ['pageIndex' => 1, 'pageSize' => 10]);
+        eq(['id' => 1, 'name' => 'A', 'roles' => ['ADMIN', 'USER'], 'attrs' => ['env' => 'prod']], $page['list'][0], 'row');
+        $ts = time();
+        $body = json_encode(['pageIndex' => 1, 'pageSize' => 10]);
+        $headers = ['erupt' => 'Widget', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power',
+            'Erupt-Signature' => Signature::sign('secret', 'POST', '/erupt-api/data/table/Widget', $ts, 'power', 'dXNlcg==', $body)];
+        eq('{}', json_encode(json_decode($node->handle('POST', '/erupt-api/data/table/Widget', $headers, $body)->body)->list[1]->attrs), 'empty object stays {}');
+        $found = $call('POST', '/erupt-api/data/table/Widget', ['condition' => [['key' => 'roles', 'expression' => 'IN', 'value' => ['GUEST']]]]);
+        eq(['B'], array_column($found['list'], 'name'), 'search');
+        eq(['env' => 'prod'], $call('GET', '/erupt-api/data/Widget/1')['attrs'], 'by id');
+    }
+    unlink($db);
 });
 
 $failed = 0;

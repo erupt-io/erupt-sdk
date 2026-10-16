@@ -12,7 +12,7 @@ final class Node
     public const VERSION = '0.1.0';
 
     // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-    private const UNSUPPORTED_POWER = ['export' => false, 'importable' => false, 'cellEdit' => false, 'print' => false, 'ai' => false];
+    private const UNSUPPORTED_POWER = ['cellEdit' => false, 'print' => false, 'ai' => false];
 
     // Rights the server decides per user; the node ANDs them onto the declared power
     private const SERVER_POWER = ['add', 'edit', 'delete', 'viewDetails', 'export', 'importable'];
@@ -20,14 +20,12 @@ final class Node
     private const OPS = ['EQ', 'NEQ', 'GT', 'GTE', 'LT', 'LTE', 'LIKE', 'NOT_LIKE', 'RANGE', 'IN', 'NOT_IN', 'NULL', 'NOT_NULL'];
 
     private const MAX_PAGE_SIZE = 1000;
-    private const MAX_TREE_NODES = 10000;
 
     private const ROUTES = [
         ['GET', '#^/erupt-api/build/([^/]+)$#', 'build'],
         ['GET', '#^/erupt-api/build/([^/]+)/([^/]+)$#', 'buildByField'],
         ['POST', '#^/erupt-api/data/table/([^/]+)$#', 'table'],
         ['POST', '#^/erupt-api/data/([^/]+)/reference-table/([^/]+)$#', 'referenceTable'],
-        ['GET', '#^/erupt-api/data/([^/]+)/reference-tree/([^/]+)$#', 'referenceTree'],
         ['POST', '#^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$#', 'operationFormValue'],
         ['POST', '#^/erupt-api/data/([^/]+)/operator/([^/]+)$#', 'operation'],
         ['GET', '#^/erupt-api/data/init-value/([^/]+)$#', 'initValue'],
@@ -44,6 +42,8 @@ final class Node
     /** @var array<string, array{0: Model, 1: Repository}> */
     private array $models = [];
     private array $powerCache = [];
+    /** @var list<string> checks the server ran for the request being served, from a verified Erupt-Enforced */
+    private array $enforced = [];
     private int $nextServer = 0;
     private bool $stopping = false;
     private string $instanceId;
@@ -55,6 +55,8 @@ final class Node
         string|array $servers,
         private ?string $address = null,
         private readonly int $heartbeatSeconds = 15,
+        // refuse server calls without a valid Erupt-Signature, so the plain access token alone no longer passes
+        private readonly bool $requireSignature = false,
     ) {
         if ($accessToken === '') {
             throw new \InvalidArgumentException('access token is required');
@@ -106,8 +108,9 @@ final class Node
                 }
             }
         }
-        $response = $this->handle($_SERVER['REQUEST_METHOD'] ?? 'GET', parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/',
-            $headers, (string) file_get_contents('php://input'), $_GET);
+        $target = $_SERVER['REQUEST_URI'] ?? '/';
+        $response = $this->handle($_SERVER['REQUEST_METHOD'] ?? 'GET', parse_url($target, PHP_URL_PATH) ?: '/',
+            $headers, (string) file_get_contents('php://input'), $_GET, $target);
         http_response_code($response->status);
         header('Content-Type: ' . $response->contentType);
         echo $response->body;
@@ -118,12 +121,15 @@ final class Node
      *
      * @param array<string, string> $headers any case
      * @param array<string, mixed> $query parsed query string
+     * @param ?string $target the raw request target (path and query, as received below the mount point) a signed
+     *                        call is verified against; defaults to $path plus the re-encoded $query
      */
-    public function handle(string $method, string $path, array $headers, string $body = '', array $query = []): Response
+    public function handle(string $method, string $path, array $headers, string $body = '', array $query = [], ?string $target = null): Response
     {
         $headers = array_change_key_case($headers, CASE_LOWER);
+        $target ??= $path . ($query === [] ? '' : '?' . http_build_query($query));
         try {
-            [$status, $payload] = $this->dispatch(strtoupper($method), $path, $headers, $body, $query);
+            [$status, $payload] = $this->dispatch(strtoupper($method), $path, $headers, $body, $query, $target);
         } catch (Reply $reply) {
             [$status, $payload] = [$reply->status, ''];
         } catch (Fail $e) {
@@ -133,13 +139,14 @@ final class Node
             [$status, $payload] = [500, ['path' => $path, 'status' => 500, 'error' => 'erupt exception', 'message' => $e->getMessage()]];
         } finally {
             self::$user = null;
+            $this->enforced = [];
         }
         return is_string($payload)
             ? new Response($status, 'text/plain; charset=utf-8', $payload)
             : new Response($status, 'application/json; charset=utf-8', Json::encode($payload));
     }
 
-    private function dispatch(string $method, string $path, array $headers, string $body, array $query): array
+    private function dispatch(string $method, string $path, array $headers, string $body, array $query, string $target): array
     {
         if ($path === '/node-health') {
             return [200, $this->name];
@@ -151,9 +158,7 @@ final class Node
         if (($headers['origin'] ?? '') !== '') {
             throw new Reply(403);
         }
-        if (!hash_equals($this->accessToken, (string) ($headers['access-token'] ?? ''))) {
-            throw new Reply(403);
-        }
+        $this->authenticate($method, $headers, $body, $target);
         $erupt = $headers['erupt'] ?? null;
         foreach (self::ROUTES as [$verb, $pattern, $handler]) {
             if ($verb !== $method || !preg_match($pattern, $path, $m)) {
@@ -175,6 +180,25 @@ final class Node
             return [200, $this->$handler($model, $repo, new Request($headers, $body), ...$args)];
         }
         throw new Reply(404);
+    }
+
+    /** A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then. */
+    private function authenticate(string $method, array $headers, string $body, string $target): void
+    {
+        $signature = $headers[strtolower(Signature::HEADER_SIGNATURE)] ?? null;
+        if ($signature === null) {
+            if ($this->requireSignature || !hash_equals($this->accessToken, (string) ($headers['access-token'] ?? ''))) {
+                throw new Reply(403);
+            }
+            return;
+        }
+        $multipart = str_contains((string) ($headers['content-type'] ?? ''), 'multipart/form-data');
+        $enforced = $headers[strtolower(Signature::HEADER_ENFORCED)] ?? null;
+        if (!Signature::verify($this->accessToken, $method, $target, $headers[strtolower(Signature::HEADER_TIMESTAMP)] ?? null,
+            $enforced, $headers['user'] ?? null, $multipart ? null : $body, (string) $signature, time())) {
+            throw new Reply(403);
+        }
+        $this->enforced = array_values(array_filter(explode(',', (string) $enforced)));
     }
 
     // ---------------------------------------------------------------- endpoints
@@ -203,44 +227,6 @@ final class Node
         return $this->page($target, $this->repoOf($target), $request->object());
     }
 
-    private function referenceTree(Model $model, Repository $repo, Request $request, string $field): array
-    {
-        $f = $this->referenceField($model, $field, 'REFERENCE_TREE');
-        $target = $f->target();
-        // insertion (primary key) order, whatever the repository's default is
-        [, $records] = $this->repoOf($target)->page(new Query([], [[$target->pk, false]], 0, self::MAX_TREE_NODES));
-        $nodes = [];
-        foreach ($records as $r) {
-            $label = $r[$f->decl->label] ?? null;
-            $pid = $r[$f->decl->tree] ?? null;
-            $nodes[(string) $r[$target->pk]] = (object) ['id' => (string) $r[$target->pk], 'label' => $label === null ? null : (string) $label,
-                'pid' => $pid === null ? null : (string) $pid, 'root' => false, 'level' => 1, 'children' => null];
-        }
-        $roots = [];
-        foreach ($nodes as $node) {
-            $parent = $node->pid === null ? null : ($nodes[$node->pid] ?? null);
-            if ($parent === null || $parent === $node) {
-                $node->root = true;
-                $roots[] = $node;
-            } else {
-                $parent->children[] = $node;
-            }
-        }
-        $seen = [];
-        $level = function (array $list, int $depth) use (&$level, &$seen) {
-            foreach ($list as $n) {
-                if (isset($seen[spl_object_id($n)])) { // a pid cycle would otherwise recurse forever
-                    continue;
-                }
-                $seen[spl_object_id($n)] = true;
-                $n->level = $depth;
-                $level($n->children ?? [], $depth + 1);
-            }
-        };
-        $level($roots, 1);
-        return $roots;
-    }
-
     private function referenceField(Model $model, string $field, ?string $editType = null): FieldSpec
     {
         $f = $model->fields[$field] ?? null;
@@ -256,7 +242,7 @@ final class Node
         $pageSize = min(max((int) (($body['pageSize'] ?? null) ?: 10), 1), self::MAX_PAGE_SIZE);
         $query = new Query([], [], ($pageIndex - 1) * $pageSize, $pageSize);
         foreach ((array) ($body['condition'] ?? []) as $c) {
-            $query->conditions[] = $this->condition($model, is_array($c) ? $c : []);
+            array_push($query->conditions, ...$this->conditions($model, is_array($c) ? $c : []));
         }
         foreach ((array) ($body['sort'] ?? []) as $s) {
             $f = is_array($s) && is_string($s['field'] ?? null) ? ($model->fields[$s['field']] ?? null) : null;
@@ -274,7 +260,8 @@ final class Node
             'sort' => null, 'alert' => null, 'extraContent' => null];
     }
 
-    private function condition(Model $model, array $c): Cond
+    /** @return list<Cond> */
+    private function conditions(Model $model, array $c): array
     {
         $key = $c['key'] ?? null;
         $f = is_string($key) ? ($model->fields[$key] ?? null) : null;
@@ -286,6 +273,20 @@ final class Node
             throw new Fail("illegal operator '" . (is_scalar($op) ? $op : json_encode($op)) . "'");
         }
         $value = $c['value'] ?? null;
+        if ($f->json === null) {
+            return [$this->condition($f, $op, $value)];
+        }
+        // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+        if (!in_array($op, ['EQ', 'IN', 'NEQ', 'NOT_IN'], true)) {
+            throw new Fail("illegal operator '$op' for {$f->decl->title}");
+        }
+        $like = in_array($op, ['EQ', 'IN'], true) ? 'LIKE' : 'NOT_LIKE';
+        $values = is_array($value) && array_is_list($value) ? $value : [$value];
+        return array_map(fn($v) => new Cond($f->name, $like, json_encode(is_scalar($v) ? (string) $v : json_encode($v))), $values);
+    }
+
+    private function condition(FieldSpec $f, string $op, mixed $value): Cond
+    {
         if ($op === 'NULL' || $op === 'NOT_NULL') {
             return new Cond($f->name, $op);
         }
@@ -359,34 +360,16 @@ final class Node
     }
 
     /**
-     * Records to browser rows. A reference becomes {<id>: "1", <label>: "News"} for the form plus the
-     * flattened <field>_<label> column the table reads.
+     * Records to browser rows. A reference stays its key: the server resolves its label, the flattened
+     * <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3).
      */
     private function rows(Model $model, array $records): array
     {
-        $cache = [];
         $rows = [];
         foreach ($records as $record) {
             $row = [];
             foreach ($model->fields as $name => $f) {
                 $row[$name] = $f->toJson($record[$name] ?? null);
-            }
-            foreach ($model->fields as $name => $f) {
-                if (!$f->isReference()) {
-                    continue;
-                }
-                $rid = $record[$name] ?? null;
-                if ($rid === null) {
-                    $row[$name] = null;
-                    continue;
-                }
-                $target = $f->target();
-                $key = $target->name . "\0" . $rid;
-                $cache[$key] ??= $this->repoOf($target)->get($rid) ?? [];
-                $labelField = $target->fields[$f->decl->label];
-                $label = $labelField->toJson($cache[$key][$f->decl->label] ?? null);
-                $row[$name] = [$target->pk => (string) $rid, $f->decl->label => $label];
-                $row["{$name}_{$f->decl->label}"] = $label;
             }
             $rows[] = $row;
         }
@@ -480,6 +463,11 @@ final class Node
     /** Declared power AND the server's verdict for the session; cached for this Node's lifetime (one request under php-fpm). */
     private function power(Model $model, Request $request): array
     {
+        if (in_array('power', $this->enforced, true)) {
+            // the server checked the user's rights and restricts the build's power itself: the model's own
+            // declaration is all that is left to apply here
+            return array_merge($model->power, self::UNSUPPORTED_POWER);
+        }
         $token = (string) ($request->headers['token'] ?? '');
         $key = $token . "\0" . $model->name;
         if (isset($this->powerCache[$key]) && $this->powerCache[$key][0] > microtime(true)) {

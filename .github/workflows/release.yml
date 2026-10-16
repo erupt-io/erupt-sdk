@@ -1,4 +1,5 @@
-# Publishes one language per tag: python/v1.2.3, ts/v1.2.3, go/v1.2.3, php/v1.2.3, dotnet/v1.2.3.
+# Publishes one language per tag: python/v1.2.3, ts/v1.2.3, go/v1.2.3, php/v1.2.3, dotnet/v1.2.3, rust/v1.2.3,
+# ruby/v1.2.3, dart/v1.2.3, swift/v1.2.3. The JVM node (xyz.erupt:erupt-cloud-node-lite) is released with erupt.
 # Each runs that language's full CI first and refuses a tag that differs from the package version.
 # Publishing uses OpenID Connect trusted publishing; no registry token is stored in this repository.
 # One-time setup per registry: see RELEASING.md.
@@ -6,7 +7,7 @@ name: release
 
 on:
   push:
-    tags: ["python/v*", "ts/v*", "go/v*", "php/v*", "dotnet/v*"]
+    tags: ["python/v*", "ts/v*", "go/v*", "php/v*", "dotnet/v*", "rust/v*", "ruby/v*", "dart/v*", "swift/v*"]
 
 permissions:
   contents: read
@@ -22,7 +23,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          [[ "$TAG" =~ ^(python|ts|go|php|dotnet)/v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?)$ ]] || { echo "illegal tag $TAG"; exit 1; }
+          [[ "$TAG" =~ ^(python|ts|go|php|dotnet|rust|ruby|dart|swift)/v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?)$ ]] || { echo "illegal tag $TAG"; exit 1; }
           echo "lang=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
           echo "version=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
 
@@ -187,10 +188,133 @@ jobs:
           user: ${{ vars.NUGET_USER }}
       - run: dotnet nuget push "out/*.nupkg" --api-key "${{ steps.nuget.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json
 
+  # ---------------------------------------------------------------- rust -> crates.io
+
+  rust-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'rust'
+    uses: ./.github/workflows/rust.yml
+
+  rust:
+    needs: [meta, rust-ci]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the package version
+        run: |
+          grep -qx "version = \"$VERSION\"" Cargo.toml || { echo "Cargo.toml is not $VERSION"; exit 1; }
+          grep -qx "pub const VERSION: &str = \"$VERSION\";" src/node.rs || { echo "VERSION in src/node.rs is not $VERSION"; exit 1; }
+      # trusted publishing: exchanges the workflow's OIDC token for a short-lived crates.io token
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # ---------------------------------------------------------------- ruby -> RubyGems
+
+  ruby-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'ruby'
+    uses: ./.github/workflows/ruby.yml
+
+  ruby:
+    needs: [meta, ruby-ci]
+    runs-on: ubuntu-latest
+    environment: rubygems
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        working-directory: ruby
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - name: Tag matches the package version
+        run: grep -qx "  VERSION = \"$VERSION\"" lib/erupt/version.rb || { echo "VERSION in lib/erupt/version.rb is not $VERSION"; exit 1; }
+      # trusted publishing: exchanges the workflow's OIDC token for a short-lived RubyGems API key
+      - uses: rubygems/configure-rubygems-credentials@v1.0.0
+      - run: gem build erupt-sdk.gemspec
+      - run: gem push "erupt-sdk-$VERSION.gem"
+
   # ---------------------------------------------------------------- GitHub release
 
+  # ---------------------------------------------------------------- dart -> pub.dev
+
+  dart-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'dart'
+    uses: ./.github/workflows/dart.yml
+
+  dart:
+    needs: [meta, dart-ci]
+    runs-on: ubuntu-latest
+    environment: pub-dev
+    permissions:
+      id-token: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        working-directory: dart
+    steps:
+      - uses: actions/checkout@v4
+      # trusted publishing: setup-dart exchanges the workflow's OIDC token for pub.dev credentials
+      - uses: dart-lang/setup-dart@v1
+      - name: Tag matches the package version
+        run: |
+          grep -qx "version: $VERSION" pubspec.yaml || { echo "pubspec.yaml is not $VERSION"; exit 1; }
+          grep -qx "const version = '$VERSION';" lib/src/node.dart || { echo "version in lib/src/node.dart is not $VERSION"; exit 1; }
+      - run: dart pub get
+      - run: dart pub publish --force
+
+  # ---------------------------------------------------------------- swift -> SwiftPM (via a split repository)
+
+  swift-ci:
+    needs: meta
+    if: needs.meta.outputs.lang == 'swift'
+    uses: ./.github/workflows/swift.yml
+
+  swift:
+    needs: [meta, swift-ci]
+    runs-on: ubuntu-latest
+    environment: swiftpm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag matches the reported version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: grep -q "public static let version = \"$VERSION\"" swift/Sources/EruptSDK/Node.swift || { echo "version in swift/Sources/EruptSDK/Node.swift is not $VERSION"; exit 1; }
+      # SwiftPM needs Package.swift at a repository root and a plain semver tag, so swift/ is split into its own repository
+      - name: Push swift/ to the split repository
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          SPLIT_TOKEN: ${{ secrets.SWIFT_SPLIT_TOKEN }}
+          SPLIT_REPO: ${{ vars.SWIFT_SPLIT_REPO || 'erupt-io/erupt-sdk-swift' }}
+        run: |
+          [[ "$SPLIT_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo "illegal SWIFT_SPLIT_REPO"; exit 1; }
+          git subtree split --prefix swift -b swift-split
+          url="https://x-access-token:${SPLIT_TOKEN}@github.com/${SPLIT_REPO}.git"
+          git push "$url" swift-split:main
+          git tag "$VERSION" swift-split
+          git push "$url" "$VERSION"
+
   github-release:
-    needs: [meta, python, ts, go, php, dotnet]
+    needs: [meta, python, ts, go, php, dotnet, rust, ruby, dart, swift]
     # exactly one language job ran; the others are skipped
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest

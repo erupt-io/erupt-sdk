@@ -3,6 +3,7 @@ The wire contract is erupt-cloud/PROTOCOL.md (Level 0)."""
 import base64
 import contextvars
 import hmac
+import io
 import itertools
 import json
 import logging
@@ -17,6 +18,7 @@ import urllib.request
 from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from . import _signature
 from .model import to_json_value
 from .repo import Cond, Query
 
@@ -27,7 +29,7 @@ __version__ = "0.1.0"
 _user = contextvars.ContextVar("erupt_user", default=None)
 
 # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-_UNSUPPORTED_POWER = {"export": False, "importable": False, "cellEdit": False, "print": False, "ai": False}
+_UNSUPPORTED_POWER = {"cellEdit": False, "print": False, "ai": False}
 
 # Rights the server decides per user; the node ANDs them onto the declared power
 _SERVER_POWER = ("add", "edit", "delete", "viewDetails", "export", "importable")
@@ -36,7 +38,6 @@ _OPS = {"EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE", "NOT_LIKE", "RANGE", "IN"
 
 _MAX_PAGE_SIZE = 1000
 
-_MAX_TREE_NODES = 10000
 
 
 def current_user():
@@ -69,10 +70,12 @@ def _r(success=True, message=None, data=None):
 
 class Node:
 
-    def __init__(self, name, access_token, servers, *, address=None, heartbeat=15):
+    def __init__(self, name, access_token, servers, *, address=None, heartbeat=15, require_signature=False):
+        """``require_signature`` refuses server calls without a valid Erupt-Signature, so the plain access
+        token alone no longer passes (servers sign since erupt 2.3.x)."""
         if not access_token:
             raise ValueError("access_token is required")
-        self.name, self.access_token = name, access_token
+        self.name, self.access_token, self.require_signature = name, access_token, require_signature
         self.servers = [s.rstrip("/") for s in ([servers] if isinstance(servers, str) else servers)]
         self.address, self.heartbeat = address, heartbeat
         self.models = {}
@@ -84,7 +87,6 @@ class Node:
             ("GET", re.compile(r"^/erupt-api/build/([^/]+)/([^/]+)$"), self._build_by_field),
             ("POST", re.compile(r"^/erupt-api/data/table/([^/]+)$"), self._table),
             ("POST", re.compile(r"^/erupt-api/data/([^/]+)/reference-table/([^/]+)$"), self._reference_table),
-            ("GET", re.compile(r"^/erupt-api/data/([^/]+)/reference-tree/([^/]+)$"), self._reference_tree),
             ("POST", re.compile(r"^/erupt-api/data/([^/]+)/operator/([^/]+)/form-value$"), self._operation_form_value),
             ("POST", re.compile(r"^/erupt-api/data/([^/]+)/operator/([^/]+)$"), self._operation),
             ("GET", re.compile(r"^/erupt-api/data/init-value/([^/]+)$"), self._init_value),
@@ -142,8 +144,7 @@ class Node:
         # server-to-server only: an Origin header means a browser reached the node directly
         if environ.get("HTTP_ORIGIN"):
             raise _Reply(403, "")
-        if not hmac.compare_digest(environ.get("HTTP_ACCESS_TOKEN", "").encode(), self.access_token.encode()):
-            raise _Reply(403, "")
+        self._authenticate(environ)
         erupt = environ.get("HTTP_ERUPT")
         for verb, pattern, handler in self._routes:
             match = pattern.match(path)
@@ -161,6 +162,25 @@ class Node:
                 args = [urllib.parse.unquote(g) for g in match.groups()[1:]]
                 return 200, handler(model, repo, environ, *args)
         raise _Reply(404, "")
+
+    def _authenticate(self, environ):
+        """A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then."""
+        environ["erupt.enforced"] = frozenset()
+        signature = environ.get("HTTP_ERUPT_SIGNATURE")
+        if signature is None:
+            if self.require_signature or not hmac.compare_digest(environ.get("HTTP_ACCESS_TOKEN", "").encode(), self.access_token.encode()):
+                raise _Reply(403, "")
+            return
+        length = int(environ.get("CONTENT_LENGTH") or 0)
+        body = environ["wsgi.input"].read(length) if length > 0 else b""
+        environ["wsgi.input"] = io.BytesIO(body)  # handed on to the endpoint unchanged
+        multipart = "multipart/form-data" in environ.get("CONTENT_TYPE", "")
+        enforced = environ.get("HTTP_ERUPT_ENFORCED")
+        if not _signature.verify(self.access_token, environ["REQUEST_METHOD"], _path_and_query(environ),
+                                 environ.get("HTTP_ERUPT_TIMESTAMP"), enforced, environ.get("HTTP_USER"),
+                                 None if multipart else body, signature, int(time.time())):
+            raise _Reply(403, "")
+        environ["erupt.enforced"] = frozenset(filter(None, (enforced or "").split(",")))
 
     # ---------------------------------------------------------------- endpoints
 
@@ -180,35 +200,6 @@ class Node:
         f = self._reference_field(model, field, "REFERENCE_TABLE")
         return self._page(f.target, self._repo_of(f.target), _read_json(environ) or {})
 
-    def _reference_tree(self, model, repo, environ, field):
-        f = self._reference_field(model, field, "REFERENCE_TREE")
-        target = f.target
-        _, records = self._repo_of(target).page(Query(limit=_MAX_TREE_NODES))
-        nodes = {}
-        for r in records:
-            nodes[str(r[target.pk])] = {"id": str(r[target.pk]), "label": None if r.get(f.label) is None else str(r.get(f.label)),
-                                        "pid": None if r.get(f.tree) is None else str(r.get(f.tree)),
-                                        "root": False, "level": 1, "children": None}
-        roots = []
-        for node in nodes.values():
-            parent = nodes.get(node["pid"]) if node["pid"] is not None else None
-            if parent is None or parent is node:
-                node["root"] = True
-                roots.append(node)
-            else:
-                parent["children"] = (parent["children"] or []) + [node]
-
-        def level(nodes_, depth, seen):
-            for n in nodes_:
-                if id(n) in seen:  # a pid cycle would otherwise recurse forever
-                    continue
-                seen.add(id(n))
-                n["level"] = depth
-                level(n["children"] or [], depth + 1, seen)
-
-        level(roots, 1, set())
-        return roots
-
     @staticmethod
     def _reference_field(model, field, edit_type=None):
         f = model.fields.get(field)
@@ -221,7 +212,7 @@ class Node:
         page_size = min(max(int(body.get("pageSize") or 10), 1), _MAX_PAGE_SIZE)
         query = Query(offset=(page_index - 1) * page_size, limit=page_size)
         for c in body.get("condition") or []:
-            query.conditions.append(self._condition(model, c))
+            query.conditions.extend(self._conditions(model, c))
         for s in body.get("sort") or []:
             f = model.fields.get(s.get("field"))
             if f is None or not (f.sortable or f.pk):
@@ -235,7 +226,7 @@ class Node:
                 "sort": None, "alert": None, "extraContent": None}
 
     @staticmethod
-    def _condition(model, c):
+    def _conditions(model, c):
         f = model.fields.get(c.get("key"))
         if f is None or f.pk or not f.search:
             raise _Fail(f"illegal search field '{c.get('key')}'")
@@ -243,6 +234,16 @@ class Node:
         if op not in _OPS:
             raise _Fail(f"illegal operator '{op}'")
         value = c.get("value")
+        if f.json:
+            # a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+            if op not in ("EQ", "IN", "NEQ", "NOT_IN"):
+                raise _Fail(f"illegal operator '{op}' for {f.title}")
+            like = "LIKE" if op in ("EQ", "IN") else "NOT_LIKE"
+            return [Cond(f.name, like, json.dumps(str(v))) for v in (value if isinstance(value, list) else [value])]
+        return [Node._condition(f, op, value)]
+
+    @staticmethod
+    def _condition(f, op, value):
         if op in ("NULL", "NOT_NULL"):
             return Cond(f.name, op)
         if f.type in ("REFERENCE_TABLE", "REFERENCE_TREE") and op not in ("EQ", "NEQ", "IN", "NOT_IN"):
@@ -295,27 +296,11 @@ class Node:
         repo.delete([self._pk(model, pk) for pk in body])
         return _r()
 
-    def _rows(self, model, records):
-        """Records to browser rows. A reference becomes {<id>: "1", <label>: "News"} for the form plus the
-        flattened <field>_<label> column the table reads."""
-        refs = [f for f in model.fields.values() if f.type in ("REFERENCE_TABLE", "REFERENCE_TREE")]
-        cache = {}
-        rows = []
-        for record in records:
-            row = {name: to_json_value(record.get(name)) for name in model.fields}
-            for f in refs:
-                rid = record.get(f.name)
-                if rid is None:
-                    row[f.name] = None
-                    continue
-                key = (f.target.name, rid)
-                if key not in cache:
-                    cache[key] = self._repo_of(f.target).get(rid) or {}
-                label = to_json_value(cache[key].get(f.label))
-                row[f.name] = {f.target.pk: str(rid), f.label: label}
-                row[f"{f.name}_{f.label}"] = label
-            rows.append(row)
-        return rows
+    @staticmethod
+    def _rows(model, records):
+        """Records to browser rows. A reference stays its key: the server resolves its label, the flattened
+        <field>_<label> column and the tree (erupt-cloud/PROTOCOL.md §7.3)."""
+        return [{name: to_json_value(record.get(name)) for name in model.fields} for record in records]
 
     def _operation_of(self, model, code):
         op = model.operations.get(code)
@@ -382,6 +367,10 @@ class Node:
             raise _Reply(403, "")
 
     def _power(self, model, environ):
+        if "power" in environ.get("erupt.enforced", ()):
+            # the server checked the user's rights and restricts the build's power itself: the model's own
+            # declaration is all that is left to apply here
+            return {**model.power, **_UNSUPPORTED_POWER}
         token = environ.get("HTTP_TOKEN") or ""
         key = (token, model.name)
         cached = self._power_cache.get(key)
@@ -478,6 +467,16 @@ def _read_json(environ):
         return json.loads(environ["wsgi.input"].read(length))
     except ValueError:
         raise _Fail("malformed JSON body")
+
+
+def _path_and_query(environ):
+    """The request target as the server signed it: the raw path below the mount point, plus the query."""
+    raw = environ.get("RAW_URI") or environ.get("REQUEST_URI")
+    if raw:
+        mount = environ.get("SCRIPT_NAME", "")
+        return raw[len(mount):] if mount and raw.startswith(mount) else raw
+    query = environ.get("QUERY_STRING", "")
+    return urllib.parse.quote(environ.get("PATH_INFO", ""), safe="/") + ("?" + query if query else "")
 
 
 def _query_param(environ, name):

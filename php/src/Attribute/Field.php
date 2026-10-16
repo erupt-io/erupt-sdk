@@ -9,6 +9,9 @@ namespace Erupt\Attribute;
  * references one of its records: the repository stores the referenced primary key, the UI shows
  * `label`; `tree` names the referenced model's parent field and turns the picker into a tree. `table` /
  * `form` hide the field from the table / the form. `view` / `edit` are raw `@View` / `@Edit` attributes.
+ * A property typed `array` holds a JSON array (MULTI_CHOICE, its options in `choices`), `object` / `stdClass`
+ * a JSON object (KEY_VALUE): stored as JSON text by SQL repositories. `virtual` declares a form-only element
+ * (DIVIDE, CALLOUT, EMPTY, GROUP) that is in the build but never read or written.
  */
 #[\Attribute(\Attribute::TARGET_PROPERTY)]
 final class Field
@@ -28,6 +31,7 @@ final class Field
         public ?string $tree = null,
         public array $view = [],
         public array $edit = [],
+        public bool $virtual = false,
     ) {
     }
 }

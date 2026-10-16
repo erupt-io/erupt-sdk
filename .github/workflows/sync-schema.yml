@@ -47,6 +47,13 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - uses: dart-lang/setup-dart@v1
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.1"
       - name: Regenerate every language
         run: |
           # python copies the schema into schema/ (and its package); the others generate from schema/
@@ -55,6 +62,11 @@ jobs:
           (cd ts && node tools/gen-types.mjs ../schema)
           (cd php && php tools/gen-types.php ../schema)
           (cd dotnet && dotnet run --project tools/GenTypes -- ../schema)
+          (cd rust && cargo run --bin gen-types -- ../schema)
+          (cd ruby && ruby tools/gen_types.rb ../schema)
+          (cd dart && dart run tool/gen_types.dart ../schema)
+          (cd swift && swift run erupt-gen-types ../schema)
+          # jvm/ is erupt-cloud-node-lite in the erupt repository, built from erupt-annotation itself: nothing to generate
           (cd python && PYTHONPATH=src python -m unittest discover -s tests)
       - name: Open a pull request
         run: |

@@ -1,0 +1,143 @@
+# erupt-sdk (Ruby)
+
+Serve Ruby models as an erupt admin UI. Zero gem dependencies, Ruby 3.1+.
+
+```ruby
+require "erupt"
+
+class Article
+  extend Erupt::Model
+  erupt "Article", order_by: "id desc"
+  field :id, pk: true
+  field :title, "Title", search: true, not_null: true, sortable: true
+  field :status, "Status", choices: { draft: "Draft", published: "Published" }, search: true
+  field :publish_date, "Publish Date", Date, search: true
+  field :body, "Body", type: Erupt::EditType::TEXTAREA, table: false
+end
+
+node = Erupt::Node.new("blog", ENV.fetch("ERUPT_ACCESS_TOKEN"), "http://erupt-server:8080")
+node.register(Article, Erupt::MemoryRepository.new)
+node.serve(port: 9090)
+```
+
+1. On the erupt server create node `blog` (Node Config) and copy its access token.
+2. Add a menu of type `table` with value `blog.Article`.
+3. Run the node. The server must be able to reach it on `http://<node ip>:9090`; pass `address:` otherwise.
+
+`field name, title, kind` infers the edit type from `kind`: `String` (or nothing) INPUT, `Integer` / `Float`
+NUMBER, `:boolean` BOOLEAN, `Date` DATE, `Time` DATE_TIME, `choices:` CHOICE; `type:` overrides it.
+`view: {...}` / `edit: {...}` on a field and extra keywords on `erupt` pass raw annotation attributes through.
+Enum values have constants (`Erupt::EditType::TEXTAREA`, `Erupt::RowOperationMode::SINGLE`, ...).
+
+Records are hashes keyed by field name (`row["title"]`); hashes handed to a repository may use symbols.
+
+## Rack
+
+A node is a Rack application, so it can live inside an existing app instead of on its own port. `start`
+registers it (with the port the server reaches it on) and `stop` deregisters it:
+
+```ruby
+# config/routes.rb (Rails): mount at the root, the server calls /erupt-api/... and /node-health
+mount ERUPT_NODE, at: "/"
+
+# config/initializers/erupt.rb
+ERUPT_NODE = Erupt::Node.new("blog", ENV.fetch("ERUPT_ACCESS_TOKEN"), ENV.fetch("ERUPT_SERVER"), logger: Rails.logger)
+ERUPT_NODE.register(Article, repo)
+ERUPT_NODE.start(port: 3000)
+at_exit { ERUPT_NODE.stop }
+```
+
+`serve` runs a small built-in threaded HTTP/1.1 server (keep-alive, chunked bodies) for the standalone case.
+
+## References
+
+Pass another model class (declared earlier, registered on the same node) as the kind. The repository stores
+the referenced primary key; the UI shows `label:` (default `name`).
+
+```ruby
+class Category
+  extend Erupt::Model
+  erupt "Category"
+  field :id, pk: true
+  field :name, "Name", search: true
+  field :parent, "Parent Id", Integer
+end
+
+class Article
+  # ...
+  field :category, "Category", Category, search: true   # table picker
+  field :topic, "Topic", Category, tree: :parent         # tree picker over Category.parent
+end
+```
+
+## Row operations
+
+```ruby
+class PublishForm                        # a form model needs no primary key
+  extend Erupt::Model
+  erupt "Publish Options"
+  field :publish_date, "Publish Date", Date, not_null: true
+end
+
+class Article
+  # ...
+  operation :publish, "Publish", form: PublishForm, if_expr: "item.status !== 'published'" do |op|
+    op.rows.each { |row| op.repo.update(row["id"], status: "published", publish_date: op.param["publish_date"]) }
+  end                                    # op.rows, op.param, op.repo, op.user
+end
+```
+
+`mode:` `SINGLE` / `MULTI` (default) / `MULTI_ONLY` / `BUTTON`. `confirm: false` skips the dialog, a string
+replaces its text. `show: ->(user) { ... }` hides the operation and refuses to run it. A returned string is
+executed as JavaScript in the browser, so return only code you wrote.
+
+## Storage
+
+Storage is any `Erupt::Repository` (`page`, `get`, `add`, `update`, `delete`). Shipped:
+
+- `MemoryRepository` for tests and demos;
+- `SqlRepository.new(executor, table, auto_create: false)` on PostgreSQL, MySQL or SQLite. The SDK depends on
+  no driver: an `Erupt::SqlExecutor` runs each statement with bound values on the driver you hand it. Create
+  the tables yourself, with columns named like the fields (`auto_create:` creates SQLite tables).
+
+```ruby
+require "pg"                                  # PostgreSQL (pg gem)
+repo = Erupt::SqlRepository.new(Erupt::SqlExecutor.pg(PG.connect(ENV.fetch("DATABASE_URL"))), "article")
+
+require "mysql2"                              # MySQL (mysql2 gem; statements are prepared)
+repo = Erupt::SqlRepository.new(Erupt::SqlExecutor.mysql2(Mysql2::Client.new(**MYSQL)), "article")
+
+require "sqlite3"                             # SQLite (sqlite3 gem)
+repo = Erupt::SqlRepository.new(Erupt::SqlExecutor.sqlite3(SQLite3::Database.new("blog.db")), "article", auto_create: true)
+
+require "connection_pool"                     # pooled: anything with `with` lends a connection per statement
+repo = Erupt::SqlRepository.new(Erupt::SqlExecutor.pg(ConnectionPool.new(size: 5) { PG.connect(DSN) }), "article")
+
+# any other library: a block that runs (sql, params) and returns rows as hashes keyed by column name
+executor = Erupt::SqlExecutor.new(:postgres) do |sql, params|
+  ActiveRecord::Base.connection_pool.with_connection { |c| c.raw_connection.exec_params(sql, params).to_a }
+end
+```
+
+A single connection is used by one thread at a time. Without a sort, every repository returns rows by primary
+key ascending. `Erupt.current_user` returns the acting user inside a repository call.
+
+Not yet: sub-tables (TAB_TABLE_*), TPL operations, depend fields of references, tree models, file upload, Excel, i18n of messages.
+
+## Generated code
+
+`lib/erupt/types.rb` (a constant for every annotation enum value) and `sig/erupt/types.rbs` (RBS records for
+every annotation attribute: `edit`, `view`, `erupt`, `row_operation`, ...) are generated from the erupt
+annotation JSON Schema. Raw `view:` / `edit:` / `erupt` / `operation` attributes are checked against the same
+schema when a model is declared, so a misspelt key or enum value fails at load instead of silently doing
+nothing in the browser.
+
+After an annotation change in erupt (regenerate there with `mvn -pl erupt-test -Pnode-schema test`):
+
+```bash
+ruby tools/gen_types.rb ../schema          # sync schemas, regenerate types.rb / types.rbs
+ruby tools/gen_types.rb ../schema --check  # CI: fail when stale
+```
+
+Tests: `ruby -Ilib -e 'Dir["./test/test_*.rb"].each { |f| require f }'` (SQLite-backed cases run where the
+`sqlite3` gem is installed; `ERUPT_TEST_DATABASES=1` with the `pg` and `mysql2` gems runs `test_databases.rb`).

@@ -15,9 +15,14 @@ final class FieldSpec
         'BOOLEAN' => 'bool', 'DATE' => 'date', 'DATE_TIME' => 'datetime',
     ];
 
+    /** what a JSON field holds: an `array` property a list, an `object` property an object */
+    public const JSON_ARRAY = 'array';
+    public const JSON_OBJECT = 'object';
+
     public readonly ?string $type;
 
-    public function __construct(public readonly string $name, public readonly Field $decl, ?string $type)
+    public function __construct(public readonly string $name, public readonly Field $decl, ?string $type,
+                                public readonly ?string $json = null)
     {
         $this->type = $type;
     }
@@ -70,7 +75,7 @@ final class FieldSpec
         }
         $tpl['eruptFieldJson']['edit'] = Model::merge($edit, $d->edit);
         $tpl['eruptFieldJson']['views'] = $d->table ? [Model::merge($view, $d->view)] : [];
-        if ($this->type === 'CHOICE') {
+        if ($d->choices !== null) { // CHOICE, or MULTI_CHOICE over an array
             $tpl['componentValue'] = [];
             foreach ($d->choices ?? [] as $value => $label) {
                 $tpl['componentValue'][] = ['value' => (string) $value, 'label' => $label, 'desc' => null, 'color' => null, 'disable' => false];
@@ -96,6 +101,9 @@ final class FieldSpec
         }
         if ($value === null || $value === '') {
             return null;
+        }
+        if ($this->json !== null) {
+            return $this->json($value);
         }
         if ($this->decl->pk) {
             if (is_int($value) || (is_float($value) && floor($value) == $value)) {
@@ -132,6 +140,25 @@ final class FieldSpec
             throw new \InvalidArgumentException("illegal option '$text'");
         }
         return $text;
+    }
+
+    /** A JSON value: a list as an array, an object as a stdClass (so an empty one stays `{}`). */
+    private function json(mixed $value): array|\stdClass
+    {
+        if (is_string($value)) {
+            $value = json_decode($value, $this->json === self::JSON_ARRAY, 512, JSON_THROW_ON_ERROR);
+        }
+        if ($this->json === self::JSON_OBJECT && (is_array($value) || $value instanceof \stdClass)) {
+            return (object) $value;
+        }
+        if (!is_array($value) || !array_is_list($value)) {
+            throw new \InvalidArgumentException('must be a JSON array');
+        }
+        if ($this->decl->choices !== null
+            && array_diff(array_map('strval', $value), array_map('strval', array_keys($this->decl->choices)))) {
+            throw new \InvalidArgumentException('illegal option in ' . json_encode($value));
+        }
+        return $value;
     }
 
     /** A stored value to JSON for the browser. */

@@ -4,9 +4,9 @@ name: databases
 
 on:
   push:
-    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", ".github/workflows/databases.yml"]
+    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", "rust/**", "ruby/**", ".github/workflows/databases.yml"]
   pull_request:
-    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", ".github/workflows/databases.yml"]
+    paths: ["python/**", "go/**", "ts/**", "php/**", "dotnet/**", "rust/**", "ruby/**", ".github/workflows/databases.yml"]
 
 permissions:
   contents: read
@@ -41,6 +41,12 @@ jobs:
       MYSQL_DATABASE: erupt
     steps:
       - uses: actions/checkout@v4
+      # the JVM node (erupt-cloud-node-lite) lives in the erupt repository
+      - uses: actions/checkout@v4
+        with:
+          repository: erupts/erupt
+          ref: develop
+          path: erupt
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -62,6 +68,14 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
       # each language runs even when an earlier one failed; the job fails if any did
       - name: Python
         if: success() || failure()
@@ -88,3 +102,17 @@ jobs:
         if: success() || failure()
         working-directory: dotnet
         run: dotnet test -c Release --filter "FullyQualifiedName~DatabaseTests" --logger "console;verbosity=normal"
+      - name: Rust
+        if: success() || failure()
+        working-directory: rust
+        run: cargo test --features postgres,mysql --test databases -- --nocapture
+      - name: Ruby
+        if: success() || failure()
+        working-directory: ruby
+        run: |
+          gem install --no-document pg:1.7.0 mysql2:0.5.7 sqlite3:2.10.0
+          ruby -Ilib test/test_databases.rb
+      - name: JVM
+        if: success() || failure()
+        working-directory: erupt
+        run: mvn -B test -pl erupt-cloud/erupt-cloud-node-lite -am -Dtest=DatabaseTest -Dsurefire.failIfNoSpecifiedTests=false

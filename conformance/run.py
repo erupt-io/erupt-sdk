@@ -8,6 +8,8 @@ registration (probing /node-health like the real one), answers erupt-power per s
 the requests the real server would forward and checks the answers. Standard library only.
 """
 import base64
+import hashlib
+import hmac
 import json
 import os
 import signal
@@ -31,6 +33,26 @@ ACCESS_TOKEN = "conformance-access-token"
 FULL = {"add": True, "edit": True, "delete": True, "viewDetails": True, "export": True, "importable": True}
 # session token -> what /erupt-power answers; "t-down" makes the server fail
 POWERS = {"t1": FULL, "t-noadd": {**FULL, "add": False}}
+
+
+VECTORS = Path(__file__).resolve().parent / "signature-vectors.json"
+
+
+def sign(method, path_and_query, timestamp, enforced, user, body):
+    """Erupt-Signature, written here independently of every SDK and checked against the Java vectors."""
+    canonical = "\n".join([method.upper(), path_and_query, str(timestamp), enforced or "",
+                           hashlib.sha256((user or "").encode()).hexdigest(),
+                           "UNSIGNED-PAYLOAD" if body is None else hashlib.sha256(body).hexdigest()])
+    return hmac.new(ACCESS_TOKEN.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+
+
+def check_vectors():
+    doc = json.loads(VECTORS.read_text("utf-8"))
+    assert doc["accessToken"] == ACCESS_TOKEN
+    for v in doc["vectors"]:
+        body = None if v["body"] is None else v["body"].encode()
+        if sign(v["method"], v["pathAndQuery"], v["timestamp"], v["enforced"], v["user"], body) != v["signature"]:
+            sys.exit(f"conformance signer disagrees with the Java vectors: {v['case']}")
 
 
 def free_port():
@@ -85,12 +107,22 @@ class Node:
     def __init__(self, address):
         self.address = address
 
-    def call(self, method, path, body=None, erupt="Article", token="t1", account="admin", headers=None):
+    def call(self, method, path, body=None, erupt="Article", token="t1", account="admin", headers=None,
+             signed=False, enforced=None, signed_body=None, timestamp=None):
+        """``signed`` sends Erupt-Signature (and Erupt-Enforced) instead of the plain Access-Token, as erupt
+        2.3.x servers do; ``signed_body`` / ``timestamp`` sign something other than what is sent."""
         raw = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
         h = {"Access-Token": ACCESS_TOKEN, "token": token, "Content-Type": "application/json",
              "user": base64.b64encode(json.dumps({"uid": 1, "account": account, "name": account, "tenantId": None}).encode()).decode()}
         if erupt:
             h["erupt"] = erupt
+        if signed:
+            ts = int(time.time()) if timestamp is None else timestamp
+            del h["Access-Token"]
+            h["Erupt-Timestamp"] = str(ts)
+            if enforced:
+                h["Erupt-Enforced"] = enforced
+            h["Erupt-Signature"] = sign(method, path, ts, enforced, h["user"], (raw or b"") if signed_body is None else signed_body)
         h.update(headers or {})
         h = {k: v for k, v in h.items() if v is not None}
         req = urllib.request.Request(self.address + path, data=raw, method=method, headers=h)
@@ -217,10 +249,37 @@ def build(n):
     eq("item.status !== 'published'", ops["publish"]["ifExpr"], "ifExpr")
     eq(["publish"], list(b["operationErupts"] or {}), "operationErupts")
     eq(["note"], [x["fieldName"] for x in b["operationErupts"]["publish"]["eruptFieldModels"]], "form fields")
-    eq(False, b["power"]["export"], "unsupported export hidden")
+    eq((True, False), (b["power"]["export"], b["power"]["cellEdit"]), "export passes (Excel is the server's), unsupported cellEdit hidden")
     eq(True, b["power"]["add"], "add")
     status, b = n.call("GET", "/erupt-api/build/Article", account="root")
     eq(["publish", "feature", "rebuild"], [o["code"] for o in b["eruptModel"]["eruptJson"]["rowOperation"]], "operations visible to root")
+
+
+@check
+def signature(n):
+    eq(200, n.call("GET", "/erupt-api/build/Article", signed=True)[0], "signed, no Access-Token")
+    eq(200, n.call("GET", "/erupt-api/build/Article?_probe=1", signed=True)[0], "signed with a query string")
+    query = {"pageIndex": 1, "pageSize": 10}
+    eq(200, n.call("POST", "/erupt-api/data/table/Article", query, signed=True)[0], "signed body")
+    eq(403, n.call("POST", "/erupt-api/data/table/Article", query, signed=True, signed_body=b"{}")[0], "body altered after signing")
+    eq(403, n.call("GET", "/erupt-api/build/Article", signed=True, headers={"Erupt-Signature": "00" * 32})[0], "wrong signature")
+    eq(403, n.call("GET", "/erupt-api/build/Article", signed=True, timestamp=int(time.time()) - 301)[0], "outside the 300 s window")
+    eq(403, n.call("GET", "/erupt-api/build/Article", signed=True, headers={"Erupt-Enforced": "power"})[0], "Erupt-Enforced added after signing")
+
+
+@check
+def enforced_power(n):
+    calls = len(FakeServer.power_calls)
+    # with power enforced by the server, the node must not ask it (t-down would fail closed) ...
+    s, b = n.call("GET", "/erupt-api/build/Article", token="t-down", signed=True, enforced="power")
+    eq((200, True), (s, b["power"]["add"]), "build without the erupt-power callback")
+    ok_r(n.call("POST", "/erupt-api/data/modify/Article", {"title": "enforced"}, token="t-down", signed=True, enforced="power,record"), "add")
+    eq(calls, len(FakeServer.power_calls), "erupt-power calls while the server enforces power")
+    # ... while the model's own declared power still holds
+    eq(403, n.call("POST", "/erupt-api/data/modify/Note/delete", [1], erupt="Note", token="t-down", signed=True, enforced="power")[0], "declared delete off")
+    # Erupt-Enforced is trusted only under a valid signature
+    eq(403, n.call("POST", "/erupt-api/data/modify/Article", {"title": "x"}, token="t-down", headers={"Erupt-Enforced": "power"})[0], "unsigned Erupt-Enforced ignored")
+    eq(403, n.call("POST", "/erupt-api/data/modify/Article", {"title": "x"}, token="t-down", signed=True)[0], "signed without power: still asks, fails closed")
 
 
 @check
@@ -289,8 +348,12 @@ def references(n):
     eq(404, n.call("POST", "/erupt-api/data/Article/reference-table/topic", {})[0], "table picker on a tree field")
     add(n, title="Ref", category={"id": "2", "name": "Python"}, topic={"id": 1, "name": "Tech"})
     row = table(n)["list"][0]
-    eq(({"id": "2", "name": "Python"}, "Python", "Tech"), (row["category"], row["category_name"], row["topic_name"]), "reference row")
-    eq({"id": "2", "name": "Python"}, n.call("GET", f"/erupt-api/data/Article/{row['id']}")[1]["category"], "reference get")
+    # a reference travels as its key: the server resolves the label and the flattened column
+    eq((2, 1), (row["category"], row["topic"]), "reference row: the key")
+    for flattened in ("category_name", "topic_name"):
+        if flattened in row:
+            raise AssertionError(f"reference row: {flattened} is the server's to add")
+    eq(2, n.call("GET", f"/erupt-api/data/Article/{row['id']}")[1]["category"], "reference get: the key")
     eq(1, table(n, [{"key": "category", "expression": "EQ", "value": {"id": 2, "name": "Python"}}])["total"], "search by reference")
     eq(0, table(n, [{"key": "category", "expression": "IN", "value": [{"id": 1}, {"id": 3}]}])["total"], "IN by reference")
     fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "category", "expression": "LIKE", "value": "x"}]}), "LIKE on a reference")
@@ -298,12 +361,8 @@ def references(n):
 
 @check
 def reference_tree(n):
-    status, tree = n.call("GET", "/erupt-api/data/Article/reference-tree/topic")
-    eq(200, status, "tree")
-    eq(["Tech", "Life"], [x["label"] for x in tree], "roots")
-    child = tree[0]["children"][0]
-    eq(("Python", "2", "1", 2), (child["label"], child["id"], child["pid"], child["level"]), "child")
-    eq(404, n.call("GET", "/erupt-api/data/Article/reference-tree/category")[0], "tree on a table field")
+    # the server builds reference trees from the referenced model's rows
+    eq(404, n.call("GET", "/erupt-api/data/Article/reference-tree/topic")[0], "reference-tree is the server's")
 
 
 @check
@@ -350,6 +409,7 @@ def main():
     if "--" not in sys.argv:
         sys.exit(__doc__)
     command = sys.argv[sys.argv.index("--") + 1:]
+    check_vectors()
     server = ThreadingHTTPServer(("127.0.0.1", free_port()), FakeServer)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     env = {**os.environ, "ERUPT_ACCESS_TOKEN": ACCESS_TOKEN, "PORT": str(free_port()),

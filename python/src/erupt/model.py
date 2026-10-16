@@ -9,6 +9,7 @@ import copy
 import datetime
 import json
 import re
+import typing
 from importlib import resources
 from typing import Optional
 
@@ -31,6 +32,11 @@ _INFER = [(bool, "BOOLEAN"), (int, "NUMBER"), (float, "NUMBER"),
 _REFERENCES = ("REFERENCE_TABLE", "REFERENCE_TREE")
 
 
+def _is_json(hint):
+    """``list`` / ``dict`` (bare or parameterised) hold a JSON value: MULTI_CHOICE, KEY_VALUE."""
+    return (typing.get_origin(hint) or hint) in (list, dict)
+
+
 
 def _merge(target, override):
     for key, value in override.items():
@@ -47,12 +53,16 @@ class Field:
 
     A field annotated with another ``@erupt`` class references one of its records: the repository stores the
     referenced primary key, the UI shows ``label``. ``tree`` names the referenced model's parent field and
-    turns the picker into a tree."""
+    turns the picker into a tree.
+
+    A ``list`` / ``dict`` annotation holds a JSON value (MULTI_CHOICE, KEY_VALUE): stored as JSON text by SQL
+    repositories, served as JSON. ``virtual=True`` declares a form-only element (DIVIDE, CALLOUT, EMPTY, GROUP)
+    that is in the build but never read or written."""
 
     def __init__(self, title="", *, type: Optional[EditType] = None, pk=False, search=False, not_null=False,
                  sortable=False, table=True, form=True, choices=None, ref=None, label="name", tree=None,
-                 view: Optional[View] = None, edit: Optional[Edit] = None):
-        self.title, self.type, self.pk = title, type, pk
+                 view: Optional[View] = None, edit: Optional[Edit] = None, virtual=False):
+        self.title, self.type, self.pk, self.virtual, self.json = title, type, pk, virtual, False
         self.search, self.not_null, self.sortable = search, not_null, sortable
         self.table, self.form = table, form
         self.choices = dict(choices) if choices else None
@@ -104,7 +114,7 @@ class Field:
         _merge(view, self.view)
         if not self.table:
             efj["views"] = []
-        if self.type == "CHOICE":
+        if self.choices:  # CHOICE, or MULTI_CHOICE over a list
             tpl["componentValue"] = [{"value": str(v), "label": label, "desc": None, "color": None, "disable": False}
                                      for v, label in (self.choices or {}).items()]
         return tpl
@@ -118,6 +128,13 @@ class Field:
             return self.target.fields[self.target.pk].coerce(value)
         if value is None or value == "":
             return None
+        if self.json:
+            value = json.loads(value) if isinstance(value, str) else value
+            if not isinstance(value, (list, dict)):
+                raise ValueError("must be a JSON array or object")
+            if self.choices and isinstance(value, list) and not set(map(str, value)) <= set(map(str, self.choices)):
+                raise ValueError(f"illegal option in {value}")
+            return value
         py = int if self.pk else _PY_TYPES[self.type]
         if py is bool:
             return value if isinstance(value, bool) else str(value).lower() in ("true", "1")
@@ -207,7 +224,8 @@ class Model:
         _schema.check("Erupt", raw, f"@erupt {name}")
         self.raw = raw
         hints = getattr(cls, "__annotations__", {})
-        self.fields, self.operations = {}, {}
+        # fields: stored and served; declared: all of them in order, virtual ones included, for the build
+        self.fields, self.declared, self.operations = {}, [], {}
         for attr, value in vars(cls).items():
             if isinstance(value, Field):
                 if not _IDENTIFIER.match(attr):
@@ -223,7 +241,10 @@ class Model:
                     raise ValueError(f"{name}.{attr}: edit type {value.type} is not supported yet")
                 if value.type in _REFERENCES:
                     self._check_reference(value)
-                self.fields[attr] = value
+                value.json = _is_json(hints.get(attr))
+                self.declared.append(value)
+                if not value.virtual:
+                    self.fields[attr] = value
             elif hasattr(value, "__erupt_operation__"):
                 op = value.__erupt_operation__
                 if op.code in self.operations:
@@ -265,7 +286,7 @@ class Model:
         return {
             "eruptName": self.name,
             "eruptJson": erupt_json,
-            "eruptFieldModels": [f.build() for f in self.fields.values()],
+            "eruptFieldModels": [f.build() for f in self.declared],
             "searchCondition": {},
             "extraRow": False,
             "tags": {},

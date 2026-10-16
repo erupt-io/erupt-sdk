@@ -18,7 +18,7 @@ const _userKey = #eruptUser;
 User? currentUser() => Zone.current[_userKey] as User?;
 
 // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-const _unsupportedPower = {'cellEdit': false, 'print': false, 'ai': false};
+const _unsupportedPower = {'print': false, 'ai': false};
 
 // Rights the server decides per user; the node ANDs them onto the declared power
 const _serverPower = ['add', 'edit', 'delete', 'viewDetails', 'export', 'importable'];

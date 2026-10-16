@@ -86,7 +86,7 @@ enum VisType { TABLE, GANTT, CARD, BOARD, CALENDAR, TIMELINE, MAP, CUBE, TPL }
 
 /// JSON of `@AttachmentType`.
 class AttachmentType extends Annotation {
-  const AttachmentType({this.fileSeparator, this.fileTypes, this.maxLimit, this.size, this.type});
+  const AttachmentType({this.fileSeparator, this.fileTypes, this.imageType, this.maxLimit, this.path, this.size, this.type});
 
   /// default "|"
   final String? fileSeparator;
@@ -94,8 +94,13 @@ class AttachmentType extends Annotation {
   /// default []
   final List<String>? fileTypes;
 
+  final AttachmentTypeImageType? imageType;
+
   /// default 1
   final int? maxLimit;
+
+  /// default ""
+  final String? path;
 
   /// default -1
   final int? size;
@@ -104,7 +109,27 @@ class AttachmentType extends Annotation {
   final AttachmentTypeType? type;
 
   @override
-  Map<String, Object?> get attributes => {'fileSeparator': fileSeparator, 'fileTypes': fileTypes, 'maxLimit': maxLimit, 'size': size, 'type': type};
+  Map<String, Object?> get attributes => {'fileSeparator': fileSeparator, 'fileTypes': fileTypes, 'imageType': imageType, 'maxLimit': maxLimit, 'path': path, 'size': size, 'type': type};
+}
+
+/// JSON of `@AttachmentTypeImageType`.
+class AttachmentTypeImageType extends Annotation {
+  const AttachmentTypeImageType({this.maxHeight, this.maxWidth, this.minHeight, this.minWidth});
+
+  /// default 2147483647
+  final int? maxHeight;
+
+  /// default 2147483647
+  final int? maxWidth;
+
+  /// default 0
+  final int? minHeight;
+
+  /// default 0
+  final int? minWidth;
+
+  @override
+  Map<String, Object?> get attributes => {'maxHeight': maxHeight, 'maxWidth': maxWidth, 'minHeight': minHeight, 'minWidth': minWidth};
 }
 
 /// JSON of `@AutoCompleteType`.
@@ -226,7 +251,7 @@ class CardView extends Annotation {
 
 /// JSON of `@ChoiceType`.
 class ChoiceType extends Annotation {
-  const ChoiceType({this.dependField, this.fetchHandler, this.type});
+  const ChoiceType({this.dependField, this.fetchHandler, this.type, this.validate});
 
   /// default ""
   final String? dependField;
@@ -237,8 +262,11 @@ class ChoiceType extends Annotation {
   /// default "SELECT"
   final ChoiceTypeType? type;
 
+  /// default true
+  final bool? validate;
+
   @override
-  Map<String, Object?> get attributes => {'dependField': dependField, 'fetchHandler': fetchHandler, 'type': type};
+  Map<String, Object?> get attributes => {'dependField': dependField, 'fetchHandler': fetchHandler, 'type': type, 'validate': validate};
 }
 
 /// JSON of `@CodeEditorType`.
@@ -566,6 +594,17 @@ class EruptField extends Annotation {
   Map<String, Object?> get attributes => {'edit': edit, 'params': params, 'views': views};
 }
 
+/// JSON of `@Expr`.
+class Expr extends Annotation {
+  const Expr({this.value});
+
+  /// default ""
+  final String? value;
+
+  @override
+  Map<String, Object?> get attributes => {'value': value};
+}
+
 /// JSON of `@GanttView`.
 class GanttView extends Annotation {
   const GanttView({this.colorField, this.dependencyField, this.endDateField, this.groupField, this.milestoneField, this.pidField, this.progressField, this.startDateField});
@@ -611,17 +650,20 @@ class GroupType extends Annotation {
 
 /// JSON of `@HtmlEditorType`.
 class HtmlEditorType extends Annotation {
-  const HtmlEditorType({this.value});
+  const HtmlEditorType({this.path, this.value});
+
+  /// default ""
+  final String? path;
 
   final HtmlEditorTypeType? value;
 
   @override
-  Map<String, Object?> get attributes => {'value': value};
+  Map<String, Object?> get attributes => {'path': path, 'value': value};
 }
 
 /// JSON of `@InputType`.
 class InputType extends Annotation {
-  const InputType({this.fullSpan, this.length, this.prefix, this.suffix, this.type});
+  const InputType({this.fullSpan, this.length, this.prefix, this.regex, this.suffix, this.type});
 
   /// default false
   final bool? fullSpan;
@@ -632,6 +674,9 @@ class InputType extends Annotation {
   /// default []
   final List<VL>? prefix;
 
+  /// default ""
+  final String? regex;
+
   /// default []
   final List<VL>? suffix;
 
@@ -639,7 +684,7 @@ class InputType extends Annotation {
   final String? type;
 
   @override
-  Map<String, Object?> get attributes => {'fullSpan': fullSpan, 'length': length, 'prefix': prefix, 'suffix': suffix, 'type': type};
+  Map<String, Object?> get attributes => {'fullSpan': fullSpan, 'length': length, 'prefix': prefix, 'regex': regex, 'suffix': suffix, 'type': type};
 }
 
 /// JSON of `@KV`.
@@ -772,16 +817,22 @@ class MapView extends Annotation {
 
 /// JSON of `@MultiChoiceType`.
 class MultiChoiceType extends Annotation {
-  const MultiChoiceType({this.dependField, this.type});
+  const MultiChoiceType({this.dependField, this.fetchHandler, this.type, this.validate});
 
   /// default ""
   final String? dependField;
 
+  /// default []
+  final List<String>? fetchHandler;
+
   /// default "CHECKBOX"
   final MultiChoiceTypeType? type;
 
+  /// default true
+  final bool? validate;
+
   @override
-  Map<String, Object?> get attributes => {'dependField': dependField, 'type': type};
+  Map<String, Object?> get attributes => {'dependField': dependField, 'fetchHandler': fetchHandler, 'type': type, 'validate': validate};
 }
 
 /// JSON of `@NumberType`.
@@ -866,7 +917,7 @@ class ReferenceTableType extends Annotation {
 
 /// JSON of `@ReferenceTreeType`.
 class ReferenceTreeType extends Annotation {
-  const ReferenceTreeType({this.dependField, this.expandLevel, this.id, this.label, this.pid});
+  const ReferenceTreeType({this.dependField, this.expandLevel, this.id, this.label, this.pid, this.rootPid});
 
   /// default ""
   final String? dependField;
@@ -883,8 +934,10 @@ class ReferenceTreeType extends Annotation {
   /// default ""
   final String? pid;
 
+  final Expr? rootPid;
+
   @override
-  Map<String, Object?> get attributes => {'dependField': dependField, 'expandLevel': expandLevel, 'id': id, 'label': label, 'pid': pid};
+  Map<String, Object?> get attributes => {'dependField': dependField, 'expandLevel': expandLevel, 'id': id, 'label': label, 'pid': pid, 'rootPid': rootPid};
 }
 
 /// JSON of `@RowOperation`.
@@ -987,7 +1040,7 @@ class TableView extends Annotation {
 
 /// JSON of `@TagsType`.
 class TagsType extends Annotation {
-  const TagsType({this.allowExtension, this.fetchHandler, this.joinSeparator, this.maxTagCount});
+  const TagsType({this.allowExtension, this.fetchHandler, this.joinSeparator, this.maxTagCount, this.tags});
 
   /// default true
   final bool? allowExtension;
@@ -1001,8 +1054,11 @@ class TagsType extends Annotation {
   /// default 9999
   final int? maxTagCount;
 
+  /// default []
+  final List<String>? tags;
+
   @override
-  Map<String, Object?> get attributes => {'allowExtension': allowExtension, 'fetchHandler': fetchHandler, 'joinSeparator': joinSeparator, 'maxTagCount': maxTagCount};
+  Map<String, Object?> get attributes => {'allowExtension': allowExtension, 'fetchHandler': fetchHandler, 'joinSeparator': joinSeparator, 'maxTagCount': maxTagCount, 'tags': tags};
 }
 
 /// JSON of `@TextareaType`.
@@ -1124,7 +1180,7 @@ class VL extends Annotation {
 
 /// JSON of `@View`.
 class View extends Annotation {
-  const View({this.className, this.column, this.desc, this.group, this.show, this.sortable, this.statistic, this.template, this.title, this.tpl, this.type, this.width});
+  const View({this.className, this.column, this.desc, this.export, this.group, this.show, this.sortable, this.statistic, this.template, this.title, this.tpl, this.type, this.width});
 
   /// default ""
   final String? className;
@@ -1134,6 +1190,9 @@ class View extends Annotation {
 
   /// default ""
   final String? desc;
+
+  /// default true
+  final bool? export;
 
   /// default ""
   final String? group;
@@ -1161,7 +1220,7 @@ class View extends Annotation {
   final String? width;
 
   @override
-  Map<String, Object?> get attributes => {'className': className, 'column': column, 'desc': desc, 'group': group, 'show': show, 'sortable': sortable, 'statistic': statistic, 'template': template, 'title': title, 'tpl': tpl, 'type': type, 'width': width};
+  Map<String, Object?> get attributes => {'className': className, 'column': column, 'desc': desc, 'export': export, 'group': group, 'show': show, 'sortable': sortable, 'statistic': statistic, 'template': template, 'title': title, 'tpl': tpl, 'type': type, 'width': width};
 }
 
 /// JSON of `@Vis`.

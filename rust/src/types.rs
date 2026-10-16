@@ -1389,15 +1389,36 @@ pub struct AttachmentType {
     /// default []
     #[serde(rename = "fileTypes", skip_serializing_if = "Option::is_none")]
     pub file_types: Option<Vec<String>>,
+    #[serde(rename = "imageType", skip_serializing_if = "Option::is_none")]
+    pub image_type: Option<AttachmentTypeImageType>,
     /// default 1
     #[serde(rename = "maxLimit", skip_serializing_if = "Option::is_none")]
     pub max_limit: Option<i64>,
+    /// default ""
+    #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// default -1
     #[serde(rename = "size", skip_serializing_if = "Option::is_none")]
     pub size: Option<i64>,
     /// default "BASE"
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<AttachmentTypeType>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct AttachmentTypeImageType {
+    /// default 2147483647
+    #[serde(rename = "maxHeight", skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<i64>,
+    /// default 2147483647
+    #[serde(rename = "maxWidth", skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<i64>,
+    /// default 0
+    #[serde(rename = "minHeight", skip_serializing_if = "Option::is_none")]
+    pub min_height: Option<i64>,
+    /// default 0
+    #[serde(rename = "minWidth", skip_serializing_if = "Option::is_none")]
+    pub min_width: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -1500,6 +1521,9 @@ pub struct ChoiceType {
     /// default "SELECT"
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<ChoiceTypeType>,
+    /// default true
+    #[serde(rename = "validate", skip_serializing_if = "Option::is_none")]
+    pub validate: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -1784,6 +1808,13 @@ pub struct EruptField {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Expr {
+    /// default ""
+    #[serde(rename = "value", skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct GanttView {
     /// default ""
     #[serde(rename = "colorField", skip_serializing_if = "Option::is_none")]
@@ -1820,6 +1851,9 @@ pub struct GroupType {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct HtmlEditorType {
+    /// default ""
+    #[serde(rename = "path", skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(rename = "value", skip_serializing_if = "Option::is_none")]
     pub value: Option<HtmlEditorTypeType>,
 }
@@ -1835,6 +1869,9 @@ pub struct InputType {
     /// default []
     #[serde(rename = "prefix", skip_serializing_if = "Option::is_none")]
     pub prefix: Option<Vec<VL>>,
+    /// default ""
+    #[serde(rename = "regex", skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
     /// default []
     #[serde(rename = "suffix", skip_serializing_if = "Option::is_none")]
     pub suffix: Option<Vec<VL>>,
@@ -1952,9 +1989,15 @@ pub struct MultiChoiceType {
     /// default ""
     #[serde(rename = "dependField", skip_serializing_if = "Option::is_none")]
     pub depend_field: Option<String>,
+    /// default []
+    #[serde(rename = "fetchHandler", skip_serializing_if = "Option::is_none")]
+    pub fetch_handler: Option<Vec<String>>,
     /// default "CHECKBOX"
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<MultiChoiceTypeType>,
+    /// default true
+    #[serde(rename = "validate", skip_serializing_if = "Option::is_none")]
+    pub validate: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -2038,6 +2081,8 @@ pub struct ReferenceTreeType {
     /// default ""
     #[serde(rename = "pid", skip_serializing_if = "Option::is_none")]
     pub pid: Option<String>,
+    #[serde(rename = "rootPid", skip_serializing_if = "Option::is_none")]
+    pub root_pid: Option<Expr>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -2136,6 +2181,9 @@ pub struct TagsType {
     /// default 9999
     #[serde(rename = "maxTagCount", skip_serializing_if = "Option::is_none")]
     pub max_tag_count: Option<i64>,
+    /// default []
+    #[serde(rename = "tags", skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -2246,6 +2294,9 @@ pub struct View {
     /// default ""
     #[serde(rename = "desc", skip_serializing_if = "Option::is_none")]
     pub desc: Option<String>,
+    /// default true
+    #[serde(rename = "export", skip_serializing_if = "Option::is_none")]
+    pub export: Option<bool>,
     /// default ""
     #[serde(rename = "group", skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,

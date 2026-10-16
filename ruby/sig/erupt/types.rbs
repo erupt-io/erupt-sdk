@@ -5,9 +5,17 @@ module Erupt
   type attachment_type = {
     ?fileSeparator: String, # default "|"
     ?fileTypes: Array[String], # default []
+    ?imageType: attachment_type_image_type,
     ?maxLimit: Integer, # default 1
+    ?path: String, # default ""
     ?size: Integer, # default -1
     ?type: attachment_type_type # default "BASE"
+  }
+  type attachment_type_image_type = {
+    ?maxHeight: Integer, # default 2147483647
+    ?maxWidth: Integer, # default 2147483647
+    ?minHeight: Integer, # default 0
+    ?minWidth: Integer # default 0
   }
   type attachment_type_type = "BASE" | "IMAGE"
   type auto_complete_type = {
@@ -52,7 +60,8 @@ module Erupt
   type choice_type = {
     ?dependField: String, # default ""
     ?fetchHandler: Array[String], # default []
-    ?type: choice_type_type # default "SELECT"
+    ?type: choice_type_type, # default "SELECT"
+    ?validate: bool # default true
   }
   type choice_type_type = "SELECT" | "RADIO"
   type code_editor_type = {
@@ -166,6 +175,9 @@ module Erupt
     ?params: Hash[Symbol | String, kv], # keyed by key
     ?views: Array[view] # default []
   }
+  type expr = {
+    ?value: String # default ""
+  }
   type gantt_view = {
     ?colorField: String, # default ""
     ?dependencyField: String, # default ""
@@ -181,6 +193,7 @@ module Erupt
     ?fields: Array[String]
   }
   type html_editor_type = {
+    ?path: String, # default ""
     ?value: html_editor_type_type
   }
   type html_editor_type_type = "CKEDITOR" | "UEDITOR"
@@ -188,6 +201,7 @@ module Erupt
     ?fullSpan: bool, # default false
     ?length: Integer, # default 255
     ?prefix: Array[vl], # default []
+    ?regex: String, # default ""
     ?suffix: Array[vl], # default []
     ?type: String # default "text"
   }
@@ -235,7 +249,9 @@ module Erupt
   }
   type multi_choice_type = {
     ?dependField: String, # default ""
-    ?type: multi_choice_type_type # default "CHECKBOX"
+    ?fetchHandler: Array[String], # default []
+    ?type: multi_choice_type_type, # default "CHECKBOX"
+    ?validate: bool # default true
   }
   type multi_choice_type_type = "SELECT" | "CHECKBOX" | "TRANSFER"
   type number_type = {
@@ -271,7 +287,8 @@ module Erupt
     ?expandLevel: Integer, # default 999
     ?id: String, # default "id"
     ?label: String, # default "name"
-    ?pid: String # default ""
+    ?pid: String, # default ""
+    ?rootPid: expr
   }
   type row_operation = {
     ?callHint: String, # default "erupt.operation.call_hint"
@@ -311,7 +328,8 @@ module Erupt
     ?allowExtension: bool, # default true
     ?fetchHandler: Array[String], # default []
     ?joinSeparator: String, # default "[]"
-    ?maxTagCount: Integer # default 9999
+    ?maxTagCount: Integer, # default 9999
+    ?tags: Array[String] # default []
   }
   type textarea_type = {
     ?length: Integer, # default 2147483647
@@ -355,6 +373,7 @@ module Erupt
     ?className: String, # default ""
     ?column: String, # default ""
     ?desc: String, # default ""
+    ?export: bool, # default true
     ?group: String, # default ""
     ?show: bool, # default true
     ?sortable: bool, # default false

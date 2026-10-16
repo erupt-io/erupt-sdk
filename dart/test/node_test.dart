@@ -171,7 +171,7 @@ void main() {
     expect(ops.keys, ['publish', 'feature', 'boom'], reason: 'rebuild is hidden from admin');
     expect([ops['feature']['eruptClass'], ops['feature']['callHint'], ops['feature']['mode']], ['void', '', 'SINGLE']);
     expect((b['operationErupts'] as Map).keys, ['publish']);
-    expect(b['power']['cellEdit'], isFalse);
+    expect(b['power']['cellEdit'], isTrue); // the server edits the cell
     expect(b['power']['add'], isTrue);
   });
 

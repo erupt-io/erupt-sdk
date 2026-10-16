@@ -77,7 +77,7 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(fields.map { $0["fieldName"]!.text } == ["id", "title", "status", "views", "publish_date", "category", "tags", "divider"])
         for f in fields { try Schema.check("EruptField", f["eruptFieldJson"]!, partial: false) }
         #expect(fields[6]["eruptFieldJson"]!["edit"]!["type"] == "MULTI_CHOICE")
-        #expect(build?["power"]?["cellEdit"] == false)
+        #expect(build?["power"]?["cellEdit"] == true) // the server edits the cell
     }
 
     @Test func crudAndSearch() throws {

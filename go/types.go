@@ -435,11 +435,21 @@ var VisTypeValues = []VisType{VisTypeTable, VisTypeGantt, VisTypeCard, VisTypeBo
 
 // AttachmentType is the JSON of @AttachmentType. Every field is optional: a declaration only overrides the defaults.
 type AttachmentType struct {
-	FileSeparator *string            `json:"fileSeparator,omitempty"` // default "|"
-	FileTypes     []string           `json:"fileTypes,omitempty"`     // default []
-	MaxLimit      *int64             `json:"maxLimit,omitempty"`      // default 1
-	Size          *int64             `json:"size,omitempty"`          // default -1
-	Type          AttachmentTypeType `json:"type,omitempty"`          // default "BASE"
+	FileSeparator *string                  `json:"fileSeparator,omitempty"` // default "|"
+	FileTypes     []string                 `json:"fileTypes,omitempty"`     // default []
+	ImageType     *AttachmentTypeImageType `json:"imageType,omitempty"`
+	MaxLimit      *int64                   `json:"maxLimit,omitempty"` // default 1
+	Path          *string                  `json:"path,omitempty"`     // default ""
+	Size          *int64                   `json:"size,omitempty"`     // default -1
+	Type          AttachmentTypeType       `json:"type,omitempty"`     // default "BASE"
+}
+
+// AttachmentTypeImageType is the JSON of @AttachmentTypeImageType. Every field is optional: a declaration only overrides the defaults.
+type AttachmentTypeImageType struct {
+	MaxHeight *int64 `json:"maxHeight,omitempty"` // default 2147483647
+	MaxWidth  *int64 `json:"maxWidth,omitempty"`  // default 2147483647
+	MinHeight *int64 `json:"minHeight,omitempty"` // default 0
+	MinWidth  *int64 `json:"minWidth,omitempty"`  // default 0
 }
 
 // AutoCompleteType is the JSON of @AutoCompleteType. Every field is optional: a declaration only overrides the defaults.
@@ -496,6 +506,7 @@ type ChoiceType struct {
 	DependField  *string        `json:"dependField,omitempty"`  // default ""
 	FetchHandler []string       `json:"fetchHandler,omitempty"` // default []
 	Type         ChoiceTypeType `json:"type,omitempty"`         // default "SELECT"
+	Validate     *bool          `json:"validate,omitempty"`     // default true
 }
 
 // CodeEditorType is the JSON of @CodeEditorType. Every field is optional: a declaration only overrides the defaults.
@@ -626,6 +637,11 @@ type EruptField struct {
 	Views  []View        `json:"views,omitempty"`  // default []
 }
 
+// Expr is the JSON of @Expr. Every field is optional: a declaration only overrides the defaults.
+type Expr struct {
+	Value *string `json:"value,omitempty"` // default ""
+}
+
 // GanttView is the JSON of @GanttView. Every field is optional: a declaration only overrides the defaults.
 type GanttView struct {
 	ColorField      *string `json:"colorField,omitempty"`      // default ""
@@ -646,6 +662,7 @@ type GroupType struct {
 
 // HtmlEditorType is the JSON of @HtmlEditorType. Every field is optional: a declaration only overrides the defaults.
 type HtmlEditorType struct {
+	Path  *string            `json:"path,omitempty"` // default ""
 	Value HtmlEditorTypeType `json:"value,omitempty"`
 }
 
@@ -654,6 +671,7 @@ type InputType struct {
 	FullSpan *bool   `json:"fullSpan,omitempty"` // default false
 	Length   *int64  `json:"length,omitempty"`   // default 255
 	Prefix   []VL    `json:"prefix,omitempty"`   // default []
+	Regex    *string `json:"regex,omitempty"`    // default ""
 	Suffix   []VL    `json:"suffix,omitempty"`   // default []
 	Type     *string `json:"type,omitempty"`     // default "text"
 }
@@ -712,8 +730,10 @@ type MapView struct {
 
 // MultiChoiceType is the JSON of @MultiChoiceType. Every field is optional: a declaration only overrides the defaults.
 type MultiChoiceType struct {
-	DependField *string             `json:"dependField,omitempty"` // default ""
-	Type        MultiChoiceTypeType `json:"type,omitempty"`        // default "CHECKBOX"
+	DependField  *string             `json:"dependField,omitempty"`  // default ""
+	FetchHandler []string            `json:"fetchHandler,omitempty"` // default []
+	Type         MultiChoiceTypeType `json:"type,omitempty"`         // default "CHECKBOX"
+	Validate     *bool               `json:"validate,omitempty"`     // default true
 }
 
 // NumberType is the JSON of @NumberType. Every field is optional: a declaration only overrides the defaults.
@@ -755,6 +775,7 @@ type ReferenceTreeType struct {
 	Id          *string `json:"id,omitempty"`          // default "id"
 	Label       *string `json:"label,omitempty"`       // default "name"
 	Pid         *string `json:"pid,omitempty"`         // default ""
+	RootPid     *Expr   `json:"rootPid,omitempty"`
 }
 
 // RowOperation is the JSON of @RowOperation. Every field is optional: a declaration only overrides the defaults.
@@ -802,6 +823,7 @@ type TagsType struct {
 	FetchHandler   []string `json:"fetchHandler,omitempty"`   // default []
 	JoinSeparator  *string  `json:"joinSeparator,omitempty"`  // default "[]"
 	MaxTagCount    *int64   `json:"maxTagCount,omitempty"`    // default 9999
+	Tags           []string `json:"tags,omitempty"`           // default []
 }
 
 // TextareaType is the JSON of @TextareaType. Every field is optional: a declaration only overrides the defaults.
@@ -856,6 +878,7 @@ type View struct {
 	ClassName *string       `json:"className,omitempty"` // default ""
 	Column    *string       `json:"column,omitempty"`    // default ""
 	Desc      *string       `json:"desc,omitempty"`      // default ""
+	Export    *bool         `json:"export,omitempty"`    // default true
 	Group     *string       `json:"group,omitempty"`     // default ""
 	Show      *bool         `json:"show,omitempty"`      // default true
 	Sortable  *bool         `json:"sortable,omitempty"`  // default false

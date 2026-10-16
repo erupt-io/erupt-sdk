@@ -27,9 +27,16 @@ enum Embedded {
           },
           "default": []
         },
+        "imageType": {
+          "$ref": "#/$defs/AttachmentTypeImageType"
+        },
         "maxLimit": {
           "type": "integer",
           "default": 1
+        },
+        "path": {
+          "type": "string",
+          "default": ""
         },
         "size": {
           "type": "integer",
@@ -43,9 +50,39 @@ enum Embedded {
       "required": [
         "fileSeparator",
         "fileTypes",
+        "imageType",
         "maxLimit",
+        "path",
         "size",
         "type"
+      ],
+      "additionalProperties": false
+    },
+    "AttachmentTypeImageType": {
+      "type": "object",
+      "properties": {
+        "maxHeight": {
+          "type": "integer",
+          "default": 2147483647
+        },
+        "maxWidth": {
+          "type": "integer",
+          "default": 2147483647
+        },
+        "minHeight": {
+          "type": "integer",
+          "default": 0
+        },
+        "minWidth": {
+          "type": "integer",
+          "default": 0
+        }
+      },
+      "required": [
+        "maxHeight",
+        "maxWidth",
+        "minHeight",
+        "minWidth"
       ],
       "additionalProperties": false
     },
@@ -265,12 +302,17 @@ enum Embedded {
         "type": {
           "$ref": "#/$defs/ChoiceTypeType",
           "default": "SELECT"
+        },
+        "validate": {
+          "type": "boolean",
+          "default": true
         }
       },
       "required": [
         "dependField",
         "fetchHandler",
-        "type"
+        "type",
+        "validate"
       ],
       "additionalProperties": false
     },
@@ -898,6 +940,19 @@ enum Embedded {
       ],
       "additionalProperties": false
     },
+    "Expr": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "additionalProperties": false
+    },
     "GanttView": {
       "type": "object",
       "properties": {
@@ -967,11 +1022,16 @@ enum Embedded {
     "HtmlEditorType": {
       "type": "object",
       "properties": {
+        "path": {
+          "type": "string",
+          "default": ""
+        },
         "value": {
           "$ref": "#/$defs/HtmlEditorTypeType"
         }
       },
       "required": [
+        "path",
         "value"
       ],
       "additionalProperties": false
@@ -1001,6 +1061,10 @@ enum Embedded {
           },
           "default": []
         },
+        "regex": {
+          "type": "string",
+          "default": ""
+        },
         "suffix": {
           "type": "array",
           "items": {
@@ -1017,6 +1081,7 @@ enum Embedded {
         "fullSpan",
         "length",
         "prefix",
+        "regex",
         "suffix",
         "type"
       ],
@@ -1242,14 +1307,27 @@ enum Embedded {
           "type": "string",
           "default": ""
         },
+        "fetchHandler": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
         "type": {
           "$ref": "#/$defs/MultiChoiceTypeType",
           "default": "CHECKBOX"
+        },
+        "validate": {
+          "type": "boolean",
+          "default": true
         }
       },
       "required": [
         "dependField",
-        "type"
+        "fetchHandler",
+        "type",
+        "validate"
       ],
       "additionalProperties": false
     },
@@ -1438,6 +1516,9 @@ enum Embedded {
         "pid": {
           "type": "string",
           "default": ""
+        },
+        "rootPid": {
+          "$ref": "#/$defs/Expr"
         }
       },
       "required": [
@@ -1445,7 +1526,8 @@ enum Embedded {
         "expandLevel",
         "id",
         "label",
-        "pid"
+        "pid",
+        "rootPid"
       ],
       "additionalProperties": false
     },
@@ -1640,13 +1722,21 @@ enum Embedded {
         "maxTagCount": {
           "type": "integer",
           "default": 9999
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
         "allowExtension",
         "fetchHandler",
         "joinSeparator",
-        "maxTagCount"
+        "maxTagCount",
+        "tags"
       ],
       "additionalProperties": false
     },
@@ -1850,6 +1940,10 @@ enum Embedded {
           "type": "string",
           "default": ""
         },
+        "export": {
+          "type": "boolean",
+          "default": true
+        },
         "group": {
           "type": "string",
           "default": ""
@@ -1889,6 +1983,7 @@ enum Embedded {
         "className",
         "column",
         "desc",
+        "export",
         "group",
         "show",
         "sortable",
@@ -2122,6 +2217,7 @@ enum Embedded {
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2151,7 +2247,8 @@ enum Embedded {
           "choiceType": {
             "dependField": "",
             "fetchHandler": [],
-            "type": "SELECT"
+            "type": "SELECT",
+            "validate": true
           },
           "desc": "",
           "notNull": false,
@@ -2177,6 +2274,7 @@ enum Embedded {
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2233,6 +2331,7 @@ enum Embedded {
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2289,6 +2388,7 @@ enum Embedded {
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2321,6 +2421,7 @@ enum Embedded {
             "fullSpan": false,
             "length": 255,
             "prefix": [],
+            "regex": "",
             "suffix": [],
             "type": "text"
           },
@@ -2347,6 +2448,7 @@ enum Embedded {
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2406,6 +2508,7 @@ enum Embedded {
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2461,6 +2564,7 @@ enum Embedded {
             "className": "",
             "column": "name",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2501,7 +2605,10 @@ enum Embedded {
             "expandLevel": 999,
             "id": "id",
             "label": "name",
-            "pid": ""
+            "pid": "",
+            "rootPid": {
+              "value": ""
+            }
           },
           "search": {
             "lockOperator": false,
@@ -2518,6 +2625,7 @@ enum Embedded {
             "className": "",
             "column": "name",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2576,6 +2684,7 @@ enum Embedded {
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,

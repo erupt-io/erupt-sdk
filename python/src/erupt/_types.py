@@ -35,9 +35,18 @@ VisType = Literal["TABLE", "GANTT", "CARD", "BOARD", "CALENDAR", "TIMELINE", "MA
 class AttachmentType(TypedDict, total=False):
     fileSeparator: str  # default "|"
     fileTypes: "List[str]"  # default []
+    imageType: "AttachmentTypeImageType"
     maxLimit: int  # default 1
+    path: str  # default ""
     size: int  # default -1
     type: "AttachmentTypeType"  # default "BASE"
+
+
+class AttachmentTypeImageType(TypedDict, total=False):
+    maxHeight: int  # default 2147483647
+    maxWidth: int  # default 2147483647
+    minHeight: int  # default 0
+    minWidth: int  # default 0
 
 
 class AutoCompleteType(TypedDict, total=False):
@@ -86,6 +95,7 @@ class ChoiceType(TypedDict, total=False):
     dependField: str  # default ""
     fetchHandler: "List[str]"  # default []
     type: "ChoiceTypeType"  # default "SELECT"
+    validate: bool  # default true
 
 
 class CodeEditorType(TypedDict, total=False):
@@ -205,6 +215,10 @@ class EruptField(TypedDict, total=False):
     views: "List[View]"  # default []
 
 
+class Expr(TypedDict, total=False):
+    value: str  # default ""
+
+
 class GanttView(TypedDict, total=False):
     colorField: str  # default ""
     dependencyField: str  # default ""
@@ -222,6 +236,7 @@ class GroupType(TypedDict, total=False):
 
 
 class HtmlEditorType(TypedDict, total=False):
+    path: str  # default ""
     value: "HtmlEditorTypeType"
 
 
@@ -229,6 +244,7 @@ class InputType(TypedDict, total=False):
     fullSpan: bool  # default false
     length: int  # default 255
     prefix: "List[VL]"  # default []
+    regex: str  # default ""
     suffix: "List[VL]"  # default []
     type: str  # default "text"
 
@@ -281,7 +297,9 @@ class MapView(TypedDict, total=False):
 
 class MultiChoiceType(TypedDict, total=False):
     dependField: str  # default ""
+    fetchHandler: "List[str]"  # default []
     type: "MultiChoiceTypeType"  # default "CHECKBOX"
+    validate: bool  # default true
 
 
 class NumberType(TypedDict, total=False):
@@ -318,6 +336,7 @@ class ReferenceTreeType(TypedDict, total=False):
     id: str  # default "id"
     label: str  # default "name"
     pid: str  # default ""
+    rootPid: "Expr"
 
 
 class RowOperation(TypedDict, total=False):
@@ -360,6 +379,7 @@ class TagsType(TypedDict, total=False):
     fetchHandler: "List[str]"  # default []
     joinSeparator: str  # default "[]"
     maxTagCount: int  # default 9999
+    tags: "List[str]"  # default []
 
 
 class TextareaType(TypedDict, total=False):
@@ -408,6 +428,7 @@ class View(TypedDict, total=False):
     className: str  # default ""
     column: str  # default ""
     desc: str  # default ""
+    export: bool  # default true
     group: str  # default ""
     show: bool  # default true
     sortable: bool  # default false

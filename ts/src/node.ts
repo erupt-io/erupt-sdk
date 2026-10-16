@@ -18,7 +18,7 @@ export function currentUser(): User | null {
 }
 
 // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-const UNSUPPORTED_POWER: Power = { cellEdit: false, print: false, ai: false };
+const UNSUPPORTED_POWER: Power = { print: false, ai: false };
 
 // Rights the server decides per user; the node ANDs them onto the declared power
 const SERVER_POWER = ["add", "edit", "delete", "viewDetails", "export", "importable"];

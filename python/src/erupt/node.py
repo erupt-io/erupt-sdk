@@ -29,7 +29,7 @@ __version__ = "0.1.0"
 _user = contextvars.ContextVar("erupt_user", default=None)
 
 # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-_UNSUPPORTED_POWER = {"cellEdit": False, "print": False, "ai": False}
+_UNSUPPORTED_POWER = {"print": False, "ai": False}
 
 # Rights the server decides per user; the node ANDs them onto the declared power
 _SERVER_POWER = ("add", "edit", "delete", "viewDetails", "export", "importable")

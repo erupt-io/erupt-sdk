@@ -170,7 +170,7 @@ class NodeTest < Minitest::Test
     assert_equal %w[draft published], fields["status"]["componentValue"].map { |v| v["value"] }
     assert fields["title"]["eruptFieldJson"]["edit"]["notNull"]
     assert build["power"]["export"] # Excel is done by the server
-    refute build["power"]["cellEdit"]
+    assert build["power"]["cellEdit"] # the server edits the cell
   end
 
   def test_build_matches_schema

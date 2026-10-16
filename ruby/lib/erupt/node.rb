@@ -17,7 +17,7 @@ module Erupt
   # mounted in Rails / Sinatra / any Rack server, or served on its own with +serve+.
   class Node
     # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-    UNSUPPORTED_POWER = { "cellEdit" => false, "print" => false, "ai" => false }.freeze
+    UNSUPPORTED_POWER = { "print" => false, "ai" => false }.freeze
     # Rights the server decides per user; the node ANDs them onto the declared power
     SERVER_POWER = %w[add edit delete viewDetails export importable].freeze
     OPS = %w[EQ NEQ GT GTE LT LTE LIKE NOT_LIKE RANGE IN NOT_IN NULL NOT_NULL].freeze

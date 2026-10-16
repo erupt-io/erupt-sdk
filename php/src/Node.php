@@ -12,7 +12,7 @@ final class Node
     public const VERSION = '0.1.0';
 
     // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
-    private const UNSUPPORTED_POWER = ['cellEdit' => false, 'print' => false, 'ai' => false];
+    private const UNSUPPORTED_POWER = ['print' => false, 'ai' => false];
 
     // Rights the server decides per user; the node ANDs them onto the declared power
     private const SERVER_POWER = ['add', 'edit', 'delete', 'viewDetails', 'export', 'importable'];

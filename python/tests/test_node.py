@@ -137,7 +137,7 @@ class NodeTest(unittest.TestCase):
         self.assertEqual(["draft", "published"], [v["value"] for v in fields["status"]["componentValue"]])
         self.assertTrue(fields["title"]["eruptFieldJson"]["edit"]["notNull"])
         self.assertTrue(build["power"]["export"])  # Excel is done by the server
-        self.assertFalse(build["power"]["cellEdit"])
+        self.assertTrue(build["power"]["cellEdit"])  # the server edits the cell
 
     def test_power_is_declared_and_server(self):
         self.remote["add"] = False

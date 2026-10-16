@@ -8,7 +8,8 @@ namespace Erupt\Types;
  * Erupt annotation JSON as array shapes, for IDE help on raw view / edit / erupt / operation
  * attributes. Every key is optional: a declaration only overrides the defaults the Java proxies emit.
  *
- * @phpstan-type AttachmentType array{fileSeparator?: string, fileTypes?: list<string>, maxLimit?: int, size?: int, type?: value-of<\Erupt\Types\AttachmentTypeType>}
+ * @phpstan-type AttachmentType array{fileSeparator?: string, fileTypes?: list<string>, imageType?: AttachmentTypeImageType, maxLimit?: int, path?: string, size?: int, type?: value-of<\Erupt\Types\AttachmentTypeType>}
+ * @phpstan-type AttachmentTypeImageType array{maxHeight?: int, maxWidth?: int, minHeight?: int, minWidth?: int}
  * @phpstan-type AutoCompleteType array{triggerLength?: int}
  * @phpstan-type BoardView array{groupField?: string, sumField?: string, swimlaneField?: string, wipLimit?: int}
  * @phpstan-type BoolType array{falseText?: string, trueText?: string, type?: value-of<\Erupt\Types\BoolTypeType>}
@@ -16,7 +17,7 @@ namespace Erupt\Types;
  * @phpstan-type CalendarView array{colorField?: string, dateField?: string, endDateField?: string, mode?: value-of<\Erupt\Types\CalendarViewMode>}
  * @phpstan-type CalloutType array{style?: value-of<\Erupt\Types\CalloutTypeStyle>, value?: string}
  * @phpstan-type CardView array{coverEffect?: value-of<\Erupt\Types\CardViewCoverEffect>, coverField?: string}
- * @phpstan-type ChoiceType array{dependField?: string, fetchHandler?: list<string>, type?: value-of<\Erupt\Types\ChoiceTypeType>}
+ * @phpstan-type ChoiceType array{dependField?: string, fetchHandler?: list<string>, type?: value-of<\Erupt\Types\ChoiceTypeType>, validate?: bool}
  * @phpstan-type CodeEditorType array{height?: int, hintHandler?: list<string>, hints?: list<string>, language?: string}
  * @phpstan-type ColorType array{alpha?: bool, presets?: list<string>, showText?: bool}
  * @phpstan-type CubeChart array{series?: string, span?: int, title?: string, type?: value-of<\Erupt\Types\CubeChartType>, ui?: array<string, KV>, x?: list<string>, y?: list<string>}
@@ -28,33 +29,34 @@ namespace Erupt\Types;
  * @phpstan-type Edit array{ai?: bool, attachmentType?: AttachmentType, autoCompleteType?: AutoCompleteType, boolType?: BoolType, buttonType?: ButtonType, calloutType?: CalloutType, cellEdit?: bool, choiceType?: ChoiceType, codeEditType?: CodeEditorType, colorType?: ColorType, dateType?: DateType, desc?: string, dynamic?: Dynamic, groupType?: GroupType, htmlEditorType?: HtmlEditorType, inputType?: InputType, keyValueType?: KeyValueType, multiChoiceType?: MultiChoiceType, notNull?: bool, numberType?: NumberType, onchange?: string, placeHolder?: string, rateType?: RateType, readOnly?: Readonly, referenceTableType?: ReferenceTableType, referenceTreeType?: ReferenceTreeType, search?: Search, show?: bool, sliderType?: SliderType, tagsType?: TagsType, textareaType?: TextareaType, title?: string, type?: value-of<\Erupt\Types\EditType>}
  * @phpstan-type Erupt array{dataProxyParams?: list<string>, desc?: string, dragSort?: DragSort, drills?: list<Drill>, extra?: array<string, mixed>, layout?: Layout, linkTree?: LinkTree, param?: array<string, KV>, primaryKeyCol?: string, rowOperation?: list<RowOperation>, tree?: Tree, vis?: list<Vis>, visRawTable?: bool}
  * @phpstan-type EruptField array{edit?: Edit, params?: array<string, KV>, views?: list<View>}
+ * @phpstan-type Expr array{value?: string}
  * @phpstan-type GanttView array{colorField?: string, dependencyField?: string, endDateField?: string, groupField?: string, milestoneField?: string, pidField?: string, progressField?: string, startDateField?: string}
  * @phpstan-type GroupType array{collapsed?: bool, fields?: list<string>}
- * @phpstan-type HtmlEditorType array{value?: value-of<\Erupt\Types\HtmlEditorTypeType>}
- * @phpstan-type InputType array{fullSpan?: bool, length?: int, prefix?: list<VL>, suffix?: list<VL>, type?: string}
+ * @phpstan-type HtmlEditorType array{path?: string, value?: value-of<\Erupt\Types\HtmlEditorTypeType>}
+ * @phpstan-type InputType array{fullSpan?: bool, length?: int, prefix?: list<VL>, regex?: string, suffix?: list<VL>, type?: string}
  * @phpstan-type KV array{desc?: string, key?: string, value?: string}
  * @phpstan-type KeyValueType array{keyPlaceholder?: string, keys?: list<string>, max?: int, valuePlaceholder?: string}
  * @phpstan-type Layout array{collapseActionButton?: bool, formSize?: value-of<\Erupt\Types\LayoutFormSize>, formSteps?: bool, pageSize?: int, pageSizes?: list<int>, pagingType?: value-of<\Erupt\Types\LayoutPagingType>, refreshTime?: int, tableLeftFixed?: int, tableOperatorWidth?: string, tableRightFixed?: int, tableTruncate?: bool, tableWidth?: string}
  * @phpstan-type Link array{linkCondition?: string, linkErupt?: string}
  * @phpstan-type LinkTree array{dependNode?: bool, field?: string}
  * @phpstan-type MapView array{cluster?: bool, colorField?: string, latField?: string, lngField?: string, locationField?: string}
- * @phpstan-type MultiChoiceType array{dependField?: string, type?: value-of<\Erupt\Types\MultiChoiceTypeType>}
+ * @phpstan-type MultiChoiceType array{dependField?: string, fetchHandler?: list<string>, type?: value-of<\Erupt\Types\MultiChoiceTypeType>, validate?: bool}
  * @phpstan-type NumberType array{max?: int, min?: int, precision?: int, prefix?: string, step?: float, suffix?: string, thousandsSeparator?: bool}
  * @phpstan-type RateType array{allowHalf?: bool, character?: string, count?: int}
  * @phpstan-type Readonly array{add?: bool, allowChange?: bool, edit?: bool}
  * @phpstan-type ReferenceTableType array{dependField?: string, id?: string, label?: string}
- * @phpstan-type ReferenceTreeType array{dependField?: string, expandLevel?: int, id?: string, label?: string, pid?: string}
+ * @phpstan-type ReferenceTreeType array{dependField?: string, expandLevel?: int, id?: string, label?: string, pid?: string, rootPid?: Expr}
  * @phpstan-type RowOperation array{callHint?: string, code?: string, eruptClass?: string, fold?: bool, icon?: string, ifExpr?: string, ifExprBehavior?: value-of<\Erupt\Types\RowOperationIfExprBehavior>, mode?: value-of<\Erupt\Types\RowOperationMode>, tip?: string, title?: string, tpl?: Tpl, type?: value-of<\Erupt\Types\RowOperationType>}
  * @phpstan-type Search array{lockOperator?: bool, notNull?: bool, operator?: value-of<\Erupt\Types\QueryExpression>, value?: bool}
  * @phpstan-type SliderType array{dots?: bool, markPoints?: list<float>, max?: int, min?: int, step?: float}
  * @phpstan-type TableView array{collapsed?: bool, groupField?: string}
- * @phpstan-type TagsType array{allowExtension?: bool, fetchHandler?: list<string>, joinSeparator?: string, maxTagCount?: int}
+ * @phpstan-type TagsType array{allowExtension?: bool, fetchHandler?: list<string>, joinSeparator?: string, maxTagCount?: int, tags?: list<string>}
  * @phpstan-type TextareaType array{length?: int, maxRows?: int, mentionFetchHandler?: list<string>, mentionPrefix?: list<string>, minRows?: int}
  * @phpstan-type TimelineView array{colorField?: string, dateField?: string, descending?: bool, mode?: value-of<\Erupt\Types\TimelineViewMode>}
  * @phpstan-type Tpl array{drawerPlacement?: value-of<\Erupt\Types\Placement>, embedType?: value-of<\Erupt\Types\PageEmbedType>, enable?: bool, height?: string, openWay?: value-of<\Erupt\Types\OpenWay>, path?: string, width?: string}
  * @phpstan-type Tree array{expandLevel?: int, id?: string, label?: string, maxLevel?: int, pid?: string}
  * @phpstan-type VL array{color?: string, desc?: string, disable?: bool, extra?: string, label?: string, value?: string}
- * @phpstan-type View array{className?: string, column?: string, desc?: string, group?: string, show?: bool, sortable?: bool, statistic?: value-of<\Erupt\Types\ViewStatistic>, template?: string, title?: string, tpl?: Tpl, type?: value-of<\Erupt\Types\ViewType>, width?: string}
+ * @phpstan-type View array{className?: string, column?: string, desc?: string, export?: bool, group?: string, show?: bool, sortable?: bool, statistic?: value-of<\Erupt\Types\ViewStatistic>, template?: string, title?: string, tpl?: Tpl, type?: value-of<\Erupt\Types\ViewType>, width?: string}
  * @phpstan-type Vis array{boardView?: BoardView, calendarView?: CalendarView, cardView?: CardView, code?: string, cubeView?: CubeView, desc?: string, fieldVisibility?: value-of<\Erupt\Types\VisFieldVisibility>, fields?: list<string>, ganttView?: GanttView, mapView?: MapView, tableView?: TableView, timelineView?: TimelineView, title?: string, tplView?: Tpl, type?: value-of<\Erupt\Types\VisType>}
  */
 final class Annotations

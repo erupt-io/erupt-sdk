@@ -336,9 +336,20 @@ public sealed class AttachmentType
 {
     [JsonPropertyName("fileSeparator")] public string? FileSeparator { get; set; } // default "|"
     [JsonPropertyName("fileTypes")] public List<string>? FileTypes { get; set; } // default []
+    [JsonPropertyName("imageType")] public AttachmentTypeImageType? ImageType { get; set; }
     [JsonPropertyName("maxLimit")] public long? MaxLimit { get; set; } // default 1
+    [JsonPropertyName("path")] public string? Path { get; set; } // default ""
     [JsonPropertyName("size")] public long? Size { get; set; } // default -1
     [JsonPropertyName("type")] public AttachmentTypeType? Type { get; set; } // default "BASE"
+}
+
+/// <summary>JSON of @AttachmentTypeImageType.</summary>
+public sealed class AttachmentTypeImageType
+{
+    [JsonPropertyName("maxHeight")] public long? MaxHeight { get; set; } // default 2147483647
+    [JsonPropertyName("maxWidth")] public long? MaxWidth { get; set; } // default 2147483647
+    [JsonPropertyName("minHeight")] public long? MinHeight { get; set; } // default 0
+    [JsonPropertyName("minWidth")] public long? MinWidth { get; set; } // default 0
 }
 
 /// <summary>JSON of @AutoCompleteType.</summary>
@@ -403,6 +414,7 @@ public sealed class ChoiceType
     [JsonPropertyName("dependField")] public string? DependField { get; set; } // default ""
     [JsonPropertyName("fetchHandler")] public List<string>? FetchHandler { get; set; } // default []
     [JsonPropertyName("type")] public ChoiceTypeType? Type { get; set; } // default "SELECT"
+    [JsonPropertyName("validate")] public bool? Validate { get; set; } // default true
 }
 
 /// <summary>JSON of @CodeEditorType.</summary>
@@ -544,6 +556,12 @@ public sealed class EruptField
     [JsonPropertyName("views")] public List<View>? Views { get; set; } // default []
 }
 
+/// <summary>JSON of @Expr.</summary>
+public sealed class Expr
+{
+    [JsonPropertyName("value")] public string? Value { get; set; } // default ""
+}
+
 /// <summary>JSON of @GanttView.</summary>
 public sealed class GanttView
 {
@@ -567,6 +585,7 @@ public sealed class GroupType
 /// <summary>JSON of @HtmlEditorType.</summary>
 public sealed class HtmlEditorType
 {
+    [JsonPropertyName("path")] public string? Path { get; set; } // default ""
     [JsonPropertyName("value")] public HtmlEditorTypeType? Value { get; set; }
 }
 
@@ -576,6 +595,7 @@ public sealed class InputType
     [JsonPropertyName("fullSpan")] public bool? FullSpan { get; set; } // default false
     [JsonPropertyName("length")] public long? Length { get; set; } // default 255
     [JsonPropertyName("prefix")] public List<VL>? Prefix { get; set; } // default []
+    [JsonPropertyName("regex")] public string? Regex { get; set; } // default ""
     [JsonPropertyName("suffix")] public List<VL>? Suffix { get; set; } // default []
     [JsonPropertyName("type")] public string? Type { get; set; } // default "text"
 }
@@ -642,7 +662,9 @@ public sealed class MapView
 public sealed class MultiChoiceType
 {
     [JsonPropertyName("dependField")] public string? DependField { get; set; } // default ""
+    [JsonPropertyName("fetchHandler")] public List<string>? FetchHandler { get; set; } // default []
     [JsonPropertyName("type")] public MultiChoiceTypeType? Type { get; set; } // default "CHECKBOX"
+    [JsonPropertyName("validate")] public bool? Validate { get; set; } // default true
 }
 
 /// <summary>JSON of @NumberType.</summary>
@@ -689,6 +711,7 @@ public sealed class ReferenceTreeType
     [JsonPropertyName("id")] public string? Id { get; set; } // default "id"
     [JsonPropertyName("label")] public string? Label { get; set; } // default "name"
     [JsonPropertyName("pid")] public string? Pid { get; set; } // default ""
+    [JsonPropertyName("rootPid")] public Expr? RootPid { get; set; }
 }
 
 /// <summary>JSON of @RowOperation.</summary>
@@ -741,6 +764,7 @@ public sealed class TagsType
     [JsonPropertyName("fetchHandler")] public List<string>? FetchHandler { get; set; } // default []
     [JsonPropertyName("joinSeparator")] public string? JoinSeparator { get; set; } // default "[]"
     [JsonPropertyName("maxTagCount")] public long? MaxTagCount { get; set; } // default 9999
+    [JsonPropertyName("tags")] public List<string>? Tags { get; set; } // default []
 }
 
 /// <summary>JSON of @TextareaType.</summary>
@@ -801,6 +825,7 @@ public sealed class View
     [JsonPropertyName("className")] public string? ClassName { get; set; } // default ""
     [JsonPropertyName("column")] public string? Column { get; set; } // default ""
     [JsonPropertyName("desc")] public string? Desc { get; set; } // default ""
+    [JsonPropertyName("export")] public bool? Export { get; set; } // default true
     [JsonPropertyName("group")] public string? Group { get; set; } // default ""
     [JsonPropertyName("show")] public bool? Show { get; set; } // default true
     [JsonPropertyName("sortable")] public bool? Sortable { get; set; } // default false

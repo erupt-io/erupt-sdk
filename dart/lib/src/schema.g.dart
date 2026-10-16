@@ -25,9 +25,16 @@ const schemaJson = r'''{
           },
           "default": []
         },
+        "imageType": {
+          "$ref": "#/$defs/AttachmentTypeImageType"
+        },
         "maxLimit": {
           "type": "integer",
           "default": 1
+        },
+        "path": {
+          "type": "string",
+          "default": ""
         },
         "size": {
           "type": "integer",
@@ -41,9 +48,39 @@ const schemaJson = r'''{
       "required": [
         "fileSeparator",
         "fileTypes",
+        "imageType",
         "maxLimit",
+        "path",
         "size",
         "type"
+      ],
+      "additionalProperties": false
+    },
+    "AttachmentTypeImageType": {
+      "type": "object",
+      "properties": {
+        "maxHeight": {
+          "type": "integer",
+          "default": 2147483647
+        },
+        "maxWidth": {
+          "type": "integer",
+          "default": 2147483647
+        },
+        "minHeight": {
+          "type": "integer",
+          "default": 0
+        },
+        "minWidth": {
+          "type": "integer",
+          "default": 0
+        }
+      },
+      "required": [
+        "maxHeight",
+        "maxWidth",
+        "minHeight",
+        "minWidth"
       ],
       "additionalProperties": false
     },
@@ -263,12 +300,17 @@ const schemaJson = r'''{
         "type": {
           "$ref": "#/$defs/ChoiceTypeType",
           "default": "SELECT"
+        },
+        "validate": {
+          "type": "boolean",
+          "default": true
         }
       },
       "required": [
         "dependField",
         "fetchHandler",
-        "type"
+        "type",
+        "validate"
       ],
       "additionalProperties": false
     },
@@ -896,6 +938,19 @@ const schemaJson = r'''{
       ],
       "additionalProperties": false
     },
+    "Expr": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "additionalProperties": false
+    },
     "GanttView": {
       "type": "object",
       "properties": {
@@ -965,11 +1020,16 @@ const schemaJson = r'''{
     "HtmlEditorType": {
       "type": "object",
       "properties": {
+        "path": {
+          "type": "string",
+          "default": ""
+        },
         "value": {
           "$ref": "#/$defs/HtmlEditorTypeType"
         }
       },
       "required": [
+        "path",
         "value"
       ],
       "additionalProperties": false
@@ -999,6 +1059,10 @@ const schemaJson = r'''{
           },
           "default": []
         },
+        "regex": {
+          "type": "string",
+          "default": ""
+        },
         "suffix": {
           "type": "array",
           "items": {
@@ -1015,6 +1079,7 @@ const schemaJson = r'''{
         "fullSpan",
         "length",
         "prefix",
+        "regex",
         "suffix",
         "type"
       ],
@@ -1240,14 +1305,27 @@ const schemaJson = r'''{
           "type": "string",
           "default": ""
         },
+        "fetchHandler": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
         "type": {
           "$ref": "#/$defs/MultiChoiceTypeType",
           "default": "CHECKBOX"
+        },
+        "validate": {
+          "type": "boolean",
+          "default": true
         }
       },
       "required": [
         "dependField",
-        "type"
+        "fetchHandler",
+        "type",
+        "validate"
       ],
       "additionalProperties": false
     },
@@ -1436,6 +1514,9 @@ const schemaJson = r'''{
         "pid": {
           "type": "string",
           "default": ""
+        },
+        "rootPid": {
+          "$ref": "#/$defs/Expr"
         }
       },
       "required": [
@@ -1443,7 +1524,8 @@ const schemaJson = r'''{
         "expandLevel",
         "id",
         "label",
-        "pid"
+        "pid",
+        "rootPid"
       ],
       "additionalProperties": false
     },
@@ -1638,13 +1720,21 @@ const schemaJson = r'''{
         "maxTagCount": {
           "type": "integer",
           "default": 9999
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
         "allowExtension",
         "fetchHandler",
         "joinSeparator",
-        "maxTagCount"
+        "maxTagCount",
+        "tags"
       ],
       "additionalProperties": false
     },
@@ -1848,6 +1938,10 @@ const schemaJson = r'''{
           "type": "string",
           "default": ""
         },
+        "export": {
+          "type": "boolean",
+          "default": true
+        },
         "group": {
           "type": "string",
           "default": ""
@@ -1887,6 +1981,7 @@ const schemaJson = r'''{
         "className",
         "column",
         "desc",
+        "export",
         "group",
         "show",
         "sortable",
@@ -2119,6 +2214,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2148,7 +2244,8 @@ const defaultsJson = r'''{
           "choiceType": {
             "dependField": "",
             "fetchHandler": [],
-            "type": "SELECT"
+            "type": "SELECT",
+            "validate": true
           },
           "desc": "",
           "notNull": false,
@@ -2174,6 +2271,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2230,6 +2328,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2286,6 +2385,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2318,6 +2418,7 @@ const defaultsJson = r'''{
             "fullSpan": false,
             "length": 255,
             "prefix": [],
+            "regex": "",
             "suffix": [],
             "type": "text"
           },
@@ -2344,6 +2445,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2403,6 +2505,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2458,6 +2561,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "name",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2498,7 +2602,10 @@ const defaultsJson = r'''{
             "expandLevel": 999,
             "id": "id",
             "label": "name",
-            "pid": ""
+            "pid": "",
+            "rootPid": {
+              "value": ""
+            }
           },
           "search": {
             "lockOperator": false,
@@ -2515,6 +2622,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "name",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,
@@ -2573,6 +2681,7 @@ const defaultsJson = r'''{
             "className": "",
             "column": "",
             "desc": "",
+            "export": true,
             "group": "",
             "show": true,
             "sortable": false,

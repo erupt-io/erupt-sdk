@@ -9,8 +9,11 @@ public struct AttachmentType: AnnotationValue, Sendable {
     public var fileSeparator: String?
     /// default []
     public var fileTypes: [String]?
+    public var imageType: AttachmentTypeImageType?
     /// default 1
     public var maxLimit: Int?
+    /// default ""
+    public var path: String?
     /// default -1
     public var size: Int?
     /// default "BASE"
@@ -19,13 +22,17 @@ public struct AttachmentType: AnnotationValue, Sendable {
     public init(
         fileSeparator: String? = nil,
         fileTypes: [String]? = nil,
+        imageType: AttachmentTypeImageType? = nil,
         maxLimit: Int? = nil,
+        path: String? = nil,
         size: Int? = nil,
         type: AttachmentTypeType? = nil
     ) {
         self.fileSeparator = fileSeparator
         self.fileTypes = fileTypes
+        self.imageType = imageType
         self.maxLimit = maxLimit
+        self.path = path
         self.size = size
         self.type = type
     }
@@ -34,9 +41,45 @@ public struct AttachmentType: AnnotationValue, Sendable {
         var o: [String: JSON] = [:]
         o["fileSeparator"] = fileSeparator?.json
         o["fileTypes"] = fileTypes?.json
+        o["imageType"] = imageType?.json
         o["maxLimit"] = maxLimit?.json
+        o["path"] = path?.json
         o["size"] = size?.json
         o["type"] = type?.json
+        return .object(o)
+    }
+}
+
+/// `AttachmentTypeImageType` annotation attributes: every one is optional, a declaration only overrides the defaults
+/// the Java proxies emit.
+public struct AttachmentTypeImageType: AnnotationValue, Sendable {
+    /// default 2147483647
+    public var maxHeight: Int?
+    /// default 2147483647
+    public var maxWidth: Int?
+    /// default 0
+    public var minHeight: Int?
+    /// default 0
+    public var minWidth: Int?
+
+    public init(
+        maxHeight: Int? = nil,
+        maxWidth: Int? = nil,
+        minHeight: Int? = nil,
+        minWidth: Int? = nil
+    ) {
+        self.maxHeight = maxHeight
+        self.maxWidth = maxWidth
+        self.minHeight = minHeight
+        self.minWidth = minWidth
+    }
+
+    public var json: JSON {
+        var o: [String: JSON] = [:]
+        o["maxHeight"] = maxHeight?.json
+        o["maxWidth"] = maxWidth?.json
+        o["minHeight"] = minHeight?.json
+        o["minWidth"] = minWidth?.json
         return .object(o)
     }
 }
@@ -286,15 +329,19 @@ public struct ChoiceType: AnnotationValue, Sendable {
     public var fetchHandler: [String]?
     /// default "SELECT"
     public var type: ChoiceTypeType?
+    /// default true
+    public var validate: Bool?
 
     public init(
         dependField: String? = nil,
         fetchHandler: [String]? = nil,
-        type: ChoiceTypeType? = nil
+        type: ChoiceTypeType? = nil,
+        validate: Bool? = nil
     ) {
         self.dependField = dependField
         self.fetchHandler = fetchHandler
         self.type = type
+        self.validate = validate
     }
 
     public var json: JSON {
@@ -302,6 +349,7 @@ public struct ChoiceType: AnnotationValue, Sendable {
         o["dependField"] = dependField?.json
         o["fetchHandler"] = fetchHandler?.json
         o["type"] = type?.json
+        o["validate"] = validate?.json
         return .object(o)
     }
 }
@@ -973,6 +1021,25 @@ public struct EruptField: AnnotationValue, Sendable {
     }
 }
 
+/// `Expr` annotation attributes: every one is optional, a declaration only overrides the defaults
+/// the Java proxies emit.
+public struct Expr: AnnotationValue, Sendable {
+    /// default ""
+    public var value: String?
+
+    public init(
+        value: String? = nil
+    ) {
+        self.value = value
+    }
+
+    public var json: JSON {
+        var o: [String: JSON] = [:]
+        o["value"] = value?.json
+        return .object(o)
+    }
+}
+
 /// `GanttView` annotation attributes: every one is optional, a declaration only overrides the defaults
 /// the Java proxies emit.
 public struct GanttView: AnnotationValue, Sendable {
@@ -1051,16 +1118,21 @@ public struct GroupType: AnnotationValue, Sendable {
 /// `HtmlEditorType` annotation attributes: every one is optional, a declaration only overrides the defaults
 /// the Java proxies emit.
 public struct HtmlEditorType: AnnotationValue, Sendable {
+    /// default ""
+    public var path: String?
     public var value: HtmlEditorTypeType?
 
     public init(
+        path: String? = nil,
         value: HtmlEditorTypeType? = nil
     ) {
+        self.path = path
         self.value = value
     }
 
     public var json: JSON {
         var o: [String: JSON] = [:]
+        o["path"] = path?.json
         o["value"] = value?.json
         return .object(o)
     }
@@ -1081,6 +1153,8 @@ public struct InputType: AnnotationValue, Sendable {
     public var length: Int?
     /// default []
     public var prefix: [VL]?
+    /// default ""
+    public var regex: String?
     /// default []
     public var suffix: [VL]?
     /// default "text"
@@ -1090,12 +1164,14 @@ public struct InputType: AnnotationValue, Sendable {
         fullSpan: Bool? = nil,
         length: Int? = nil,
         prefix: [VL]? = nil,
+        regex: String? = nil,
         suffix: [VL]? = nil,
         type: String? = nil
     ) {
         self.fullSpan = fullSpan
         self.length = length
         self.prefix = prefix
+        self.regex = regex
         self.suffix = suffix
         self.type = type
     }
@@ -1105,6 +1181,7 @@ public struct InputType: AnnotationValue, Sendable {
         o["fullSpan"] = fullSpan?.json
         o["length"] = length?.json
         o["prefix"] = prefix?.json
+        o["regex"] = regex?.json
         o["suffix"] = suffix?.json
         o["type"] = type?.json
         return .object(o)
@@ -1349,21 +1426,31 @@ public struct MapView: AnnotationValue, Sendable {
 public struct MultiChoiceType: AnnotationValue, Sendable {
     /// default ""
     public var dependField: String?
+    /// default []
+    public var fetchHandler: [String]?
     /// default "CHECKBOX"
     public var type: MultiChoiceTypeType?
+    /// default true
+    public var validate: Bool?
 
     public init(
         dependField: String? = nil,
-        type: MultiChoiceTypeType? = nil
+        fetchHandler: [String]? = nil,
+        type: MultiChoiceTypeType? = nil,
+        validate: Bool? = nil
     ) {
         self.dependField = dependField
+        self.fetchHandler = fetchHandler
         self.type = type
+        self.validate = validate
     }
 
     public var json: JSON {
         var o: [String: JSON] = [:]
         o["dependField"] = dependField?.json
+        o["fetchHandler"] = fetchHandler?.json
         o["type"] = type?.json
+        o["validate"] = validate?.json
         return .object(o)
     }
 }
@@ -1563,19 +1650,22 @@ public struct ReferenceTreeType: AnnotationValue, Sendable {
     public var label: String?
     /// default ""
     public var pid: String?
+    public var rootPid: Expr?
 
     public init(
         dependField: String? = nil,
         expandLevel: Int? = nil,
         id: String? = nil,
         label: String? = nil,
-        pid: String? = nil
+        pid: String? = nil,
+        rootPid: Expr? = nil
     ) {
         self.dependField = dependField
         self.expandLevel = expandLevel
         self.id = id
         self.label = label
         self.pid = pid
+        self.rootPid = rootPid
     }
 
     public var json: JSON {
@@ -1585,6 +1675,7 @@ public struct ReferenceTreeType: AnnotationValue, Sendable {
         o["id"] = id?.json
         o["label"] = label?.json
         o["pid"] = pid?.json
+        o["rootPid"] = rootPid?.json
         return .object(o)
     }
 }
@@ -1788,17 +1879,21 @@ public struct TagsType: AnnotationValue, Sendable {
     public var joinSeparator: String?
     /// default 9999
     public var maxTagCount: Int?
+    /// default []
+    public var tags: [String]?
 
     public init(
         allowExtension: Bool? = nil,
         fetchHandler: [String]? = nil,
         joinSeparator: String? = nil,
-        maxTagCount: Int? = nil
+        maxTagCount: Int? = nil,
+        tags: [String]? = nil
     ) {
         self.allowExtension = allowExtension
         self.fetchHandler = fetchHandler
         self.joinSeparator = joinSeparator
         self.maxTagCount = maxTagCount
+        self.tags = tags
     }
 
     public var json: JSON {
@@ -1807,6 +1902,7 @@ public struct TagsType: AnnotationValue, Sendable {
         o["fetchHandler"] = fetchHandler?.json
         o["joinSeparator"] = joinSeparator?.json
         o["maxTagCount"] = maxTagCount?.json
+        o["tags"] = tags?.json
         return .object(o)
     }
 }
@@ -2028,6 +2124,8 @@ public struct View: AnnotationValue, Sendable {
     public var column: String?
     /// default ""
     public var desc: String?
+    /// default true
+    public var export: Bool?
     /// default ""
     public var group: String?
     /// default true
@@ -2049,6 +2147,7 @@ public struct View: AnnotationValue, Sendable {
         className: String? = nil,
         column: String? = nil,
         desc: String? = nil,
+        export: Bool? = nil,
         group: String? = nil,
         show: Bool? = nil,
         sortable: Bool? = nil,
@@ -2062,6 +2161,7 @@ public struct View: AnnotationValue, Sendable {
         self.className = className
         self.column = column
         self.desc = desc
+        self.export = export
         self.group = group
         self.show = show
         self.sortable = sortable
@@ -2078,6 +2178,7 @@ public struct View: AnnotationValue, Sendable {
         o["className"] = className?.json
         o["column"] = column?.json
         o["desc"] = desc?.json
+        o["export"] = export?.json
         o["group"] = group?.json
         o["show"] = show?.json
         o["sortable"] = sortable?.json

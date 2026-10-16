@@ -88,12 +88,26 @@ export interface AttachmentType {
   fileSeparator?: string;
   /** default [] */
   fileTypes?: string[];
+  imageType?: AttachmentTypeImageType;
   /** default 1 */
   maxLimit?: number;
+  /** default "" */
+  path?: string;
   /** default -1 */
   size?: number;
   /** default "BASE" */
   type?: AttachmentTypeType;
+}
+
+export interface AttachmentTypeImageType {
+  /** default 2147483647 */
+  maxHeight?: number;
+  /** default 2147483647 */
+  maxWidth?: number;
+  /** default 0 */
+  minHeight?: number;
+  /** default 0 */
+  minWidth?: number;
 }
 
 export interface AutoCompleteType {
@@ -164,6 +178,8 @@ export interface ChoiceType {
   fetchHandler?: string[];
   /** default "SELECT" */
   type?: ChoiceTypeType;
+  /** default true */
+  validate?: boolean;
 }
 
 export interface CodeEditorType {
@@ -352,6 +368,11 @@ export interface EruptField {
   views?: View[];
 }
 
+export interface Expr {
+  /** default "" */
+  value?: string;
+}
+
 export interface GanttView {
   /** default "" */
   colorField?: string;
@@ -376,6 +397,8 @@ export interface GroupType {
 }
 
 export interface HtmlEditorType {
+  /** default "" */
+  path?: string;
   value?: HtmlEditorTypeType;
 }
 
@@ -386,6 +409,8 @@ export interface InputType {
   length?: number;
   /** default [] */
   prefix?: VL[];
+  /** default "" */
+  regex?: string;
   /** default [] */
   suffix?: VL[];
   /** default "text" */
@@ -465,8 +490,12 @@ export interface MapView {
 export interface MultiChoiceType {
   /** default "" */
   dependField?: string;
+  /** default [] */
+  fetchHandler?: string[];
   /** default "CHECKBOX" */
   type?: MultiChoiceTypeType;
+  /** default true */
+  validate?: boolean;
 }
 
 export interface NumberType {
@@ -524,6 +553,7 @@ export interface ReferenceTreeType {
   label?: string;
   /** default "" */
   pid?: string;
+  rootPid?: Expr;
 }
 
 export interface RowOperation {
@@ -590,6 +620,8 @@ export interface TagsType {
   joinSeparator?: string;
   /** default 9999 */
   maxTagCount?: number;
+  /** default [] */
+  tags?: string[];
 }
 
 export interface TextareaType {
@@ -664,6 +696,8 @@ export interface View {
   column?: string;
   /** default "" */
   desc?: string;
+  /** default true */
+  export?: boolean;
   /** default "" */
   group?: string;
   /** default true */

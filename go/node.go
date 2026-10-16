@@ -79,7 +79,7 @@ type cachedPower struct {
 }
 
 // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there.
-var unsupportedPower = map[string]bool{"cellEdit": false, "print": false, "ai": false}
+var unsupportedPower = map[string]bool{"print": false, "ai": false}
 
 // Rights the server decides per user; the node ANDs them onto the declared power.
 var serverPower = []string{"add", "edit", "delete", "viewDetails", "export", "importable"}

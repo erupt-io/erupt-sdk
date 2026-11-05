@@ -87,7 +87,9 @@ Known causes seen before:
   policy owner's nuget.org name.
 - php / swift push denied **to `github-actions[bot]`**: the checkout's persisted `GITHUB_TOKEN` was used
   instead of the split token — the checkout step needs `persist-credentials: false`. Denied to a user: the
-  split token expired or lost Contents write on the mirror.
+  split token expired, lacks Contents write, or awaits the org's fine-grained token approval. To check a new
+  token before saving it, ask for `info/refs?service=git-receive-pack` on the mirror with it (200 = can push);
+  the REST `permissions.push` field reflects the user, not the token.
 
 ## Rules
 

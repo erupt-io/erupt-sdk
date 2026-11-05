@@ -4,6 +4,10 @@ Each language is versioned and released on its own. A tag `<lang>/v<version>` ru
 (generation check, unit tests, conformance), checks that the tag equals the version in the package
 metadata and in the version the node reports to the server, publishes, and creates a GitHub release.
 
+`scripts/release.sh <version> [lang...]` does all of it (bump every version file, commit, push one tag per
+language, one by one); `--dry-run` shows the diff, `status` compares the repository with each registry,
+`bootstrap` makes the first npm / crates.io publish by hand. By hand it is:
+
 ```bash
 # 1. bump the version in the files below, merge to main
 # 2. tag main and push the tag

@@ -13,8 +13,10 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # pinned: ubuntu-latest (26.04) has no Python 3.9 build, and 3.9 is the floor pyproject.toml promises
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     defaults:

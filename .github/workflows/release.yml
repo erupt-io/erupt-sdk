@@ -244,8 +244,20 @@ jobs:
           ruby-version: "3.4"
       - name: Tag matches the package version
         run: grep -qx "  VERSION = \"$VERSION\"" lib/erupt/version.rb || { echo "VERSION in lib/erupt/version.rb is not $VERSION"; exit 1; }
-      # trusted publishing: exchanges the workflow's OIDC token for a short-lived RubyGems API key
-      - uses: rubygems/configure-rubygems-credentials@v1.0.0
+      # trusted publishing: exchanges the workflow's OIDC token for a short-lived RubyGems API key. The exchange
+      # names the owning account (its immutable rubygems.org ID), which a pending publisher's first push requires;
+      # configure-rubygems-credentials has no input for it yet, so the exchange is made here
+      - name: RubyGems credentials
+        env:
+          OWNER: ${{ vars.RUBYGEMS_OWNER || '255640' }}
+        run: |
+          jwt=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=rubygems.org" | jq -r .value)
+          key=$(jq -n --arg jwt "$jwt" --arg owner "$OWNER" '{jwt: $jwt, owner: $owner}' \
+            | curl -fsS -H 'Content-Type: application/json' --data @- \
+              https://rubygems.org/api/v1/oidc/trusted_publisher/exchange_token | jq -r .rubygems_api_key)
+          echo "::add-mask::$key"
+          echo "GEM_HOST_API_KEY=$key" >> "$GITHUB_ENV"
       - run: gem build erupt-sdk.gemspec
       - run: gem push "erupt-sdk-$VERSION.gem"
 

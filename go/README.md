@@ -29,6 +29,13 @@ err = node.ListenAndServe(":9090")
 2. Add a menu of type `table` with value `blog.Article`.
 3. Run the node. The server must reach it on `http://<node ip>:9090`; set `Config.Address` otherwise.
 
+The node speaks node protocol v2 (erupt-cloud `PROTOCOL.md` §12), a thin node: the erupt server signs every call
+with the access token (`Erupt-Signature`; the token itself never travels), enforces the user's rights and the
+ones the model switches off, checks and normalizes queries and records, and turns drills and link trees into plain
+conditions. The node refuses an unsigned call, and one whose `Erupt-Enforced` lacks what the endpoint needs. It needs
+an erupt server that speaks v2: an older one does not answer the registration as such, and the node logs an error
+and stops registering.
+
 ## Declaring a model
 
 The struct only describes the model; records travel as `erupt.Record` (`map[string]any`) keyed by field
@@ -47,9 +54,10 @@ name, which is the `json` tag name (else the Go field name). Only fields with an
 Options: `WithName`, `WithPower(map[string]bool{"delete": false})`, `WithOrderBy("views desc, id")`,
 `WithRaw(...)` (raw `@Erupt` attributes), `WithFieldEdit` / `WithFieldView` (raw `@Edit` / `@View`), and
 `WithOperations(...)`. Raw attributes are an `erupt.M` or a generated type
-(`erupt.Edit{InputType: &erupt.InputType{Length: erupt.Ptr[int64](64)}}`); they are checked against the
-erupt annotation schema in `NewModel`, so a misspelt key or enum value is an error there, not a silent
-no-op in the browser.
+(`erupt.Edit{InputType: &erupt.InputType{Length: erupt.Ptr[int64](64)}}`). The build carries only what a model
+declares: the erupt server completes it from Java's defaults and checks every attribute, and answers an error
+naming the model and the attribute for one it does not know. `NewModel` checks what the node relies on itself: the
+edit type, an operation's mode, the power keys, `WithOrderBy` fields, `linkTree.field` and the drills.
 
 ## Row operations
 
@@ -134,15 +142,17 @@ Dragging on a board, calendar or gantt view is saved by the erupt server through
 
 `WithRaw(erupt.M{"tree": erupt.M{"id": "id", "label": "name", "pid": "parent"}})` shows the model as a tree, and
 `WithRaw(erupt.M{"linkTree": erupt.M{"field": "category"}})` puts the tree of a reference field beside the table:
-the erupt server builds both trees from the node's table, and the node keeps the rows under the picked tree node
-(`"dependNode": true` shows none until one is picked). `linkTree.field` must be a reference field.
+the erupt server builds both trees from the node's table and sends the picked tree node as a plain condition on
+the field (`"dependNode": true` shows no rows until one is picked). `linkTree.field` must be a reference field.
 
 ## Field types and field code
 
 Besides the inferred types, `type=` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT` (the erupt server stores the
 upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR` (all text), `BUTTON` (form only),
 and `CHECKBOX` / `TAB_TREE` with `ref=`: the picked records, stored as the JSON list of their keys. A slice
-field with `choices` is a `MULTI_CHOICE`.
+field with `choices` is a `MULTI_CHOICE`. A `MULTI_CHOICE` (or `KEY_VALUE`) may be `search`ed: EQ / IN match each
+picked value as `"<value>"` in its JSON text (every one of them), NEQ / NOT_IN exclude it. A JSON field is never
+`sortable`, and a `CHECKBOX` / `TAB_TREE` / `TRANSFER` is not searched.
 
 A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
 values:
@@ -174,7 +184,9 @@ erupt.NewModel(Order{}, "Order",
 
 `Fetch` belongs to `CHOICE` / `MULTI_CHOICE`, `Tags` to `TAGS`, `Complete` to `AUTO_COMPLETE`, `Click` to
 `BUTTON`; `Onchange` to any field. A field with `Fetch` and no `type` is a `CHOICE` (a `MULTI_CHOICE` for a
-slice). Return `erupt.Fail(...)` to refuse with a message.
+slice). Return `erupt.Fail(...)` to refuse with a message. The form's values are decoded JSON with numbers kept
+exact, so a number arrives as a `json.Number`: `n, _ := form["qty"].(json.Number).Float64()` (two-value assertion
+when the field may be empty).
 
 Also: `COLOR`, `ICON`, `SIGNATURE`, `MAP`, `HIDDEN` (text), `RATE`, `SLIDER` (numbers) and `TRANSFER` (like
 `CHECKBOX`). A reference table depending on another field takes
@@ -189,8 +201,9 @@ erupt.NewModel(Author{}, "Author", erupt.WithRaw(erupt.M{"drills": []erupt.M{
 }}))
 ```
 
-opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
-`link.linkCondition` adds SQL as written. Both models must be on the node.
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default): the
+erupt server reads the author and sends that join as a plain condition. `link.linkCondition` is SQL the node adds
+as written. Both models must be on the node.
 
 ## Server config and user info
 
@@ -222,8 +235,8 @@ the erupt server.
 Go modules come straight from GitHub, so no registry is involved: a `go/vX.Y.Z` tag is the release, and
 `GOPROXY=direct` skips the module proxy too.
 
-To vendor it instead, copy `go/` without the tests (`go.mod`, the `.go` files and the two `.json` files, which
-are embedded) into your repository and redirect the import path:
+To vendor it instead, copy `go/` without the tests (`go.mod` and the `.go` files) into your repository and
+redirect the import path:
 
 ```bash
 go mod edit -replace github.com/erupt-io/erupt-sdk/go=./third_party/erupt
@@ -234,13 +247,15 @@ A copy does not update itself: when erupt changes the protocol or the annotation
 ## Generated code
 
 `types.go` (a struct per annotation, a string type with constants and `…Values` per enum) is generated from
-the erupt schema, which is also embedded for validation:
+the erupt schema (`../schema`); nothing of it is embedded at run time:
 
 ```bash
-go run ./cmd/gentypes ../schema          # sync schemas, regenerate types.go
+go run ./cmd/gentypes ../schema          # regenerate types.go
 go run ./cmd/gentypes -check ../schema   # CI: fail when stale
 ```
 
 Tests: `go test ./...` (the SQLite driver `modernc.org/sqlite` is a test-only dependency). Conformance,
 from the repository root: `(cd go && go build -o /tmp/erupt-go-conformance ./examples/conformance) &&
-python3 conformance/run.py -- /tmp/erupt-go-conformance`.
+python3 conformance/run.py -- /tmp/erupt-go-conformance`. `examples/showcase` is the showcase of `SHOWCASE.md`
+(every capability of the SDK, stored in SQLite): `(cd go && go build -o /tmp/erupt-go-showcase ./examples/showcase) &&
+python3 conformance/showcase.py -- /tmp/erupt-go-showcase`.

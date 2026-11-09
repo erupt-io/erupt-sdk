@@ -2,6 +2,7 @@ package erupt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strings"
@@ -203,6 +204,17 @@ func matchAll(row Record, conds []Cond) bool {
 	return true
 }
 
+// likeText is the text LIKE searches: a JSON value (MULTI_CHOICE, KEY_VALUE) as its JSON text, as SQL stores it.
+func likeText(value any) string {
+	switch value.(type) {
+	case []any, map[string]any, []string, map[string]string:
+		if text, err := json.Marshal(value); err == nil {
+			return string(text)
+		}
+	}
+	return str(value)
+}
+
 func match(value any, c Cond) bool {
 	switch c.Op {
 	case "NULL":
@@ -219,7 +231,7 @@ func match(value any, c Cond) bool {
 	case "NEQ":
 		return !equal(value, c.Value)
 	case "LIKE", "NOT_LIKE":
-		found := strings.Contains(strings.ToLower(str(value)), strings.ToLower(str(c.Value)))
+		found := strings.Contains(strings.ToLower(likeText(value)), strings.ToLower(str(c.Value)))
 		return found == (c.Op == "LIKE")
 	case "IN", "NOT_IN":
 		found := false

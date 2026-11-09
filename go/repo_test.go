@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -136,12 +135,8 @@ func TestSQLGeneration(t *testing.T) {
 
 // TestNodeOverSQLite drives the HTTP handler against a fake erupt server, with SQLite storage.
 func TestNodeOverSQLite(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
-	}))
-	defer server.Close()
 	category, article := testModels(t)
-	node, err := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{server.URL}})
+	node, err := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{"http://127.0.0.1:1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,11 +150,10 @@ func TestNodeOverSQLite(t *testing.T) {
 	user := base64.StdEncoding.EncodeToString([]byte(`{"uid":1,"account":"admin"}`))
 	call := func(method, path, erupt, body string) (int, any) {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
-		req.Header.Set("Access-Token", "secret")
 		req.Header.Set("erupt", erupt)
 		req.Header.Set("user", user)
 		w := httptest.NewRecorder()
-		node.ServeHTTP(w, req)
+		node.ServeHTTP(w, signed(node, req, body))
 		data, _ := io.ReadAll(w.Body)
 		var v any
 		_ = json.Unmarshal(data, &v)
@@ -170,7 +164,7 @@ func TestNodeOverSQLite(t *testing.T) {
 			t.Fatalf("add category: %d %v", code, r)
 		}
 	}
-	body := `{"title":"100% pure","status":"draft","views":"7","featured":true,"publish_date":"2026-03-01","review_at":"2026-03-01 08:15:00","category":{"id":"2","name":"Python"}}`
+	body := `{"title":"100% pure","status":"draft","views":7,"featured":true,"publish_date":"2026-03-01","review_at":"2026-03-01 08:15:00","category":2}`
 	if code, r := call("POST", "/erupt-api/data/modify/Article", "Article", body); code != 200 || r.(map[string]any)["success"] != true {
 		t.Fatalf("add article: %d %v", code, r)
 	}
@@ -267,16 +261,12 @@ func (p *memoProxy) BeforeDelete(_ context.Context, r Record) error { return p.c
 func (p *memoProxy) AfterDelete(_ context.Context, r Record) error  { return p.call("AfterDelete", r) }
 
 func TestDataProxy(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
-	}))
-	defer server.Close()
 	proxy := &memoProxy{}
 	m, err := NewModel(memo{}, "Memo", WithName("Memo"), WithDataProxy(proxy))
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, err := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{server.URL}})
+	node, err := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{"http://127.0.0.1:1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,10 +275,9 @@ func TestDataProxy(t *testing.T) {
 	}
 	call := func(method, path, body string) map[string]any {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
-		req.Header.Set("Access-Token", "secret")
 		req.Header.Set("erupt", "Memo")
 		w := httptest.NewRecorder()
-		node.ServeHTTP(w, req)
+		node.ServeHTTP(w, signed(node, req, body))
 		var v map[string]any
 		_ = json.Unmarshal(w.Body.Bytes(), &v)
 		return v
@@ -346,11 +335,7 @@ func (openProxy) BeforeFetch(context.Context, []Cond) (Filter, error) {
 }
 
 func TestBeforeFetch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
-	}))
-	defer server.Close()
-	node, err := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{server.URL}})
+	node, err := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{"http://127.0.0.1:1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,11 +355,10 @@ func TestBeforeFetch(t *testing.T) {
 	register("MemoryTask", NewMemoryRepository())
 	call := func(path, erupt, account, body string) (int, map[string]any) {
 		req := httptest.NewRequest("POST", path, strings.NewReader(body))
-		req.Header.Set("Access-Token", "secret")
 		req.Header.Set("erupt", erupt)
 		req.Header.Set("user", base64.StdEncoding.EncodeToString([]byte(`{"uid":1,"account":"`+account+`"}`)))
 		w := httptest.NewRecorder()
-		node.ServeHTTP(w, req)
+		node.ServeHTTP(w, signed(node, req, body))
 		var v map[string]any
 		_ = json.Unmarshal(w.Body.Bytes(), &v)
 		return w.Code, v
@@ -406,10 +390,9 @@ func TestBeforeFetch(t *testing.T) {
 		t.Errorf("vis Reversed %v", page)
 	}
 	req := httptest.NewRequest("GET", "/erupt-api/build/Task", nil)
-	req.Header.Set("Access-Token", "secret")
 	req.Header.Set("erupt", "Task")
 	w := httptest.NewRecorder()
-	node.ServeHTTP(w, req)
+	node.ServeHTTP(w, signed(node, req, ""))
 	var build struct {
 		EruptModel struct {
 			EruptJSON struct{ Vis []map[string]any }
@@ -443,44 +426,6 @@ type doc struct {
 	ID    int64  `json:"id" erupt:"pk"`
 	Title string `json:"title" erupt:"title=Title"`
 	Topic int64  `json:"topic" erupt:"title=Topic;ref=Category;tree=parent"`
-}
-
-func TestLinkTree(t *testing.T) {
-	if _, err := NewModel(doc{}, "Doc", WithRaw(M{"linkTree": M{"field": "title"}})); err == nil {
-		t.Error("a linkTree on a non-reference field was accepted")
-	}
-	category, _ := testModels(t)
-	m, err := NewModel(doc{}, "Doc", WithName("Doc"), WithRaw(M{"linkTree": LinkTree{Field: Ptr("topic"), DependNode: Ptr(true)}}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, _ := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{"http://127.0.0.1:1"}})
-	if err := node.Register(category, NewMemoryRepository()); err != nil {
-		t.Fatal(err)
-	}
-	if err := node.Register(m, NewMemoryRepository(Record{"title": "a", "topic": 1}, Record{"title": "b", "topic": 2}, Record{"title": "c", "topic": 3})); err != nil {
-		t.Fatal(err)
-	}
-	titles := func(body string) []string {
-		req := httptest.NewRequest("POST", "/erupt-api/data/table/Doc", strings.NewReader(body))
-		req.Header.Set("Access-Token", "secret")
-		req.Header.Set("erupt", "Doc")
-		w := httptest.NewRecorder()
-		node.ServeHTTP(w, req)
-		var page struct{ List []map[string]any }
-		_ = json.Unmarshal(w.Body.Bytes(), &page)
-		out := []string{}
-		for _, row := range page.List {
-			out = append(out, str(row["title"]))
-		}
-		return out
-	}
-	// dependNode: nothing until a tree node is picked
-	for body, want := range map[string][]string{`{}`: {}, `{"linkTreeVal":[2]}`: {"b"}, `{"linkTreeVal":["1","2"]}`: {"a", "b"}} {
-		if got := titles(body); !reflect.DeepEqual(got, want) {
-			t.Errorf("%s: %v, want %v", body, got, want)
-		}
-	}
 }
 
 // A virtual field is in the build only; a slice or map field round-trips as a JSON value.
@@ -528,17 +473,75 @@ func TestVirtualAndJSONFields(t *testing.T) {
 			if _, ok := got["note"]; ok {
 				t.Fatal("virtual field read back")
 			}
-			if _, err := toRecord(m, M{"name": "B", "roles": "ADMIN"}); err == nil {
-				t.Fatal("a string accepted for a JSON field")
-			}
 		})
 	}
-	type Bad struct {
-		ID   int64    `json:"id" erupt:"pk"`
-		Tags []string `json:"tags" erupt:"search"`
+	// a JSON field is never sorted, and a collection's numeric keys are never searched as text
+	for _, tag := range []string{"sortable", "type=CHECKBOX;ref=Category;search"} {
+		bad := reflect.StructOf([]reflect.StructField{
+			{Name: "ID", Type: reflect.TypeOf(int64(0)), Tag: `json:"id" erupt:"pk"`},
+			{Name: "Tags", Type: reflect.TypeOf([]int64{}), Tag: reflect.StructTag(`json:"tags" erupt:"` + tag + `"`)}})
+		if _, err := NewModel(reflect.New(bad).Elem().Interface(), "Bad"); err == nil {
+			t.Fatalf("a JSON field declared %s was accepted", tag)
+		}
 	}
-	if _, err := NewModel(Bad{}, "Bad"); err == nil {
-		t.Fatal("a searchable JSON field accepted")
+}
+
+// A MULTI_CHOICE is searched by its JSON text: EQ / IN match each value as "<value>", NEQ / NOT_IN exclude it.
+func TestJSONFieldSearch(t *testing.T) {
+	type Widget struct {
+		ID    int64    `json:"id" erupt:"pk"`
+		Name  string   `json:"name" erupt:"title=Name"`
+		Roles []string `json:"roles" erupt:"title=Roles;search;choices=ADMIN:Admin,USER:User,GUEST:Guest"`
+	}
+	ctx := context.Background()
+	for name, factory := range repositories(t) {
+		t.Run(name, func(t *testing.T) {
+			m, err := NewModel(Widget{}, "Widget")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.FieldType("roles") != "MULTI_CHOICE" {
+				t.Fatalf("roles is %s", m.FieldType("roles"))
+			}
+			repo := factory()
+			if err := repo.(Binder).Bind(m); err != nil {
+				t.Fatal(err)
+			}
+			for _, w := range []Record{{"name": "A", "roles": []any{"ADMIN", "USER"}}, {"name": "B", "roles": []any{"GUEST"}},
+				{"name": "C", "roles": []any{"USER"}}} {
+				if err := repo.Add(ctx, w); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, c := range []struct {
+				op    string
+				value any
+				want  []string
+			}{
+				{"IN", []any{"GUEST"}, []string{"B"}},
+				{"EQ", "USER", []string{"A", "C"}},
+				{"IN", []any{"ADMIN", "USER"}, []string{"A"}}, // every value searched for
+				{"NOT_IN", []any{"USER"}, []string{"B"}},
+				{"NEQ", "ADMIN", []string{"B", "C"}},
+				{"IN", []any{"US"}, nil}, // a whole value, not a part of one
+			} {
+				conds, err := condition(m, M{"key": "roles", "expression": c.op, "value": c.value})
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, records, err := repo.Page(ctx, Query{Conditions: conds, Limit: 10})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got []string
+				for _, r := range records {
+					got = append(got, r["name"].(string))
+				}
+				if !reflect.DeepEqual(got, c.want) {
+					t.Errorf("%s %v: got %v, want %v", c.op, c.value, got, c.want)
+				}
+			}
+		})
 	}
 }
 
@@ -569,10 +572,6 @@ func TestFieldTypesAndInvoke(t *testing.T) {
 	if _, err := NewModel(order{}, "Order", WithFieldCode("note", complete)); err == nil {
 		t.Error("Complete on an INPUT was accepted")
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
-	}))
-	defer server.Close()
 	category, _ := testModels(t)
 	m, err := NewModel(order{}, "Order", WithName("Order"),
 		WithFieldCode("status", FieldCode{Fetch: func(_ context.Context, form M) ([]Option, error) {
@@ -599,7 +598,7 @@ func TestFieldTypesAndInvoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, _ := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{server.URL}})
+	node, _ := NewNode(Config{Name: "n", AccessToken: "secret", Servers: []string{"http://127.0.0.1:1"}})
 	if err := node.Register(category, NewMemoryRepository()); err != nil {
 		t.Fatal(err)
 	}
@@ -608,10 +607,9 @@ func TestFieldTypesAndInvoke(t *testing.T) {
 	}
 	call := func(method, path, body string) (int, map[string]any) {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
-		req.Header.Set("Access-Token", "secret")
 		req.Header.Set("erupt", "Order")
 		w := httptest.NewRecorder()
-		node.ServeHTTP(w, req)
+		node.ServeHTTP(w, signed(node, req, body))
 		var v map[string]any
 		_ = json.Unmarshal(w.Body.Bytes(), &v)
 		return w.Code, v
@@ -663,8 +661,8 @@ func TestFieldTypesAndInvoke(t *testing.T) {
 			t.Errorf("%s: %d", field, status)
 		}
 	}
-	// picked records arrive as [{id: key}] and are stored as their keys
-	if _, r := call("POST", "/erupt-api/data/modify/Order", `{"cats":[{"id":1},{"id":"2"}],"sections":[{"id":3}],"tags":"[\"red\"]"}`); r["success"] != true {
+	// picked records arrive as their keys, unwrapped by the server, and are stored as such
+	if _, r := call("POST", "/erupt-api/data/modify/Order", `{"cats":[1,2],"sections":[3],"tags":"red"}`); r["success"] != true {
 		t.Fatalf("add %v", r)
 	}
 	_, page := call("POST", "/erupt-api/data/table/Order", `{}`)
@@ -694,7 +692,7 @@ type book struct {
 }
 
 // bookNode serves Category, Author (drilling into its books) and Book.
-func bookNode(t *testing.T, server string) (*Node, func(method, path, body string, headers map[string]string) (int, map[string]any)) {
+func bookNode(t *testing.T) (*Node, func(method, path, body string, headers map[string]string) (int, map[string]any)) {
 	t.Helper()
 	category, _ := testModels(t)
 	a, err := NewModel(author{}, "Author", WithName("Author"),
@@ -707,7 +705,7 @@ func bookNode(t *testing.T, server string) (*Node, func(method, path, body strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, _ := NewNode(Config{Name: "blog", AccessToken: "secret", Servers: []string{server}})
+	node, _ := NewNode(Config{Name: "blog", AccessToken: "secret", Servers: []string{"http://127.0.0.1:1"}})
 	for _, reg := range []struct {
 		m    *Model
 		repo Repository
@@ -722,25 +720,16 @@ func bookNode(t *testing.T, server string) (*Node, func(method, path, body strin
 	}
 	return node, func(method, path, body string, headers map[string]string) (int, map[string]any) {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
-		req.Header.Set("Access-Token", "secret")
 		req.Header.Set("erupt", path[strings.LastIndex(path, "/")+1:])
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
 		w := httptest.NewRecorder()
-		node.ServeHTTP(w, req)
+		node.ServeHTTP(w, signed(node, req, body))
 		var v map[string]any
 		_ = json.Unmarshal(w.Body.Bytes(), &v)
 		return w.Code, v
 	}
-}
-
-func powerServer(t *testing.T) string {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"add":true,"edit":true,"delete":true,"viewDetails":true}`))
-	}))
-	t.Cleanup(server.Close)
-	return server.URL
 }
 
 func titlesOf(page map[string]any) []string {
@@ -753,45 +742,41 @@ func titlesOf(page map[string]any) []string {
 }
 
 func TestDrill(t *testing.T) {
-	node, call := bookNode(t, powerServer(t))
-	drill := map[string]string{"Drill": "Books", "DrillSourceErupt": "Author", "DrillValue": "1"}
-	if _, page := call("POST", "/erupt-api/data/table/Book", `{}`, drill); !reflect.DeepEqual(titlesOf(page), []string{"a", "c"}) {
+	node, call := bookNode(t)
+	// the server sends the join as a condition and names the drill in the body (PROTOCOL.md §12.4)
+	body := `{"condition":[{"key":"author","expression":"EQ","value":1}],"drill":{"erupt":"Author","code":"Books"}}`
+	if _, page := call("POST", "/erupt-api/data/table/Book", body, nil); !reflect.DeepEqual(titlesOf(page), []string{"a", "c"}) {
 		t.Errorf("drilled rows %v", titlesOf(page))
 	}
-	for k, v := range map[string]string{"Drill": "x", "DrillSourceErupt": "Book"} {
-		headers := map[string]string{"Drill": "Books", "DrillSourceErupt": "Author", "DrillValue": "1", k: v}
-		if status, _ := call("POST", "/erupt-api/data/table/Book", `{}`, headers); status != 403 {
-			t.Errorf("%s=%s: %d", k, v, status)
+	for _, drill := range []string{`{"erupt":"Author","code":"x"}`, `{"erupt":"Book","code":"Books"}`, `{"erupt":"Nope","code":"Books"}`} {
+		if status, _ := call("POST", "/erupt-api/data/table/Book", `{"drill":`+drill+`}`, nil); status != 403 {
+			t.Errorf("%s: %d", drill, status)
 		}
-	}
-	if _, r := call("POST", "/erupt-api/data/table/Category", `{}`, drill); r["success"] != false {
-		t.Errorf("a drill into another model %v", r)
 	}
 	_, build := call("GET", "/erupt-api/build/Author", "", nil)
 	drills := build["eruptModel"].(map[string]any)["eruptJson"].(map[string]any)["drills"].([]any)
-	want := []any{M{"code": "Books", "title": "Books", "fold": false, "icon": "fa fa-sitemap", "link": M{"linkErupt": "Book", "linkCondition": ""}}}
+	// the link goes to the server whole: it reads the source row and joins on column / joinColumn
+	want := []any{M{"code": "Books", "title": "Books", "link": M{"linkErupt": "Book", "joinColumn": "author.id"}}}
 	if !reflect.DeepEqual(drills, want) {
 		t.Errorf("build drills %v", drills)
 	}
-	if _, err := NewModel(author{}, "Author", WithRaw(M{"drills": []M{{"title": "x", "link": M{"linkErupt": "Book"}}}})); err == nil {
-		t.Error("a drill without joinColumn was accepted")
+	// a drill's linkCondition is the node's SQL, added to the drilled table
+	m, err := NewModel(author{}, "Author", WithName("Writer"),
+		WithRaw(M{"drills": []M{{"title": "Live", "code": "live", "link": M{"linkErupt": "Book", "joinColumn": "author", "linkCondition": "live = 1"}}}}))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// a signed "query" takes a condition on a field the search bar does not have
-	body := `{"condition":[{"key":"author","expression":"EQ","value":2}]}`
-	if _, r := call("POST", "/erupt-api/data/table/Book", body, nil); r["success"] != false {
-		t.Errorf("an unsigned condition on a non-search field %v", r)
+	if err := node.Register(m, NewMemoryRepository()); err != nil {
+		t.Fatal(err)
 	}
-	ts := time.Now().Unix()
-	path := "/erupt-api/data/table/Book"
-	signed := map[string]string{HeaderTimestamp: strconv.FormatInt(ts, 10), HeaderEnforced: "power,query",
-		HeaderSignature: Sign(node.cfg.AccessToken, "POST", path, ts, "power,query", "", []byte(body))}
-	if _, page := call("POST", path, body, signed); !reflect.DeepEqual(titlesOf(page), []string{"b"}) {
-		t.Errorf("signed query %v", page)
+	var q Query
+	if err := node.drill(M{"drill": M{"erupt": "Writer", "code": "live"}}, &q); err != nil || !reflect.DeepEqual(q.Filters, []Filter{{SQL: "live = 1"}}) {
+		t.Errorf("linkCondition %v %v", q.Filters, err)
 	}
 }
 
 func TestSimpleTypesAndDependColumn(t *testing.T) {
-	_, call := bookNode(t, powerServer(t))
+	_, call := bookNode(t)
 	_, build := call("GET", "/erupt-api/build/Book", "", nil)
 	edit := map[string]map[string]any{}
 	for _, f := range build["eruptModel"].(map[string]any)["eruptFieldModels"].([]any) {
@@ -806,7 +791,7 @@ func TestSimpleTypesAndDependColumn(t *testing.T) {
 	if got := edit["shelf"]["referenceTableType"].(map[string]any)["dependColumn"]; got != "parent" {
 		t.Errorf("dependColumn %v: the server reads it off the build", got)
 	}
-	if _, r := call("POST", "/erupt-api/data/modify/Book", `{"title":"d","stars":"4","readers":[{"id":2}]}`, nil); r["success"] != true {
+	if _, r := call("POST", "/erupt-api/data/modify/Book", `{"title":"d","stars":4,"readers":[2]}`, nil); r["success"] != true {
 		t.Fatalf("add %v", r)
 	}
 	_, page := call("POST", "/erupt-api/data/table/Book", `{}`, nil)

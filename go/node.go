@@ -3,7 +3,6 @@ package erupt
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -21,6 +20,11 @@ import (
 
 // Version is reported to the server at registration.
 const Version = "0.1.0"
+
+// ProtocolVersion is the node protocol this SDK speaks (erupt-cloud/PROTOCOL.md §12): the server signs every call,
+// enforces the user's rights and the model's, checks and normalizes queries and records, and turns drills and link
+// trees into conditions. The node stores and reads rows and runs its own code.
+const ProtocolVersion = 2
 
 // User is the acting user of a request, as the server forwards it.
 type User struct {
@@ -43,7 +47,7 @@ func UserFrom(ctx context.Context) *User {
 // Config configures a node.
 type Config struct {
 	Name        string   // the node name created on the erupt server
-	AccessToken string   // that node's access token
+	AccessToken string   // that node's access token: the key the server signs every call with (PROTOCOL.md §4.3)
 	Servers     []string // erupt server base URLs, used round robin
 	// Address is the base URL the server calls this node on; ListenAndServe derives it from the local
 	// interface and the listening port when empty.
@@ -52,22 +56,17 @@ type Config struct {
 	Heartbeat time.Duration
 	// Logger receives errors and warnings; log.Default() when nil.
 	Logger *log.Logger
-	// RequireSignature refuses server calls without a valid Erupt-Signature, so the plain access token
-	// alone no longer passes (servers sign since erupt 2.3.x).
-	RequireSignature bool
 }
 
 // Node serves registered models to an erupt cloud server (erupt-cloud/PROTOCOL.md). It is an
 // http.Handler, so it can be mounted in any Go server; ListenAndServe also registers it.
 type Node struct {
-	cfg     Config
-	mu      sync.RWMutex
-	models  map[string]*registered
-	names   []string
-	client  *http.Client
-	next    atomic.Uint64
-	powerMu sync.Mutex
-	powers  map[[2]string]cachedPower
+	cfg    Config
+	mu     sync.RWMutex
+	models map[string]*registered
+	names  []string
+	client *http.Client
+	next   atomic.Uint64
 }
 
 type registered struct {
@@ -75,23 +74,16 @@ type registered struct {
 	repo  Repository
 }
 
-type cachedPower struct {
-	until time.Time
-	power map[string]bool
-}
-
 // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there.
 var unsupportedPower = map[string]bool{"print": false, "ai": false}
 
-// Rights the server decides per user; the node ANDs them onto the declared power.
-var serverPower = []string{"add", "edit", "delete", "viewDetails", "export", "importable"}
-
+// queryOps are the expressions a node puts into a query: an unknown one fails rather than build no condition and
+// match every row, whoever sends it (PROTOCOL.md §12.6).
 var queryOps = map[string]bool{"EQ": true, "NEQ": true, "GT": true, "GTE": true, "LT": true, "LTE": true, "LIKE": true,
 	"NOT_LIKE": true, "RANGE": true, "IN": true, "NOT_IN": true, "NULL": true, "NOT_NULL": true}
 
-const (
-	maxPageSize = 1000
-)
+// maxPageSize is a guard of the node's own: the server caps a page too, but no call should make a node read without end.
+const maxPageSize = 1000
 
 // NewNode creates a node; register models on it before serving.
 func NewNode(cfg Config) (*Node, error) {
@@ -107,8 +99,7 @@ func NewNode(cfg Config) (*Node, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
-	return &Node{cfg: cfg, models: map[string]*registered{}, client: &http.Client{Timeout: 10 * time.Second},
-		powers: map[[2]string]cachedPower{}}, nil
+	return &Node{cfg: cfg, models: map[string]*registered{}, client: &http.Client{Timeout: 10 * time.Second}}, nil
 }
 
 // Register serves a model from a repository. A referenced model must be registered first.
@@ -145,30 +136,37 @@ type reply struct{ status int }
 func (r reply) Error() string { return http.StatusText(r.status) }
 
 type request struct {
-	r        *http.Request
-	ctx      context.Context
-	model    *Model
-	repo     Repository
-	args     []string
-	body     []byte
-	enforced map[string]bool // checks the server ran, from a verified Erupt-Enforced
+	r     *http.Request
+	ctx   context.Context
+	model *Model
+	repo  Repository
+	args  []string
+	body  []byte
 }
 
 type route struct {
 	method  string
 	pattern *regexp.Regexp
 	handle  func(*Node, *request) (any, error)
+	// what the server must vouch for in Erupt-Enforced (PROTOCOL.md §12.2)
+	enforced []string
 }
 
+var (
+	needPower  = []string{"power"}
+	needQuery  = []string{"power", "query"}
+	needRecord = []string{"power", "record"}
+)
+
 var routes = []route{
-	{"GET", regexp.MustCompile(`^/erupt-api/build/([^/]+)$`), (*Node).build},
-	{"POST", regexp.MustCompile(`^/erupt-api/data/table/([^/]+)$`), (*Node).table},
-	{"GET", regexp.MustCompile(`^/erupt-api/data/init-value/([^/]+)$`), (*Node).initValue},
-	{"GET", regexp.MustCompile(`^/erupt-api/data/([^/]+)/([^/]+)$`), (*Node).get},
-	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)$`), (*Node).add},
-	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)/update$`), (*Node).update},
-	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)/delete$`), (*Node).delete},
-	{"POST", regexp.MustCompile(`^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$`), (*Node).invoke},
+	{"GET", regexp.MustCompile(`^/erupt-api/build/([^/]+)$`), (*Node).build, nil},
+	{"POST", regexp.MustCompile(`^/erupt-api/data/table/([^/]+)$`), (*Node).table, needQuery},
+	{"GET", regexp.MustCompile(`^/erupt-api/data/init-value/([^/]+)$`), (*Node).initValue, needPower},
+	{"GET", regexp.MustCompile(`^/erupt-api/data/([^/]+)/([^/]+)$`), (*Node).get, needPower},
+	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)$`), (*Node).add, needRecord},
+	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)/update$`), (*Node).update, needRecord},
+	{"POST", regexp.MustCompile(`^/erupt-api/data/modify/([^/]+)/delete$`), (*Node).delete, needPower},
+	{"POST", regexp.MustCompile(`^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$`), (*Node).invoke, needPower},
 }
 
 func r(success bool, message, data any) M {
@@ -251,6 +249,12 @@ func (n *Node) dispatch(hr *http.Request) (any, error) {
 		if groups == nil || rt.method != hr.Method {
 			continue
 		}
+		// what lets the node skip the checks the server made: never the negotiation alone (PROTOCOL.md §12.2)
+		for _, check := range rt.enforced {
+			if !enforced[check] {
+				return nil, reply{403}
+			}
+		}
 		name := groups[1]
 		n.mu.RLock()
 		reg := n.models[name]
@@ -278,20 +282,17 @@ func (n *Node) dispatch(hr *http.Request) (any, error) {
 			}
 			ctx = context.WithValue(ctx, userKey{}, &user)
 		}
-		return rt.handle(n, &request{r: hr, ctx: ctx, model: reg.model, repo: reg.repo, args: groups[2:], body: body, enforced: enforced})
+		return rt.handle(n, &request{r: hr, ctx: ctx, model: reg.model, repo: reg.repo, args: groups[2:], body: body})
 	}
 	return nil, reply{404}
 }
 
-// authenticate admits a server call: a signed call must verify and then stands for the token; its
-// Erupt-Enforced is trusted only then. Unsigned calls present the access token.
+// authenticate admits a server call: every call is signed (PROTOCOL.md §12.2), and its Erupt-Enforced is what
+// the server vouches for.
 func (n *Node) authenticate(hr *http.Request, body []byte) (map[string]bool, error) {
 	signature := hr.Header.Get(HeaderSignature)
 	if signature == "" {
-		if n.cfg.RequireSignature || subtle.ConstantTimeCompare([]byte(hr.Header.Get("Access-Token")), []byte(n.cfg.AccessToken)) != 1 {
-			return nil, reply{403}
-		}
-		return nil, nil
+		return nil, reply{403}
 	}
 	pathAndQuery := hr.URL.EscapedPath()
 	if hr.URL.RawQuery != "" {
@@ -344,7 +345,15 @@ func (q *request) object() (map[string]any, error) {
 // ---------------------------------------------------------------- endpoints
 
 func (n *Node) build(q *request) (any, error) {
-	build := q.model.buildModel(n.power(q, q.model), UserFrom(q.ctx))
+	// the rights the model switches off, and the features this SDK does not serve yet (PROTOCOL.md §12.3)
+	power := map[string]bool{}
+	for k, v := range q.model.power {
+		power[k] = v
+	}
+	for k, v := range unsupportedPower {
+		power[k] = v
+	}
+	build := q.model.buildModel(power, UserFrom(q.ctx))
 	condition := M{}
 	if err := hook(q.ctx, q.model, DataProxy.SearchCondition, condition); err != nil {
 		return nil, err
@@ -354,9 +363,6 @@ func (n *Node) build(q *request) (any, error) {
 }
 
 func (n *Node) table(q *request) (any, error) {
-	if err := n.require(q, "query"); err != nil {
-		return nil, err
-	}
 	body, err := q.object()
 	if err != nil {
 		return nil, err
@@ -380,41 +386,34 @@ func (n *Node) page(req *request, body map[string]any) (any, error) {
 	pageSize := number(body["pageSize"], 10)
 	pageSize = int(math.Min(math.Max(float64(pageSize), 1), maxPageSize))
 	q := Query{Offset: (pageIndex - 1) * pageSize, Limit: pageSize}
+	// checked and normalized by the server, a drill's join and a link tree's keys among them (PROTOCOL.md §12.4)
 	conditions, _ := body["condition"].([]any)
 	for _, c := range conditions {
 		obj, ok := c.(map[string]any)
 		if !ok {
 			return nil, Fail("illegal condition")
 		}
-		// under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
-		cond, err := condition(m, obj, req.enforced["query"])
+		conds, err := condition(m, obj)
 		if err != nil {
 			return nil, err
 		}
-		q.Conditions = append(q.Conditions, cond)
-	}
-	if err := n.drill(req, &q); err != nil {
-		return nil, err
+		q.Conditions = append(q.Conditions, conds...)
 	}
 	sorts, _ := body["sort"].([]any)
 	for _, s := range sorts {
 		obj, _ := s.(map[string]any)
-		f := m.byName[str(obj["field"])]
-		if f == nil || !(f.sortable || f.pk) {
+		// "field.column" sorts by a reference's label: the server resolves labels, the node orders by the key
+		name, _, _ := strings.Cut(str(obj["field"]), ".")
+		f := m.byName[name]
+		if f == nil || f.virtual {
 			return nil, Fail("illegal sort field '%s'", str(obj["field"]))
 		}
 		q.Sort = append(q.Sort, Order{Field: f.name, Desc: strings.EqualFold(str(obj["direction"]), "DESC")})
 	}
-	// a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
-	picked := body["linkTreeVal"]
-	if m.linkTree != "" && picked != nil {
-		cond, err := fieldCondition(m.byName[m.linkTree], "IN", picked)
-		if err != nil {
-			return nil, err
-		}
-		q.Conditions = append(q.Conditions, cond)
+	// a drill's linkCondition, a @Vis view's own filter and order, then the DataProxy's
+	if err := n.drill(body, &q); err != nil {
+		return nil, err
 	}
-	// a @Vis view's own filter and order, then the DataProxy's
 	code, _ := body["vis"].(string)
 	v := m.vis[code]
 	if len(q.Sort) == 0 {
@@ -433,12 +432,9 @@ func (n *Node) page(req *request, body map[string]any) (any, error) {
 			q.Filters = append(q.Filters, f)
 		}
 	}
-	total, records := int64(0), []Record{}
-	if !m.dependNode || picked != nil {
-		var err error
-		if total, records, err = repo.Page(ctx, q); err != nil {
-			return nil, err
-		}
+	total, records, err := repo.Page(ctx, q)
+	if err != nil {
+		return nil, err
 	}
 	rows, err := n.rows(ctx, m, records)
 	if err != nil {
@@ -452,114 +448,88 @@ func (n *Node) page(req *request, body map[string]any) (any, error) {
 		"sort": nil, "alert": nil, "extraContent": nil}, nil
 }
 
-// drill narrows a table read from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose join
-// field holds the source row's column, and its linkCondition as a filter ahead of the others.
-func (n *Node) drill(req *request, q *Query) error {
-	header := req.r.Header
-	if len(header.Values("Drill")) == 0 {
+// drill applies a drilled table's linkCondition (PROTOCOL.md §12.4): the server sent the join as a condition and
+// names the drill in the body, {"erupt": source, "code": code}; a drill its source model does not declare is refused.
+func (n *Node) drill(body map[string]any, q *Query) error {
+	d, _ := body["drill"].(map[string]any)
+	if d == nil {
 		return nil
 	}
-	code := header.Get("Drill")
 	n.mu.RLock()
-	source := n.models[header.Get("DrillSourceErupt")]
+	source := n.models[str(d["erupt"])]
 	n.mu.RUnlock()
 	if source == nil {
 		return reply{403}
 	}
-	link, ok := source.model.drills[code]
+	condition, ok := source.model.drills[str(d["code"])]
 	if !ok {
 		return reply{403}
 	}
-	join := req.model.byName[link.join]
-	if link.erupt != req.model.name || join == nil || join.virtual {
-		return Fail("illegal erupt from drill '%s'", code)
-	}
-	pk, err := primaryKey(source.model, header.Get("DrillValue"))
-	if err != nil {
-		return err
-	}
-	row, err := source.repo.Get(req.ctx, pk)
-	if err != nil {
-		return err
-	}
-	if row == nil {
-		return Fail("record not found")
-	}
-	cond, err := fieldCondition(join, "EQ", row[link.column])
-	if err != nil {
-		return err
-	}
-	q.Conditions = append(q.Conditions, cond)
-	if link.condition != "" {
-		q.Filters = append(q.Filters, Filter{SQL: link.condition})
+	if condition != "" {
+		q.Filters = append(q.Filters, Filter{SQL: condition})
 	}
 	return nil
 }
 
-// condition checks a table condition: on a searchable field, or on any stored one when trusted.
-func condition(m *Model, c map[string]any, trusted bool) (Cond, error) {
+// condition turns a table condition into Conds. The server checked it; the node still puts only its own stored
+// field names and known expressions into a query (PROTOCOL.md §12.6).
+func condition(m *Model, c map[string]any) ([]Cond, error) {
 	key := str(c["key"])
 	f := m.byName[key]
-	if f == nil || f.virtual || (!trusted && (f.pk || !f.search)) {
-		return Cond{}, Fail("illegal search field '%s'", key)
+	if f == nil || f.virtual {
+		return nil, Fail("illegal search field '%s'", key)
 	}
-	op := str(c["expression"])
-	if op == "" {
-		op = "EQ"
-	}
+	op, value := str(c["expression"]), c["value"]
 	if !queryOps[op] {
-		return Cond{}, Fail("illegal operator '%s'", op)
+		return nil, Fail("illegal operator '%s'", op)
 	}
-	return fieldCondition(f, op, c["value"])
-}
-
-// fieldCondition coerces a condition's value to the field's type.
-func fieldCondition(f *field, op string, value any) (Cond, error) {
-	switch {
-	case op == "NULL" || op == "NOT_NULL":
-		return Cond{Field: f.name, Op: op}, nil
-	case f.isReference() && op != "EQ" && op != "NEQ" && op != "IN" && op != "NOT_IN":
-		return Cond{}, Fail("illegal operator '%s' for a reference", op)
-	case op == "LIKE" || op == "NOT_LIKE":
-		return Cond{Field: f.name, Op: op, Value: str(value)}, nil
-	case op == "RANGE":
-		bounds, ok := value.([]any)
-		if !ok || len(bounds) != 2 {
-			return Cond{}, Fail("range needs two values")
+	if f.json && (op == "EQ" || op == "IN" || op == "NEQ" || op == "NOT_IN") {
+		// a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its JSON text
+		like := "LIKE"
+		if op == "NEQ" || op == "NOT_IN" {
+			like = "NOT_LIKE"
 		}
-		values, err := coerceAll(f, bounds)
-		return Cond{Field: f.name, Op: op, Value: values}, err
-	case op == "IN" || op == "NOT_IN":
+		values, ok := value.([]any)
+		if !ok {
+			values = []any{value}
+		}
+		conds := make([]Cond, len(values))
+		for i, v := range values {
+			text, _ := json.Marshal(str(v))
+			conds[i] = Cond{Field: f.name, Op: like, Value: string(text)}
+		}
+		return conds, nil
+	}
+	switch op {
+	case "NULL", "NOT_NULL":
+		return []Cond{{Field: f.name, Op: op}}, nil
+	case "LIKE", "NOT_LIKE":
+		// the text the user typed: the repository adds the wildcards and escapes it
+		return []Cond{{Field: f.name, Op: op, Value: str(value)}}, nil
+	case "RANGE", "IN", "NOT_IN":
 		list, ok := value.([]any)
 		if !ok {
-			list = []any{value}
+			return nil, Fail("%s: %s needs an array", f.title, op)
 		}
-		values, err := coerceAll(f, list)
-		return Cond{Field: f.name, Op: op, Value: values}, err
+		values := make([]any, len(list))
+		for i, v := range list {
+			stored, err := f.coerce(v)
+			if err != nil {
+				return nil, Fail("%s: %s", f.title, err.Error())
+			}
+			values[i] = stored
+		}
+		return []Cond{{Field: f.name, Op: op, Value: values}}, nil
 	}
-	v, err := f.coerce(value)
+	// values arrive as the JSON type their field stores; dates become time.Time, keys the key type
+	stored, err := f.coerce(value)
 	if err != nil {
-		return Cond{}, Fail("%s", err.Error())
+		return nil, Fail("%s: %s", f.title, err.Error())
 	}
-	return Cond{Field: f.name, Op: op, Value: v}, nil
-}
-
-func coerceAll(f *field, values []any) ([]any, error) {
-	out := make([]any, len(values))
-	for i, v := range values {
-		c, err := f.coerce(v)
-		if err != nil {
-			return nil, Fail("%s", err.Error())
-		}
-		out[i] = c
-	}
-	return out, nil
+	return []Cond{{Field: f.name, Op: op, Value: stored}}, nil
 }
 
 func (n *Node) initValue(q *request) (any, error) {
-	if err := n.require(q, "add"); err != nil {
-		return nil, err
-	}
 	record := emptyRow(q.model)
 	if err := hook(q.ctx, q.model, DataProxy.AddBehavior, record); err != nil {
 		return nil, err
@@ -580,10 +550,6 @@ func emptyRow(m *Model) M {
 }
 
 func (n *Node) get(q *request) (any, error) {
-	power := n.power(q, q.model)
-	if !power["edit"] && !power["viewDetails"] {
-		return nil, reply{403}
-	}
 	pk, err := primaryKey(q.model, q.args[0])
 	if err != nil {
 		return nil, err
@@ -606,9 +572,6 @@ func (n *Node) get(q *request) (any, error) {
 }
 
 func (n *Node) add(q *request) (any, error) {
-	if err := n.require(q, "add"); err != nil {
-		return nil, err
-	}
 	body, err := q.object()
 	if err != nil {
 		return nil, err
@@ -633,9 +596,6 @@ func (n *Node) add(q *request) (any, error) {
 }
 
 func (n *Node) update(q *request) (any, error) {
-	if err := n.require(q, "edit"); err != nil {
-		return nil, err
-	}
 	body, err := q.object()
 	if err != nil {
 		return nil, err
@@ -671,9 +631,6 @@ func (n *Node) update(q *request) (any, error) {
 }
 
 func (n *Node) delete(q *request) (any, error) {
-	if err := n.require(q, "delete"); err != nil {
-		return nil, err
-	}
 	body, err := q.json()
 	if err != nil {
 		return nil, err
@@ -861,7 +818,7 @@ func primaryKey(m *Model, v any) (any, error) {
 	return pk, nil
 }
 
-// toRecord coerces and checks the form fields of a body.
+// toRecord turns a record the server checked and normalized (PROTOCOL.md §12.4) into what the repository stores.
 func toRecord(m *Model, body map[string]any) (Record, error) {
 	record := Record{}
 	for _, f := range m.stored() {
@@ -871,9 +828,6 @@ func toRecord(m *Model, body map[string]any) (Record, error) {
 		v, err := f.coerce(body[f.name])
 		if err != nil {
 			return nil, Fail("%s: %s", f.title, err.Error())
-		}
-		if f.notNull && v == nil {
-			return nil, Fail("%s cannot be empty", f.title)
 		}
 		record[f.name] = v
 	}

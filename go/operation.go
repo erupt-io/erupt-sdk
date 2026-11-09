@@ -51,7 +51,7 @@ func newOperation(model string, op Operation) (*Operation, error) {
 	if err := checkEnum(RowOperationModeValues, string(op.Mode), "RowOperationMode", path+".mode"); err != nil {
 		return nil, err
 	}
-	raw, err := rawObject(op.Raw, "RowOperation", path)
+	raw, err := rawObject(op.Raw, path)
 	if err != nil {
 		return nil, err
 	}
@@ -61,14 +61,14 @@ func newOperation(model string, op Operation) (*Operation, error) {
 
 func (op *Operation) visible(user *User) bool { return op.Show == nil || op.Show(user) }
 
+// build declares the operation (PROTOCOL.md §12.3): the server completes the rest from Java's defaults.
 func (op *Operation) build() map[string]any {
-	tpl := deepCopy(defaults.RowOperation).(map[string]any)
 	eruptClass := "void"
 	if op.Form != nil {
 		eruptClass = op.Form.name
 	}
-	merge(tpl, M{"code": op.Code, "title": op.Title, "mode": string(op.Mode), "tip": op.Tip, "ifExpr": op.IfExpr,
-		"type": "ERUPT", "eruptClass": eruptClass})
+	tpl := M{"code": op.Code, "title": op.Title, "mode": string(op.Mode), "tip": op.Tip, "ifExpr": op.IfExpr,
+		"eruptClass": eruptClass}
 	if op.Icon != "" {
 		tpl["icon"] = op.Icon
 	}

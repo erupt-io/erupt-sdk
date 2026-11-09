@@ -68,7 +68,8 @@ module Erupt
   class SqlRepository < Repository
     QUOTES = { sqlite: %w[" "], postgres: %w[" "], mysql: %w[` `] }.freeze
     OPS = { "EQ" => "=", "NEQ" => "<>", "GT" => ">", "GTE" => ">=", "LT" => "<", "LTE" => "<=" }.freeze
-    SQLITE_TYPES = { EditType::NUMBER => "NUMERIC", EditType::BOOLEAN => "INTEGER", EditType::DATE => "DATE",
+    SQLITE_TYPES = { EditType::NUMBER => "NUMERIC", EditType::RATE => "NUMERIC", EditType::SLIDER => "NUMERIC",
+                     EditType::BOOLEAN => "INTEGER", EditType::DATE => "DATE",
                      DATE_TIME => "TIMESTAMP", EditType::REFERENCE_TABLE => "INTEGER",
                      EditType::REFERENCE_TREE => "INTEGER" }.freeze
 
@@ -218,7 +219,8 @@ module Erupt
       when EditType::BOOLEAN then [true, 1, "1", "t", "true"].include?(value)
       when EditType::DATE then Erupt.parse_time(value).to_date
       when DATE_TIME then Erupt.parse_time(value)
-      when EditType::NUMBER, *REFERENCES then Erupt.number(value)
+      # RATE / SLIDER are numbers too, whatever column an older table gave them
+      when EditType::NUMBER, EditType::RATE, EditType::SLIDER, *REFERENCES then Erupt.number(value)
       else field.pk? ? Erupt.number(value) : value
       end
     end

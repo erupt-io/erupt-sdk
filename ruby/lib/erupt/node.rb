@@ -2,7 +2,6 @@
 
 require "json"
 require "net/http"
-require "openssl"
 require "securerandom"
 require "socket"
 require "stringio"
@@ -13,26 +12,31 @@ module Erupt
   def self.current_user = Thread.current[:erupt_user]
 
   # Erupt cloud node runtime: registers with the server, then answers the requests it forwards. The wire
-  # contract is erupt-cloud/PROTOCOL.md (Level 0). A node is a Rack application (+call(env)+), so it can be
-  # mounted in Rails / Sinatra / any Rack server, or served on its own with +serve+.
+  # contract is erupt-cloud/PROTOCOL.md, protocol v2 (§12): the server signs every call, enforces the user's
+  # rights and the model's, checks and normalizes queries and records, and turns drills and link trees into
+  # conditions; the node stores and reads rows and runs its own code. A node is a Rack application
+  # (+call(env)+), so it can be mounted in Rails / Sinatra / any Rack server, or served on its own with +serve+.
   class Node
+    # The node protocol this SDK speaks (PROTOCOL.md §12.2)
+    PROTOCOL_VERSION = 2
     # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
     UNSUPPORTED_POWER = { "print" => false, "ai" => false }.freeze
-    # Rights the server decides per user; the node ANDs them onto the declared power
-    SERVER_POWER = %w[add edit delete viewDetails export importable].freeze
-    OPS = %w[EQ NEQ GT GTE LT LTE LIKE NOT_LIKE RANGE IN NOT_IN NULL NOT_NULL].freeze
+    # A guard of the node's own: the server checks a page size too, but no call should make a node read without end
     MAX_PAGE_SIZE = 1000
-    POWER_TTL = 5
+    # Operators a condition may carry: like a field name, checked whoever calls (§12.6)
+    OPS = %w[EQ NEQ GT GTE LT LTE LIKE NOT_LIKE RANGE IN NOT_IN NULL NOT_NULL].freeze
 
+    POWER, QUERY, RECORD = %w[power].freeze, %w[power query].freeze, %w[power record].freeze
+    # verb, path, endpoint, what the server must vouch for in Erupt-Enforced (§12.2)
     ROUTES = [
-      ["GET", %r{\A/erupt-api/build/([^/]+)\z}, :build],
-      ["POST", %r{\A/erupt-api/data/table/([^/]+)\z}, :table],
-      ["GET", %r{\A/erupt-api/data/init-value/([^/]+)\z}, :init_value],
-      ["GET", %r{\A/erupt-api/data/([^/]+)/([^/]+)\z}, :get],
-      ["POST", %r{\A/erupt-api/data/modify/([^/]+)\z}, :add],
-      ["POST", %r{\A/erupt-api/data/modify/([^/]+)/update\z}, :update],
-      ["POST", %r{\A/erupt-api/data/modify/([^/]+)/delete\z}, :delete],
-      ["POST", %r{\A/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)\z}, :invoke]
+      ["GET", %r{\A/erupt-api/build/([^/]+)\z}, :build, [].freeze],
+      ["POST", %r{\A/erupt-api/data/table/([^/]+)\z}, :table, QUERY],
+      ["GET", %r{\A/erupt-api/data/init-value/([^/]+)\z}, :init_value, POWER],
+      ["GET", %r{\A/erupt-api/data/([^/]+)/([^/]+)\z}, :get, POWER],
+      ["POST", %r{\A/erupt-api/data/modify/([^/]+)\z}, :add, RECORD],
+      ["POST", %r{\A/erupt-api/data/modify/([^/]+)/update\z}, :update, RECORD],
+      ["POST", %r{\A/erupt-api/data/modify/([^/]+)/delete\z}, :delete, POWER],
+      ["POST", %r{\A/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)\z}, :invoke, POWER]
     ].freeze
     # invoke kind -> the Field attribute holding its code
     INVOKED = { "options" => :fetch, "onchange" => :onchange, "autocomplete" => :complete, "button" => :click }.freeze
@@ -55,18 +59,15 @@ module Erupt
 
     attr_reader :name, :address, :models
 
-    # +require_signature+ refuses server calls without a valid Erupt-Signature, so the plain access token alone
-    # no longer passes (servers sign since erupt 2.3.x).
-    def initialize(name, access_token, servers, address: nil, heartbeat: 15, require_signature: false, logger: nil)
+    # +access_token+ is the key the server signs every call with (PROTOCOL.md §4.3).
+    def initialize(name, access_token, servers, address: nil, heartbeat: 15, logger: nil)
       raise ArgumentError, "access_token is required" if access_token.to_s.empty?
 
-      @name, @access_token, @require_signature = name, access_token, require_signature
+      @name, @access_token = name, access_token
       @servers = Array(servers).map { |s| s.chomp("/") }
       @address, @heartbeat, @log = address, heartbeat, logger || StderrLog.new
       @models = {}
       @tick = 0
-      @power_cache = {}
-      @lock = Mutex.new
     end
 
     def register(cls, repository)
@@ -152,10 +153,12 @@ module Erupt
       # server-to-server only: an Origin header means a browser reached the node directly
       raise Reply, 403 unless env["HTTP_ORIGIN"].to_s.empty?
 
-      authenticate(env)
-      ROUTES.each do |verb, pattern, handler|
+      enforced = authenticate(env)
+      ROUTES.each do |verb, pattern, handler, required|
         match = verb == method && pattern.match(path)
         next unless match
+        # what lets the node skip the checks the server made: never the negotiation alone (§12.2)
+        raise Reply, 403 unless (required - enforced).empty?
 
         name = unescape(match[1])
         raise Reply, 404 if env["HTTP_ERUPT"] != name || !@models.key?(name)
@@ -173,126 +176,98 @@ module Erupt
       raise Reply, 404
     end
 
-    # A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then.
+    # Every call is signed (§12.2); its Erupt-Enforced is what the server vouches for.
     def authenticate(env)
-      env["erupt.enforced"] = []
-      signature = env["HTTP_ERUPT_SIGNATURE"]
-      if signature.nil?
-        raise Reply, 403 if @require_signature || !OpenSSL.secure_compare(env["HTTP_ACCESS_TOKEN"].to_s, @access_token)
-
-        return
-      end
+      signature = env["HTTP_ERUPT_SIGNATURE"] or raise Reply, 403
       enforced = env["HTTP_ERUPT_ENFORCED"]
       multipart = env["CONTENT_TYPE"].to_s.include?("multipart/form-data")
       ok = Signature.verify(@access_token, env["REQUEST_METHOD"], path_and_query(env), env["HTTP_ERUPT_TIMESTAMP"], enforced,
                             env["HTTP_USER"], multipart ? nil : body(env), signature, Time.now.to_i)
       raise Reply, 403 unless ok
 
-      env["erupt.enforced"] = enforced.to_s.split(",").reject(&:empty?)
+      enforced.to_s.split(",").reject(&:empty?)
     end
 
     # ---------------------------------------------------------------- endpoints
 
-    def build(model, _repo, env) = model.build_model(power(model, env), Erupt.current_user)
+    # the rights the model switches off, and the features this SDK does not serve yet (§12.3)
+    def build(model, _repo, _env) = model.build_model(model.power.merge(UNSUPPORTED_POWER), Erupt.current_user)
 
-    def table(model, repo, env)
-      require_power(model, env, "query")
-      page(model, repo, read_object(env), env)
-    end
+    def table(model, repo, env) = page(model, repo, read_object(env))
 
-    def page(model, repo, body, env)
+    def page(model, repo, body)
       page_index = [int(body["pageIndex"] || 1), 1].max
       page_size = int(body["pageSize"] || 10).clamp(1, MAX_PAGE_SIZE)
       query = Query.new(offset: (page_index - 1) * page_size, limit: page_size)
-      # under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
-      trusted = env["erupt.enforced"].include?("query")
-      Array(body["condition"]).each { |c| query.conditions.concat(conditions(model, c, trusted)) }
-      drilled = drill(model, env, query)
+      # checked and normalized by the server, a drill's join and a link tree's keys among them (§12.4)
+      Array(body["condition"]).each { |c| query.conditions.concat(conditions(model, c)) }
       Array(body["sort"]).each do |s|
-        f = s.is_a?(Hash) && model.fields[s["field"]]
-        raise Fail, "illegal sort field '#{s["field"] if s.is_a?(Hash)}'" unless f && (f.sortable? || f.pk?)
+        # "field.column" sorts by a reference's label: the server resolves labels, the node orders by the key
+        f = s.is_a?(Hash) && model.fields[s["field"].to_s.split(".").first]
+        raise Fail, "illegal sort field '#{s["field"] if s.is_a?(Hash)}'" unless f
 
         query.sort << [f.name, s["direction"].to_s.upcase == "DESC"]
       end
-      # a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
-      field, depend = model.link_tree
-      picked = body["linkTreeVal"]
-      query.conditions << condition(model.fields[field], "IN", picked) if field && !picked.nil?
-      # a @Vis view's own filter and order, then the DataProxy's
+      # a @Vis view's own filter and order, a drill's linkCondition, then the DataProxy's
       filters, sort = model.vis.fetch(body["vis"], [[], []])
       query.sort = (sort.empty? ? model.order : sort).dup if query.sort.empty?
-      query.filters = drilled + filters + model.filters(query.conditions)
-      total, records = depend && picked.nil? ? [0, []] : repo.page(query)
+      query.filters = drill(model, body) + filters + model.filters(query.conditions)
+      total, records = repo.page(query)
       list = rows(model, records)
       model.hook(:after_fetch, list)
       { "pageIndex" => page_index, "pageSize" => page_size, "total" => total, "totalPage" => (total + page_size - 1) / page_size,
         "list" => list, "sort" => nil, "alert" => nil, "extraContent" => nil }
     end
 
-    # A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
-    # joinColumn holds the source row's column; its linkCondition is returned as a filter.
-    def drill(model, env, query)
-      code = env["HTTP_DRILL"]
-      return [] if code.nil?
+    # A drilled table (§12.4): the server sent the join as a condition and names the drill, whose linkCondition the
+    # node adds. The source model must be registered and declare that drill into this one.
+    def drill(model, body)
+      drill = body["drill"]
+      return [] if drill.nil?
 
-      source, source_repo = @models[env["HTTP_DRILLSOURCEERUPT"].to_s]
-      link = source && source.drills[code]
-      raise Reply, 403 if link.nil?
-      raise Fail, "illegal erupt from drill '#{code}'" if link.erupt != model.name || !model.fields.key?(link.join)
+      source = (@models[drill["erupt"].to_s] if drill.is_a?(Hash))&.first
+      erupt, condition = source&.drills&.[](drill["code"])
+      raise Reply, 403 if erupt != model.name
 
-      row = source_repo.get(pk_of(source, env["HTTP_DRILLVALUE"])) or raise Fail, "record not found"
-      query.conditions << condition(model.fields[link.join], "EQ", row.key?(link.column) ? row[link.column] : row[link.column.to_sym])
-      link.condition.empty? ? [] : [[link.condition, []]]
+      condition.empty? ? [] : [[condition, []]]
     end
 
-    def conditions(model, c, trusted = false)
+    def conditions(model, c)
       c = {} unless c.is_a?(Hash)
+      # a name the node puts into a query is one of its stored fields, whoever sends it (§12.6)
       f = model.fields[c["key"]]
-      raise Fail, "illegal search field '#{c["key"]}'" if f.nil? || (!trusted && (f.pk? || !f.search?))
+      raise Fail, "illegal search field '#{c["key"]}'" if f.nil?
 
-      op = c["expression"] || "EQ"
+      op, value = c["expression"], c["value"]
       raise Fail, "illegal operator '#{op}'" unless OPS.include?(op)
-      return [condition(f, op, c["value"])] unless f.json?
-      # a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
-      raise Fail, "illegal operator '#{op}' for #{f.title}" unless %w[EQ IN NEQ NOT_IN].include?(op)
-
-      like = %w[EQ IN].include?(op) ? "LIKE" : "NOT_LIKE"
-      Array(c["value"]).map { |v| Cond.new(f.name, like, JSON.generate(v.to_s)) }
-    end
-
-    def condition(f, op, value)
-      return Cond.new(f.name, op) if %w[NULL NOT_NULL].include?(op)
-      raise Fail, "illegal operator '#{op}' for a reference" if f.reference? && !%w[EQ NEQ IN NOT_IN].include?(op)
-
-      case op
-      when "LIKE", "NOT_LIKE" then Cond.new(f.name, op, value.to_s)
-      when "RANGE"
-        raise Fail, "range needs two values" unless value.is_a?(Array) && value.size == 2
-
-        Cond.new(f.name, op, value.map { |v| coerce(f, v) })
-      when "IN", "NOT_IN" then Cond.new(f.name, op, (value.is_a?(Array) ? value : [value]).map { |v| coerce(f, v) })
-      else Cond.new(f.name, op, coerce(f, value))
+      if f.json? && %w[EQ IN NEQ NOT_IN].include?(op)
+        # a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+        like = %w[EQ IN].include?(op) ? "LIKE" : "NOT_LIKE"
+        return (value.is_a?(Array) ? value : [value]).map { |v| Cond.new(f.name, like, JSON.generate(v.to_s)) }
       end
+
+      # values arrive as the JSON type their field stores; dates become the repository's Date / Time
+      [case op
+       when "NULL", "NOT_NULL" then Cond.new(f.name, op)
+       when "LIKE", "NOT_LIKE" then Cond.new(f.name, op, value.to_s)
+       when "RANGE", "IN", "NOT_IN" then Cond.new(f.name, op, Array(value).map { |v| coerce(f, v) })
+       else Cond.new(f.name, op, coerce(f, value))
+       end]
     end
 
-    def init_value(model, _repo, env)
-      require_power(model, env, "add")
+    def init_value(model, _repo, _env)
       record = model.fields.keys.to_h { |name| [name, nil] }
       model.hook(:add_behavior, record)
       rows(model, [record]).first
     end
 
-    def get(model, repo, env, pk)
-      granted = power(model, env)
-      raise Reply, 403 unless granted["edit"] || granted["viewDetails"]
-
+    def get(model, repo, _env, pk)
       record = repo.get(pk_of(model, pk)) or raise Fail, "record not found"
       model.hook(:edit_behavior, record)
       rows(model, [record]).first
     end
 
     def add(model, repo, env)
-      require_power(model, env, "add")
       rec = record(model, read_object(env))
       model.hook(:validate, rec)
       model.hook(:before_add, rec)
@@ -302,7 +277,6 @@ module Erupt
     end
 
     def update(model, repo, env)
-      require_power(model, env, "edit")
       body = read_object(env)
       pk = pk_of(model, body[model.pk])
       raise Fail, "record not found" if repo.get(pk).nil?
@@ -316,7 +290,6 @@ module Erupt
     end
 
     def delete(model, repo, env)
-      require_power(model, env, "delete")
       ids = read_json(env)
       raise Fail, "a list of ids is required" unless ids.is_a?(Array)
 
@@ -396,53 +369,17 @@ module Erupt
       raise Fail, e.message
     end
 
+    # A record the server checked and normalized (§12.4), as the repository stores it.
     def record(model, body)
       model.fields.each_value.reject { |f| f.pk? || !f.form? }.to_h do |f|
-        value = begin
-          f.coerce(body[f.name])
-        rescue ArgumentError, TypeError => e
-          raise Fail, "#{f.title}: #{e.message}"
-        end
-        raise Fail, "#{f.title} cannot be empty" if f.not_null? && value.nil?
-
-        [f.name, value]
+        [f.name, f.coerce(body[f.name])]
+      rescue ArgumentError, TypeError => e
+        raise Fail, "#{f.title}: #{e.message}"
       end
     end
 
     def r(success: true, message: nil, data: nil)
       { "success" => success, "status" => success ? "SUCCESS" : "ERROR", "message" => message, "data" => data, "promptWay" => "MESSAGE" }
-    end
-
-    # ---------------------------------------------------------------- permissions (PROTOCOL.md §6.1)
-
-    def require_power(model, env, right)
-      raise Reply, 403 unless power(model, env)[right]
-    end
-
-    def power(model, env)
-      granted = model.power.merge(UNSUPPORTED_POWER)
-      # the server checked the user's rights and restricts the build's power itself: the model's own
-      # declaration is all that is left to apply here
-      return granted if env["erupt.enforced"]&.include?("power")
-
-      key = [env["HTTP_TOKEN"].to_s, model.name]
-      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      cached = @lock.synchronize { @power_cache[key] }
-      return cached.last if cached && cached.first > now
-
-      remote = begin
-        server_call(:get, "/erupt-cloud-api/erupt-power", query: { nodeName: @name, eruptName: model.name }, headers: { "token" => key.first })
-      rescue StandardError => e # fail closed: without the server's verdict nothing is writable
-        @log.warn("erupt-power unavailable: #{e.message}")
-        {}
-      end
-      remote = {} unless remote.is_a?(Hash)
-      SERVER_POWER.each { |right| granted[right] &&= !!remote[right] }
-      @lock.synchronize do
-        @power_cache.clear if @power_cache.size > 10_000
-        @power_cache[key] = [now + POWER_TTL, granted]
-      end
-      granted
     end
 
     # ---------------------------------------------------------------- server calls
@@ -471,7 +408,7 @@ module Erupt
 
     def node_info
       { "instanceId" => @instance_id, "nodeName" => @name, "accessToken" => @access_token, "version" => "ruby-#{VERSION}",
-        "nodeAddress" => [@address], "eruptModules" => [], "erupts" => @models.keys, "resources" => {},
+        "protocolVersion" => PROTOCOL_VERSION, "nodeAddress" => [@address], "eruptModules" => [], "erupts" => @models.keys, "resources" => {},
         "capabilities" => ["invoke"] }
     end
 
@@ -480,7 +417,12 @@ module Erupt
       loop do
         server = next_server
         begin
-          server_call(:post, "/erupt-cloud-api/register-node", server: server, json: node_info, timeout: 10)
+          answer = server_call(:post, "/erupt-cloud-api/register-node", server: server, json: node_info, timeout: 10, parse: false)
+          unless speaks_v2?(answer)
+            # an older server: it would call this node as v1, which it no longer answers (§12.2)
+            @log.error("#{server} does not speak node protocol v#{PROTOCOL_VERSION}: upgrade the erupt server; registration stopped")
+            return
+          end
           @log.info("#{server} -> connection success") if failing
           failing = false
           sleep(@heartbeat)
@@ -490,6 +432,14 @@ module Erupt
           sleep(@heartbeat / 2.0)
         end
       end
+    end
+
+    # Whether a register answer comes from a server that speaks this node's protocol (§12.2).
+    def speaks_v2?(answer)
+      reply = JSON.parse(answer.to_s)
+      reply.is_a?(Hash) && reply["protocolVersion"] == PROTOCOL_VERSION
+    rescue JSON::ParserError
+      false
     end
 
     def deregister

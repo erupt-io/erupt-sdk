@@ -14,6 +14,14 @@ class Post
   field :at, "At", Time
 end
 
+class Review
+  extend Erupt::Model
+  erupt "Review"
+  field :id, pk: true
+  field :rating, "Rating", Float, type: Erupt::EditType::RATE
+  field :progress, "Progress", Integer, type: Erupt::EditType::SLIDER
+end
+
 class SqlRepositoryTest < Minitest::Test
   # Records statements the way a driver receives them; answers like pg does (text, upper-case columns).
   def fake(dialect)
@@ -84,6 +92,18 @@ class SqlRepositoryTest < Minitest::Test
     assert_equal [["SELECT COUNT(*) AS n FROM \"post\" #{where}", ["u", "x", 1]],
                   ["SELECT * FROM \"post\" #{where} ORDER BY \"id\" ASC LIMIT $4 OFFSET $5", ["u", "x", 1, 10, 0]]], log
     assert_raises(ArgumentError) { repo.page(Erupt::Query.new(filters: [["owner = ? OR ?", ["u"]]])) }
+  end
+
+  # RATE and SLIDER hold numbers: stored in a numeric column, read back as numbers even from a TEXT one (pg's text)
+  def test_rate_and_slider_are_numbers
+    executor = Erupt::SqlExecutor.new(:postgres) { |sql, _| sql.start_with?("SELECT") ? [{ "id" => "1", "rating" => "4.5", "progress" => "60" }] : [] }
+    repo = Erupt::SqlRepository.new(executor, "review")
+    repo.bind(Review.erupt_model)
+    assert_equal({ "id" => 1, "rating" => 4.5, "progress" => 60 }, repo.get(1))
+    created = []
+    sqlite = Erupt::SqlExecutor.new(:sqlite) { |sql, _| created << sql && [] }
+    Erupt::SqlRepository.new(sqlite, "review", auto_create: true).bind(Review.erupt_model)
+    assert_includes created.first, '"rating" NUMERIC, "progress" NUMERIC'
   end
 
   def test_identifiers_are_quoted_and_checked

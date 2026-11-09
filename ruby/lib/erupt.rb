@@ -3,7 +3,6 @@
 # Erupt node SDK: give any Ruby service an erupt admin UI through an erupt cloud server.
 require_relative "erupt/version"
 require_relative "erupt/types"
-require_relative "erupt/schema"
 require_relative "erupt/signature"
 require_relative "erupt/model"
 require_relative "erupt/repository"

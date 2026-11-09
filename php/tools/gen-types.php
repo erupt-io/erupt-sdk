@@ -1,11 +1,12 @@
 <?php
 /**
- * Sync the erupt schemas into resources/ and generate src/Types/ from them.
+ * Generate src/Types/ from the erupt annotation schema. The SDK embeds no schema at run time: the server
+ * completes and checks builds (PROTOCOL.md §12.3).
  *
- *   php tools/gen-types.php <erupt schema dir>          copy schemas, regenerate types
+ *   php tools/gen-types.php <erupt schema dir>          regenerate types
  *   php tools/gen-types.php <erupt schema dir> --check  exit 1 when anything is out of date (CI)
  *
- * Inputs are generated in the erupt repository by erupt-test NodeSchemaTest / NodeDefaultsTest.
+ * The input is generated in the erupt repository by erupt-test NodeSchemaTest.
  */
 
 const PRIMITIVES = ['string' => 'string', 'integer' => 'int', 'number' => 'float', 'boolean' => 'bool'];
@@ -61,15 +62,12 @@ if (PHP_SAPI === 'cli' && realpath($argv[0] ?? '') === __FILE__) {
     }
     $root = dirname(__DIR__);
     $expected = [];
-    foreach (['erupt-annotations.schema.json', 'erupt-node-defaults.json'] as $file) {
-        $source = rtrim($args[0], '/') . "/$file";
-        if (!is_file($source)) {
-            fwrite(STDERR, "missing $source\n");
-            exit(2);
-        }
-        $expected["$root/resources/$file"] = file_get_contents($source);
+    $source = rtrim($args[0], '/') . '/erupt-annotations.schema.json';
+    if (!is_file($source)) {
+        fwrite(STDERR, "missing $source\n");
+        exit(2);
     }
-    $schema = json_decode($expected["$root/resources/erupt-annotations.schema.json"], true, 512, JSON_THROW_ON_ERROR);
+    $schema = json_decode(file_get_contents($source), true, 512, JSON_THROW_ON_ERROR);
     foreach (generate($schema) as $file => $content) {
         $expected["$root/src/Types/$file"] = $content;
     }

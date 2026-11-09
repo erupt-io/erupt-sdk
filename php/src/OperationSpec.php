@@ -18,7 +18,6 @@ final class OperationSpec
             throw new \InvalidArgumentException("operation $this->code: mode '$decl->mode' is not a RowOperationMode, expected one of "
                 . implode(', ', array_column(RowOperationMode::cases(), 'value')));
         }
-        Schema::check('RowOperation', $decl->raw, "operation $this->code");
         if ($decl->form !== null) {
             Model::of($decl->form);
         }
@@ -42,14 +41,8 @@ final class OperationSpec
     public function build(): array
     {
         $d = $this->decl;
-        $tpl = Schema::defaults()['rowOperation'];
-        $tpl['code'] = $this->code;
-        $tpl['title'] = $d->title;
-        $tpl['mode'] = $d->mode;
-        $tpl['tip'] = $d->tip;
-        $tpl['ifExpr'] = $d->ifExpr;
-        $tpl['type'] = 'ERUPT';
-        $tpl['eruptClass'] = $d->form === null ? 'void' : $this->formModel()->name;
+        $tpl = ['code' => $this->code, 'title' => $d->title, 'mode' => $d->mode, 'tip' => $d->tip, 'ifExpr' => $d->ifExpr,
+            'eruptClass' => $d->form === null ? 'void' : $this->formModel()->name];
         if ($d->icon !== null) {
             $tpl['icon'] = $d->icon;
         }

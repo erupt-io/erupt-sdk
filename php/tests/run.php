@@ -10,13 +10,13 @@ use Erupt\Cond;
 use Erupt\DataProxy;
 use Erupt\Fail;
 use Erupt\FieldSpec;
+use Erupt\Json;
 use Erupt\MemoryRepository;
 use Erupt\Model;
 use Erupt\Node;
 use Erupt\OperationContext;
 use Erupt\PdoRepository;
 use Erupt\Query;
-use Erupt\Schema;
 use Erupt\Signature;
 
 require __DIR__ . '/../autoload.php';
@@ -171,7 +171,7 @@ final class Order
     public static function refuse(array $form): array { throw new Fail('not now'); }
 }
 
-#[Erupt('Author', raw: ['drills' => [['title' => 'Books', 'link' => ['linkErupt' => 'Book', 'joinColumn' => 'author.id']]]])]
+#[Erupt('Author', raw: ['drills' => [['title' => 'Books', 'link' => ['linkErupt' => 'Book', 'joinColumn' => 'author.id', 'linkCondition' => "title <> 'c'"]]]])]
 final class Author
 {
     #[Field(pk: true)] public int $id;
@@ -191,17 +191,14 @@ final class Book
     #[Field('Shelf', edit: ['referenceTableType' => ['dependField' => 'author', 'dependColumn' => 'parent']])] public ?Tag $shelf;
 }
 
-#[Erupt('Bad1')] final class BadEditKey { #[Field(pk: true)] public int $id; #[Field('T', edit: ['inputTyp' => ['length' => 9]])] public string $t; }
-#[Erupt('Bad2')] final class BadViewType { #[Field(pk: true)] public int $id; #[Field('T', view: ['sortable' => 'yes'])] public string $t; }
+// attribute names and values the schema refuses: the server's to check now (PROTOCOL.md §12.3)
+#[Erupt('Lenient', raw: ['layout' => ['pageSiz' => 10]])]
+final class Lenient { #[Field(pk: true)] public int $id; #[Field('T', edit: ['inputTyp' => ['length' => 9]], view: ['sortable' => 'yes'])] public string $t; }
 #[Erupt('Bad3')] final class BadEditType { #[Field(pk: true)] public int $id; #[Field('T', type: 'INPUTT')] public string $t; }
-#[Erupt('Bad4')] final class BadOperator { #[Field(pk: true)] public int $id; #[Field('T', edit: ['search' => ['operator' => 'ABOUT']])] public string $t; }
-#[Erupt('Bad5', raw: ['orderBy' => 'id'])] final class BadRaw { #[Field(pk: true)] public int $id; }
-#[Erupt('Bad6', raw: ['layout' => ['pageSize' => '10']])] final class BadRawType { #[Field(pk: true)] public int $id; }
 #[Erupt('Bad7', orderBy: 'missing desc')] final class BadOrder { #[Field(pk: true)] public int $id; }
 #[Erupt('Bad10', raw: ['vis' => [['title' => 'V', 'type' => 'TABLE', 'orderBy' => 'missing']]])] final class BadVisOrder { #[Field(pk: true)] public int $id; }
 #[Erupt('Bad8', power: ['remove' => false])] final class BadPower { #[Field(pk: true)] public int $id; }
 #[Erupt('Bad9')] final class BadMode { #[Field(pk: true)] public int $id; #[Operation('Go', mode: 'ALL')] public static function go(): void {} }
-#[Erupt('Bad10')] final class BadOpRaw { #[Field(pk: true)] public int $id; #[Operation('Go', raw: ['colour' => 'red'])] public static function go(): void {} }
 #[Erupt('Bad11')] final class BadOpStatic { #[Field(pk: true)] public int $id; #[Operation('Go')] public function go(): void {} }
 #[Erupt('Bad12')] final class BadLabel { #[Field(pk: true)] public int $id; #[Field('Tag', label: 'title')] public ?Tag $tag; }
 #[Erupt('Bad13')] final class TwoPks { #[Field(pk: true)] public int $id; #[Field(pk: true)] public int $id2; }
@@ -210,6 +207,7 @@ final class Book
 #[Erupt('Bad16')] final class BadFetch { #[Field(pk: true)] public int $id; #[Field('T', type: 'TAGS', fetch: 'missing')] public string $t; }
 #[Erupt('Bad17')] final class BadCheckbox { #[Field(pk: true)] public int $id; #[Field('T', type: 'CHECKBOX')] public array $t; }
 #[Erupt('Bad18', raw: ['drills' => [['title' => 'D', 'link' => ['linkErupt' => 'Tag']]]])] final class BadDrill { #[Field(pk: true)] public int $id; }
+#[Erupt('Bad19', power: ['print' => false, 'sing' => false])] final class BadPowerKey { #[Field(pk: true)] public int $id; }
 
 // ---------------------------------------------------------------- runner
 
@@ -247,21 +245,45 @@ function throws(string $pattern, callable $fn, string $what = ''): void
     throw new \RuntimeException("$what: nothing thrown");
 }
 
+/** The Erupt-Enforced a v2 server sends to an endpoint (PROTOCOL.md §12.2). */
+function enforcedFor(string $method, string $target): string
+{
+    $path = (string) parse_url($target, PHP_URL_PATH);
+    return match (true) {
+        $method === 'GET' && str_starts_with($path, '/erupt-api/build/') => '',
+        str_starts_with($path, '/erupt-api/data/table/') => 'power,query',
+        $method === 'POST' && preg_match('#^/erupt-api/data/modify/[^/]+(/update)?$#', $path) === 1 => 'power,record',
+        default => 'power',
+    };
+}
+
+/**
+ * A call to $node for $erupt signed as a v2 server signs it, with the Erupt-Enforced its endpoint needs unless
+ * $enforced says otherwise; $headers are added unsigned. [status, decoded body]
+ */
+function signedCall(Node $node, string $erupt, string $method, string $target, mixed $body = null, ?string $enforced = null,
+                    array $headers = [], string $user = 'dXNlcg=='): array
+{
+    $raw = is_string($body) ? $body : ($body === null ? '' : json_encode($body));
+    $enforced ??= enforcedFor($method, $target);
+    $ts = time();
+    $headers += ['erupt' => $erupt, 'user' => $user, 'Erupt-Timestamp' => (string) $ts]
+        + ($enforced === '' ? [] : ['Erupt-Enforced' => $enforced]);
+    $headers['Erupt-Signature'] ??= Signature::sign('secret', $method, $target, $ts, $enforced, $user, $raw);
+    $response = $node->handle($method, (string) parse_url($target, PHP_URL_PATH), $headers, $raw, [], $target);
+    return [$response->status, json_decode($response->body, true) ?? $response->body];
+}
+
 // ---------------------------------------------------------------- tests
 
-$test('declarations are checked against the schema', function () {
+$test('declarations are checked', function () {
     $cases = [
-        [BadEditKey::class, "/Edit has no attribute 'inputTyp'/"],
-        [BadViewType::class, '/expected boolean/'],
         [BadEditType::class, '/is not a EditType/'],
-        [BadOperator::class, '/is not a QueryExpression/'],
-        [BadRaw::class, "/Erupt has no attribute 'orderBy'/"],
-        [BadRawType::class, '/expected integer/'],
         [BadOrder::class, '/illegal orderBy/'],
         [BadVisOrder::class, "/illegal orderBy 'missing'/"],
         [BadPower::class, '/unknown power remove/'],
+        [BadPowerKey::class, '/unknown power sing, expected some of add, edit/'],
         [BadMode::class, '/is not a RowOperationMode/'],
-        [BadOpRaw::class, "/RowOperation has no attribute 'colour'/"],
         [BadOpStatic::class, '/public static/'],
         [BadLabel::class, "/has no field 'title'/"],
         [TwoPks::class, '/at most one/'],
@@ -274,45 +296,59 @@ $test('declarations are checked against the schema', function () {
     foreach ($cases as [$class, $pattern]) {
         throws($pattern, fn() => Model::of($class), $class);
     }
+    // attribute names and values are the server's to refuse: they travel as declared
+    $m = Model::of(Lenient::class)->buildErupt();
+    eq(['pageSiz' => 10], $m['eruptJson']['layout'], 'raw erupt as declared');
+    eq([['length' => 9], [['title' => 'T', 'sortable' => 'yes']]],
+        [$m['eruptFieldModels'][1]['eruptFieldJson']['edit']['inputTyp'], $m['eruptFieldModels'][1]['eruptFieldJson']['views']], 'raw field as declared');
 });
 
-$test('build follows the templates and the schema', function () {
-    $build = Model::of(Post::class)->buildModel(Schema::defaults()['power'], null);
+$test('build is declared only', function () {
+    $build = Model::of(Post::class)->buildModel(['delete' => false], null);
     $m = $build['eruptModel'];
-    eq(30, $m['eruptJson']['layout']['pageSize'], 'raw erupt');
-    eq('{}', json_encode($m['eruptJson']['extra']), 'empty objects stay objects');
+    eq(['primaryKeyCol' => 'id', 'rowOperation' => [['code' => 'touch', 'title' => 'Touch', 'mode' => 'SINGLE', 'tip' => '', 'ifExpr' => '',
+        'eruptClass' => 'void', 'callHint' => 'Sure?']], 'layout' => ['pageSize' => 30]], $m['eruptJson'], 'eruptJson');
+    eq(['delete' => false], $build['power'], 'power: what the model switches off');
     $fields = array_column($m['eruptFieldModels'], null, 'fieldName');
-    eq(['NUMBER', 'INPUT', 'NUMBER', 'BOOLEAN', 'DATE', 'DATE', 'CHOICE', 'REFERENCE_TABLE'],
-        array_map(fn($f) => $f['eruptFieldJson']['edit']['type'], array_values($fields)), 'types');
-    eq('DATE_TIME', $fields['at']['eruptFieldJson']['edit']['dateType']['type'], 'DATE_TIME template');
-    eq(9, $fields['title']['eruptFieldJson']['edit']['inputType']['length'], 'raw edit');
-    eq('Tag', $fields['tag']['fieldReturnName'], 'reference return name');
-    eq('Sure?', $m['eruptJson']['rowOperation'][0]['callHint'], 'confirm text');
-    Schema::check('Erupt', $m['eruptJson'], 'Post', false);
-    foreach ($m['eruptFieldModels'] as $f) {
-        Schema::check('EruptField', $f['eruptFieldJson'], $f['fieldName'], false);
-    }
+    eq(['fieldName' => 'id', 'fieldReturnName' => 'number', 'componentValue' => null,
+        'eruptFieldJson' => ['edit' => ['title' => '', 'type' => 'NUMBER']]], $fields['id'], 'pk');
+    eq(['fieldName' => 'title', 'fieldReturnName' => 'String', 'componentValue' => null, 'eruptFieldJson' => [
+        'edit' => ['title' => 'Title', 'type' => 'INPUT', 'notNull' => true, 'search' => ['value' => true], 'inputType' => ['length' => 9]],
+        'views' => [['title' => 'Title', 'sortable' => true]]]], $fields['title'], 'title');
+    eq(['edit' => ['title' => 'At', 'type' => 'DATE', 'dateType' => ['type' => 'DATE_TIME']], 'views' => [['title' => 'At']]],
+        $fields['at']['eruptFieldJson'], 'DATE_TIME: a DATE that says so, no view type');
+    eq(['title' => 'Day', 'type' => 'DATE', 'dateType' => ['type' => 'DATE'], 'search' => ['value' => true]],
+        $fields['day']['eruptFieldJson']['edit'], 'DATE');
+    eq(['Date', 'Date', 'number', 'Boolean', 'String'], array_map(fn($n) => $fields[$n]['fieldReturnName'], ['at', 'day', 'views', 'live', 'kind']), 'return names');
+    eq(['fieldName' => 'tag', 'fieldReturnName' => 'Tag', 'componentValue' => null, 'eruptFieldJson' => [
+        'edit' => ['title' => 'Tag', 'type' => 'REFERENCE_TABLE', 'search' => ['value' => true], 'referenceTableType' => ['id' => 'id', 'label' => 'name']],
+        'views' => [['title' => 'Tag', 'column' => 'name']]]], $fields['tag'], 'reference');
+    eq(['a', 'b'], array_column($fields['kind']['componentValue'], 'value'), 'choice options');
+    eq('{}', json_encode(Model::of(Memo::class)->buildModel([], null)['eruptModel']['tags']), 'empty objects stay objects');
+    $hidden = Model::of(Order::class)->buildErupt()['eruptFieldModels'];
+    eq([[], ['title' => 'Calc', 'type' => 'BUTTON']], [$hidden[10]['eruptFieldJson']['views'], $hidden[10]['eruptFieldJson']['edit']], 'BUTTON: no column');
 });
 
 $test('generated files are current', function () {
-    $root = dirname(__DIR__);
-    $schema = json_decode(file_get_contents("$root/resources/erupt-annotations.schema.json"), true);
+    $schema = json_decode(file_get_contents(dirname(__DIR__, 2) . '/schema/erupt-annotations.schema.json'), true);
     foreach (\generate($schema) as $file => $content) {
-        eq($content, file_get_contents("$root/src/Types/$file"), $file);
+        eq($content, file_get_contents(dirname(__DIR__) . "/src/Types/$file"), $file);
     }
 });
 
-$test('values are coerced like the python SDK', function () {
+$test('values become storage types', function () {
     $f = Model::of(Post::class)->fields;
     eq('2026-01-05T10:30:00.000', $f['at']->coerce('2026-01-05 10:30:00'), 'datetime');
     eq('2026-01-05T10:30:00.123', $f['at']->coerce('2026-01-05T10:30:00.123Z'), 'datetime with T / Z');
     eq('2026-01-05', $f['day']->coerce('2026-01-05 10:30'), 'date from a datetime');
-    eq(3, $f['views']->coerce('3'), 'integral number');
+    eq(3, $f['views']->coerce('3'), 'integral number, as a driver reads it');
     eq(2.5, $f['views']->coerce(2.5), 'float');
-    eq(true, $f['live']->coerce('true'), 'bool');
-    eq(2, $f['tag']->coerce(['id' => '2', 'name' => 'x']), 'reference object');
+    eq(true, $f['live']->coerce(1), 'bool, as a driver reads it');
+    eq(2, $f['tag']->coerce('2'), 'reference key');
     eq(null, $f['title']->coerce(''), 'empty');
-    foreach ([['day', 'someday'], ['day', '2026-02-30'], ['views', 'many'], ['kind', 'c'], ['title', ['x']]] as [$name, $value]) {
+    // no validation: the server checked the record (§12.4)
+    eq('c', $f['kind']->coerce('c'), 'an option the server let through');
+    foreach ([['day', 'someday'], ['views', 'many'], ['title', ['x']], ['id', 'abc']] as [$name, $value]) {
         throws('/./', fn() => $f[$name]->coerce($value), "$name " . json_encode($value));
     }
 });
@@ -387,58 +423,90 @@ $test('signature agrees with the Java vectors', function () {
     }
 });
 
-$test('handle() serves the protocol', function () {
+$posts = fn() => (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))
+    ->register(Tag::class, new MemoryRepository([['name' => 'Tech'], ['name' => 'Php', 'parent' => 1]]))
+    ->register(Post::class, new MemoryRepository());
+
+$test('every call is signed with what its endpoint needs', function () use ($posts) {
+    $node = $posts();
+    $call = fn(string $method, string $target, mixed $body = null, ?string $enforced = null, array $headers = []) =>
+        signedCall($node, 'Post', $method, $target, $body, $enforced, $headers);
+    eq([200, 'n'], [($r = $node->handle('GET', '/node-health', []))->status, $r->body], 'health');
+    eq(403, $call('GET', '/erupt-api/build/Post', null, null, ['Origin' => 'x'])[0], 'origin');
+    // no plain Access-Token any more
+    eq(403, $node->handle('GET', '/erupt-api/build/Post', ['Access-Token' => 'secret', 'erupt' => 'Post'])->status, 'unsigned');
+    eq(200, $call('GET', '/erupt-api/build/Post?_probe=1')[0], 'signed build: nothing enforced');
+    eq(403, $call('GET', '/erupt-api/build/Post', null, null, ['Erupt-Signature' => str_repeat('0', 64)])[0], 'wrong signature');
+    eq(403, $call('GET', '/erupt-api/build/Post', null, '', ['Erupt-Enforced' => 'power'])[0], 'enforced added after signing');
+    // each endpoint refuses a call whose Erupt-Enforced lacks what it needs
+    foreach ([['POST', '/erupt-api/data/table/Post', [], 'power'], ['POST', '/erupt-api/data/modify/Post', ['title' => 'x'], 'power'],
+                 ['POST', '/erupt-api/data/modify/Post/update', ['id' => 1], 'power,query'], ['POST', '/erupt-api/data/modify/Post/delete', [1], ''],
+                 ['GET', '/erupt-api/data/Post/1', null, ''], ['GET', '/erupt-api/data/init-value/Post', null, 'query'],
+                 ['POST', '/erupt-api/invoke/Post/operation/touch', ['ids' => [1]], 'record']] as [$method, $target, $body, $enforced]) {
+        eq(403, $call($method, $target, $body, $enforced)[0], "$target under '$enforced'");
+    }
+    eq(404, $call('GET', '/erupt-api/build/Missing', null, null, ['erupt' => 'Missing'])[0], 'unknown erupt');
+    eq(404, $call('GET', '/erupt-api/build/Tag')[0], 'header / path mismatch');
+    eq(404, $call('GET', '/erupt-api/build/Post', null, null, ['eruptParent' => 'n.Tag'])[0], 'foreign parent');
+    eq(200, $call('GET', '/erupt-api/build/Post', null, null, ['eruptParent' => 'n.Post'])[0], 'self parent');
+    eq(404, $call('GET', '/erupt-api/nothing/here')[0], 'unknown path');
+    eq(404, $call('POST', '/erupt-api/data/Post/operator/touch', ['ids' => [1]])[0], 'the old operation route');
+    eq(404, $call('GET', '/erupt-api/data/Post/reference-tree/tag')[0], 'reference-tree is the server\'s');
+    eq(404, $call('POST', '/erupt-api/data/Post/reference-table/tag', [])[0], 'the picker is the server\'s');
+});
+
+$test('handle() serves normalized requests', function () use ($posts) {
+    $node = $posts();
+    $call = fn(string $method, string $target, mixed $body = null) => signedCall($node, 'Post', $method, $target, $body);
+    eq(true, $call('POST', '/erupt-api/data/modify/Post', ['title' => 'Hello', 'views' => 4, 'tag' => 2, 'at' => '2026-01-05 10:30:00'])[1]['success'], 'add');
+    // the server checked the record: the node no longer refuses an empty notNull field
+    eq(true, $call('POST', '/erupt-api/data/modify/Post', ['views' => 1])[1]['success'], 'no not-null check');
+    [$status, $page] = $call('POST', '/erupt-api/data/table/Post', ['pageIndex' => 1, 'pageSize' => 10]);
+    $row = $page['list'][1];
+    // a reference travels as its key: the server resolves the label and the flattened column
+    eq([200, 4, 2, '2026-01-05T10:30:00.000'], [$status, $row['views'], $row['tag'], $row['at']], 'row');
+    eq(false, array_key_exists('tag_name', $row), 'no flattened reference column');
+    $table = fn(array $body) => $call('POST', '/erupt-api/data/table/Post', $body)[1];
+    $titles = fn(array $condition, array $sort = []) => array_column($table(['condition' => $condition, 'sort' => $sort])['list'], 'title');
+    // conditions on any stored field, the primary key and fields without a search among them
+    eq(['Hello'], $titles([['key' => 'at', 'expression' => 'RANGE', 'value' => ['2026-01-05 10:00:00', '2026-01-05 11:00:00']]]), 'RANGE on a date time');
+    eq([], $titles([['key' => 'id', 'expression' => 'NULL']]), 'NULL on the primary key');
+    eq(['Hello'], $titles([['key' => 'id', 'expression' => 'IN', 'value' => [1]]]), 'IN on the primary key');
+    eq(['Hello'], $titles([['key' => 'title', 'expression' => 'LIKE', 'value' => 'ell']]), 'LIKE');
+    eq(['Hello', null], $titles([], [['field' => 'tag.name', 'direction' => 'ASC']]), 'sort by a reference column: its key');
+    eq(['Hello', null], $titles([], [['field' => 'views', 'direction' => 'DESC']]), 'sort');
+    eq(2, count($titles([], [['field' => 'live', 'direction' => 'DESC']])), 'sort by a field that is not sortable');
+    foreach (['DROP', null, 'AUTO'] as $op) {
+        eq(false, $table(['condition' => [['key' => 'title', 'expression' => $op, 'value' => 'x']]])['success'], "operator " . json_encode($op) . ' refused');
+    }
+    eq(false, $table(['condition' => [['key' => 'nope', 'expression' => 'EQ', 'value' => 1]]])['success'], 'unknown field');
+    eq(false, $table(['sort' => [['field' => 'nope', 'direction' => 'ASC']]])['success'], 'unknown sort field');
+    eq(1000, $table(['pageSize' => 100000])['pageSize'], 'page size cap');
+    eq(false, $call('GET', '/erupt-api/data/Post/abc')[1]['success'], 'illegal id');
+    eq(false, $call('POST', '/erupt-api/data/modify/Post/delete', ['id' => 1])[1]['success'], 'delete needs a list');
+    eq(false, $call('POST', '/erupt-api/invoke/Post/operation/touch', ['ids' => [1, 2]])[1]['success'], 'SINGLE takes one row');
+    eq('ok()', $call('POST', '/erupt-api/invoke/Post/operation/touch', ['ids' => [1]])[1]['data'], 'script');
+    eq('malformed JSON body', $call('POST', '/erupt-api/data/modify/Post', '{x')[1]['message'], 'malformed body');
+    eq(404, $call('POST', '/erupt-api/invoke/Post/operation/missing', [])[0], 'unknown operation');
+    eq([200, null], [($r = $call('POST', '/erupt-api/invoke/Post/operation-form/touch', []))[0], $r[1]['data']], 'an operation without a form');
+});
+
+$test('registration speaks protocol v2', function () {
     [$server, $port] = fakeServer();
+    $log = ini_set('error_log', '/dev/null');
     try {
-        $node = (new Node('n', 'secret', "http://127.0.0.1:$port", 'http://127.0.0.1:1'))
-            ->register(Tag::class, new MemoryRepository([['name' => 'Tech'], ['name' => 'Php', 'parent' => 1]]))
-            ->register(Post::class, new MemoryRepository());
-        $call = function (string $method, string $path, mixed $body = null, array $headers = []) use ($node) {
-            $r = $node->handle($method, $path, $headers + ['Access-Token' => 'secret', 'erupt' => 'Post', 'token' => 't1'],
-                $body === null ? '' : json_encode($body));
-            return [$r->status, json_decode($r->body, true) ?? $r->body];
-        };
-        eq([200, 'n'], $call('GET', '/node-health'), 'health');
-        eq(403, $call('GET', '/erupt-api/build/Post', null, ['Origin' => 'x'])[0], 'origin');
-        eq(403, $call('GET', '/erupt-api/build/Post', null, ['Access-Token' => 'nope'])[0], 'token');
-        eq(403, $call('POST', '/erupt-api/data/modify/Post', ['title' => 'x'], ['token' => 'down'])[0], 'fails closed');
-        eq(true, $call('POST', '/erupt-api/data/modify/Post', ['title' => 'Hello', 'views' => '4', 'tag' => ['id' => 2, 'name' => 'Php'],
-            'at' => '2026-01-05 10:30:00'])[1]['success'], 'add');
-        [$status, $page] = $call('POST', '/erupt-api/data/table/Post', ['pageIndex' => 1, 'pageSize' => 10]);
-        $row = $page['list'][0];
-        // a reference travels as its key: the server resolves the label and the flattened column
-        eq([200, 4, 2, '2026-01-05T10:30:00.000'], [$status, $row['views'], $row['tag'], $row['at']], 'row');
-        eq(false, array_key_exists('tag_name', $row), 'no flattened reference column');
-        eq(false, $call('POST', '/erupt-api/invoke/Post/operation/touch', ['ids' => [1, 2]])[1]['success'], 'SINGLE takes one row');
-        eq('ok()', $call('POST', '/erupt-api/invoke/Post/operation/touch', ['ids' => [1]])[1]['data'], 'script');
-        $malformed = $node->handle('POST', '/erupt-api/data/modify/Post', ['Access-Token' => 'secret', 'erupt' => 'Post', 'token' => 't1'], '{x');
-        eq([200, 'malformed JSON body'], [$malformed->status, json_decode($malformed->body, true)['message']], 'malformed body');
-        eq(404, $call('POST', '/erupt-api/invoke/Post/operation/missing', [])[0], 'unknown operation');
-        eq([200, null], [($r = $call('POST', '/erupt-api/invoke/Post/operation-form/touch', []))[0], $r[1]['data']], 'an operation without a form');
-        eq(404, $call('POST', '/erupt-api/data/Post/operator/touch', ['ids' => [1]])[0], 'the old operation route');
-        eq(404, $call('GET', '/erupt-api/data/Post/reference-tree/tag')[0], 'reference-tree is the server\'s');
-        eq(404, $call('POST', '/erupt-api/data/Post/reference-table/tag', [])[0], 'the picker is the server\'s');
-        // signed calls: no token needed; Erupt-Enforced: power skips the (failing) erupt-power callback
-        $signed = function (string $method, string $target, mixed $body, ?string $enforced, array $over = []) use ($node) {
-            $raw = $body === null ? '' : json_encode($body);
-            $ts = time();
-            $headers = ['erupt' => 'Post', 'token' => 'down', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts]
-                + ($enforced === null ? [] : ['Erupt-Enforced' => $enforced]);
-            $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, $enforced, 'dXNlcg==', $raw);
-            $path = (string) parse_url($target, PHP_URL_PATH);
-            return $node->handle($method, $path, $over + $headers, $raw, [], $target)->status;
-        };
-        eq(200, $signed('GET', '/erupt-api/build/Post?_probe=1', null, null), 'signed, no token');
-        eq(200, $signed('POST', '/erupt-api/data/modify/Post', ['title' => 'Signed'], 'power,record'), 'enforced power: no callback');
-        eq(403, $signed('POST', '/erupt-api/data/modify/Post', ['title' => 'Signed'], null), 'signed without power: fails closed');
-        eq(403, $signed('GET', '/erupt-api/build/Post', null, null, ['Erupt-Signature' => str_repeat('0', 64)]), 'wrong signature');
-        eq(403, $signed('GET', '/erupt-api/build/Post', null, null, ['Erupt-Enforced' => 'power']), 'enforced added after signing');
-        eq(403, $call('POST', '/erupt-api/data/modify/Post', ['title' => 'x'], ['token' => 'down', 'Erupt-Enforced' => 'power'])[0],
-            'unsigned Erupt-Enforced ignored');
-        $strict = (new Node('n', 'secret', "http://127.0.0.1:$port", 'http://127.0.0.1:1', requireSignature: true))
-            ->register(Tag::class, new MemoryRepository())->register(Post::class, new MemoryRepository());
-        eq(403, $strict->handle('GET', '/erupt-api/build/Post', ['Access-Token' => 'secret', 'erupt' => 'Post'])->status, 'requireSignature');
+        $node = new Node('n', 'secret', "http://127.0.0.1:$port", 'http://127.0.0.1:1');
+        eq([true, false], [$node->registerOnce(), $node->stopped()], 'a v2 server');
+        $down = new Node('n', 'secret', "http://127.0.0.1:$port/down", 'http://127.0.0.1:1');
+        eq([false, false], [$down->registerOnce(), $down->stopped()], 'a failing server is retried');
+        // an older server answers no version: registering stops for good, no retry and no v1 fallback
+        $old = new Node('n', 'secret', "http://127.0.0.1:$port/old", 'http://127.0.0.1:1', 1);
+        $start = microtime(true);
+        $old->heartbeat();
+        eq(true, $old->stopped(), 'an older server stops it');
+        eq(true, microtime(true) - $start < 0.5, 'without waiting for another heartbeat');
     } finally {
+        ini_set('error_log', (string) $log);
         proc_terminate($server);
         proc_close($server);
     }
@@ -448,13 +516,7 @@ $test('virtual and JSON fields', function () {
     $db = tempnam(sys_get_temp_dir(), 'erupt-php');
     foreach ([new MemoryRepository(), new PdoRepository(new \PDO("sqlite:$db"), 'widget')] as $repo) {
         $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Widget::class, $repo);
-        $call = function (string $method, string $target, mixed $body = null) use ($node) {
-            $raw = $body === null ? '' : json_encode($body);
-            $ts = time();
-            $headers = ['erupt' => 'Widget', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
-            $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', 'dXNlcg==', $raw);
-            return json_decode($node->handle($method, $target, $headers, $raw, [], $target)->body, true);
-        };
+        $call = fn(string $method, string $target, mixed $body = null) => signedCall($node, 'Widget', $method, $target, $body)[1];
         $build = $call('GET', '/erupt-api/build/Widget');
         $fields = $build['eruptModel']['eruptFieldModels'];
         eq(['id' => 'NUMBER', 'name' => 'INPUT', 'basic' => 'DIVIDE', 'roles' => 'MULTI_CHOICE', 'attrs' => 'KEY_VALUE'],
@@ -462,14 +524,13 @@ $test('virtual and JSON fields', function () {
         eq(['Admin', 'User', 'Guest'], array_column($fields[3]['componentValue'], 'label'), 'options');
         eq(true, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'A', 'roles' => ['ADMIN', 'USER'], 'attrs' => ['env' => 'prod'], 'basic' => 'x'])['success'], 'add A');
         eq(true, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'B', 'roles' => ['GUEST'], 'attrs' => new \stdClass()])['success'], 'add B');
-        eq(false, $call('POST', '/erupt-api/data/modify/Widget', ['name' => 'C', 'roles' => ['ROOT']])['success'], 'illegal option');
         $page = $call('POST', '/erupt-api/data/table/Widget', ['pageIndex' => 1, 'pageSize' => 10]);
         eq(['id' => 1, 'name' => 'A', 'roles' => ['ADMIN', 'USER'], 'attrs' => ['env' => 'prod']], $page['list'][0], 'row');
         $ts = time();
-        $body = json_encode(['pageIndex' => 1, 'pageSize' => 10]);
-        $headers = ['erupt' => 'Widget', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power',
-            'Erupt-Signature' => Signature::sign('secret', 'POST', '/erupt-api/data/table/Widget', $ts, 'power', 'dXNlcg==', $body)];
-        eq('{}', json_encode(json_decode($node->handle('POST', '/erupt-api/data/table/Widget', $headers, $body)->body)->list[1]->attrs), 'empty object stays {}');
+        $headers = ['erupt' => 'Widget', 'user' => 'u', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power,query',
+            'Erupt-Signature' => Signature::sign('secret', 'POST', '/erupt-api/data/table/Widget', $ts, 'power,query', 'u', '{}')];
+        $response = $node->handle('POST', '/erupt-api/data/table/Widget', $headers, '{}');
+        eq('{}', json_encode(json_decode($response->body)->list[1]->attrs), 'empty object stays {}');
         $found = $call('POST', '/erupt-api/data/table/Widget', ['condition' => [['key' => 'roles', 'expression' => 'IN', 'value' => ['GUEST']]]]);
         eq(['B'], array_column($found['list'], 'name'), 'search');
         eq(['env' => 'prod'], $call('GET', '/erupt-api/data/Widget/1')['attrs'], 'by id');
@@ -479,13 +540,7 @@ $test('virtual and JSON fields', function () {
 
 $test('DataProxy hooks', function () {
     $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Memo::class, new MemoryRepository());
-    $call = function (string $method, string $target, mixed $body = null) use ($node) {
-        $raw = $body === null ? '' : json_encode($body);
-        $ts = time();
-        $headers = ['erupt' => 'Memo', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
-        $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', 'dXNlcg==', $raw);
-        return json_decode($node->handle($method, $target, $headers, $raw, [], $target)->body, true);
-    };
+    $call = fn(string $method, string $target, mixed $body = null) => signedCall($node, 'Memo', $method, $target, $body)[1];
     eq(['text' => 'hi'], $call('GET', '/erupt-api/build/Memo')['eruptModel']['searchCondition'], 'searchCondition');
     eq('new', $call('GET', '/erupt-api/data/init-value/Memo')['text'], 'addBehavior');
     $r = $call('POST', '/erupt-api/data/modify/Memo', ['text' => 'forbidden']);
@@ -504,13 +559,7 @@ $test('DataProxy hooks', function () {
 $test('DataProxy beforeFetch', function () {
     $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Task::class, new PdoRepository(new \PDO('sqlite::memory:'), 'task'));
     $call = function (string $method, string $target, mixed $body, string $account = 'admin') use (&$node) {
-        $raw = json_encode($body);
-        $ts = time();
-        $user = base64_encode(json_encode(['uid' => 1, 'account' => $account]));
-        $headers = ['erupt' => 'Task', 'user' => $user, 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
-        $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', $user, $raw);
-        $response = $node->handle($method, $target, $headers, $raw, [], $target);
-        return [$response->status, json_decode($response->body, true)];
+        return signedCall($node, 'Task', $method, $target, $body, user: base64_encode(json_encode(['uid' => 1, 'account' => $account])));
     };
     foreach ([['a', 'admin', false], ['b', 'admin', true], ['c', 'root', false], ['a?', 'admin', false]] as [$title, $owner, $done]) {
         $call('POST', '/erupt-api/data/modify/Task', ['title' => $title, 'owner' => $owner, 'done' => $done]);
@@ -532,40 +581,29 @@ $test('DataProxy beforeFetch', function () {
     throws("/2 '\\?' for 1 params/", fn() => $repo->page(new Query(filters: [['owner = ? or owner = ?', ['admin']]])), 'placeholder count');
 });
 
-$test('LinkTree filters the table', function () {
+$test('LinkTree conditions arrive from the server', function () {
     $repo = new MemoryRepository([['title' => 'a', 'topic' => 1], ['title' => 'b', 'topic' => 2], ['title' => 'c', 'topic' => 3]]);
     $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))->register(Doc::class, $repo);
-    $titles = function (array $body) use ($node) {
-        $raw = json_encode($body);
-        $ts = time();
-        $target = '/erupt-api/data/table/Doc';
-        $headers = ['erupt' => 'Doc', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
-        $headers['Erupt-Signature'] = Signature::sign('secret', 'POST', $target, $ts, 'power', 'dXNlcg==', $raw);
-        return array_column(json_decode($node->handle('POST', $target, $headers, $raw, [], $target)->body, true)['list'], 'title');
-    };
-    eq([], $titles([]), 'dependNode: nothing until a tree node is picked');
-    eq(['b'], $titles(['linkTreeVal' => [2]]));
-    eq(['a', 'b'], $titles(['linkTreeVal' => ['1', '2']]));
+    $titles = fn(array $condition) => array_column(signedCall($node, 'Doc', 'POST', '/erupt-api/data/table/Doc', ['condition' => $condition])[1]['list'], 'title');
+    // IN on linkTree.field with the picked keys; under dependNode with nothing picked, NULL on the primary key
+    eq(['b'], $titles([['key' => 'topic', 'expression' => 'IN', 'value' => [2]]]), 'one key');
+    eq(['a', 'b'], $titles([['key' => 'topic', 'expression' => 'IN', 'value' => [1, 2]]]), 'keys');
+    eq([], $titles([['key' => 'id', 'expression' => 'NULL']]), 'dependNode: nothing picked');
+    eq(['a', 'b', 'c'], array_column(signedCall($node, 'Doc', 'POST', '/erupt-api/data/table/Doc', ['linkTreeVal' => [2]])[1]['list'], 'title'), 'linkTreeVal is the server\'s');
 });
 
 $test('field types and invoke', function () {
     $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))
         ->register(Tag::class, new MemoryRepository())->register(Order::class, new PdoRepository(new \PDO('sqlite::memory:'), 'orders'));
-    $call = function (string $method, string $target, mixed $body = null) use ($node) {
-        $raw = $body === null ? '' : json_encode($body);
-        $ts = time();
-        $headers = ['erupt' => 'Order', 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => 'power'];
-        $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, 'power', 'dXNlcg==', $raw);
-        $response = $node->handle($method, $target, $headers, $raw, [], $target);
-        return [$response->status, json_decode($response->body, true)];
-    };
+    $call = fn(string $method, string $target, mixed $body = null) => signedCall($node, 'Order', $method, $target, $body);
     $fields = array_column($call('GET', '/erupt-api/build/Order')[1]['eruptModel']['eruptFieldModels'], null, 'fieldName');
     $edit = array_map(fn($f) => $f['eruptFieldJson']['edit'], $fields);
-    eq(['invoke'], $edit['status']['choiceType']['fetchHandler'], 'choice fetchHandler');
-    eq(['invoke'], $edit['tags']['tagsType']['fetchHandler'], 'tags fetchHandler');
+    eq(['fetchHandler' => ['invoke']], $edit['status']['choiceType'], 'choice fetchHandler');
+    eq(['fetchHandler' => ['invoke']], $edit['tags']['tagsType'], 'tags fetchHandler');
     eq('invoke', $edit['qty']['onchange'], 'onchange');
     eq(['MARKDOWN', 'ATTACHMENT', 'BUTTON'], [$edit['body']['type'], $edit['files']['type'], $edit['calc']['type']], 'types');
-    eq([[], 'Tag', 'Tag'], [$fields['calc']['eruptFieldJson']['views'], $fields['cats']['fieldReturnName'], $fields['sections']['fieldReturnName']], 'button and collections');
+    eq([[], 'Tag', 'Tag', 'name'], [$fields['calc']['eruptFieldJson']['views'], $fields['cats']['fieldReturnName'], $fields['sections']['fieldReturnName'],
+        $fields['cats']['eruptFieldJson']['views'][0]['column']], 'button and collections');
     $invoke = fn(string $kind, string $field, array $form = [], ?string $value = null) =>
         $call('POST', "/erupt-api/invoke/Order/$kind/$field", ['form' => $form ?: new \stdClass(), 'value' => $value]);
     eq([['value' => 'new', 'label' => 'New'], ['value' => 'n', 'label' => 'From form']], $invoke('options', 'status', ['note' => 'n'])[1]['data'], 'options');
@@ -576,44 +614,41 @@ $test('field types and invoke', function () {
     eq([false, 'not now'], [$invoke('button', 'stop')[1]['success'], $invoke('button', 'stop')[1]['message']], 'Fail');
     eq(404, $invoke('button', 'qty')[0], 'a field without that code');
     eq(404, $invoke('options', 'missing')[0], 'unknown field');
-    // picked records arrive as [{id: key}] and are stored as their keys
-    eq(true, $call('POST', '/erupt-api/data/modify/Order', ['cats' => [['id' => 1], ['id' => '2']], 'sections' => [['id' => 3]], 'tags' => '["red"]'])[1]['success'], 'add');
+    // picked records arrive as their keys (§12.4) and are stored as such
+    eq(true, $call('POST', '/erupt-api/data/modify/Order', ['cats' => [1, 2], 'sections' => [3], 'tags' => '["red"]'])[1]['success'], 'add');
     $row = $call('POST', '/erupt-api/data/table/Order', [])[1]['list'][0];
     eq([[1, 2], [3], false], [$row['cats'], $row['sections'], array_key_exists('calc', $row)], 'row');
-    eq([5], Model::of(Order::class)->fields['cats']->coerce('[5]'), 'a JSON string');
+    eq([5], Model::of(Order::class)->fields['cats']->coerce('[5]'), 'the JSON text a SQL repository reads back');
 });
 
-/** A signed call to $node for $erupt with Erupt-Enforced $enforced; $headers are added unsigned. */
-function signedCall(Node $node, string $erupt, string $method, string $target, mixed $body = null, string $enforced = 'power', array $headers = []): array
-{
-    $raw = $body === null ? '' : json_encode($body);
-    $ts = time();
-    $headers += ['erupt' => $erupt, 'user' => 'dXNlcg==', 'Erupt-Timestamp' => (string) $ts, 'Erupt-Enforced' => $enforced];
-    $headers['Erupt-Signature'] = Signature::sign('secret', $method, $target, $ts, $enforced, 'dXNlcg==', $raw);
-    $response = $node->handle($method, $target, $headers, $raw, [], $target);
-    return [$response->status, json_decode($response->body, true)];
-}
+$books = function () {
+    $book = new PdoRepository(new \PDO('sqlite::memory:'), 'book');
+    $node = (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))
+        ->register(Tag::class, new MemoryRepository([['name' => 'Tech'], ['name' => 'Php', 'parent' => 1]]))
+        ->register(Author::class, new MemoryRepository([['name' => 'Ann'], ['name' => 'Bob']]))
+        ->register(Book::class, $book);
+    foreach ([['title' => 'a', 'author' => 1], ['title' => 'b', 'author' => 2], ['title' => 'c', 'author' => 1]] as $row) {
+        $book->add($row);
+    }
+    return $node;
+};
 
-$books = fn() => (new Node('n', 'secret', 'http://127.0.0.1:1', 'http://127.0.0.1:1'))
-    ->register(Tag::class, new MemoryRepository([['name' => 'Tech'], ['name' => 'Php', 'parent' => 1]]))
-    ->register(Author::class, new MemoryRepository([['name' => 'Ann'], ['name' => 'Bob']]))
-    ->register(Book::class, new MemoryRepository([['title' => 'a', 'author' => 1], ['title' => 'b', 'author' => 2], ['title' => 'c', 'author' => 1]]));
-
-$test('drills and trusted queries', function () use ($books) {
+$test('drills arrive in the body', function () use ($books) {
     $node = $books();
-    $drill = ['Drill' => 'Books', 'DrillSourceErupt' => 'Author', 'DrillValue' => '1'];
-    $page = signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [], headers: $drill)[1];
-    eq(['a', 'c'], array_column($page['list'], 'title'), 'the drilled author\'s books');
-    eq(403, signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [], headers: ['Drill' => 'x'] + $drill)[0], 'an undeclared drill');
-    eq(false, signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [], headers: ['DrillValue' => '9'] + $drill)[1]['success'], 'a missing source row');
-    $erupt = signedCall($node, 'Author', 'GET', '/erupt-api/build/Author')[1]['eruptModel']['eruptJson'];
-    eq([['Books', 'Books', 'Book']], array_map(fn($d) => [$d['code'], $d['title'], $d['link']['linkErupt']], $erupt['drills']), 'drills in the build');
-    eq(false, isset($erupt['drills'][0]['link']['joinColumn']), 'joinColumn off the build');
-    Schema::check('Erupt', $erupt, 'Author', false);
-    // a condition the server added after checking the browser's: taken on a field the search bar does not have
-    $title = ['condition' => [['key' => 'title', 'expression' => 'EQ', 'value' => 'b']]];
-    eq(['b'], array_column(signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', $title, 'power,query')[1]['list'], 'title'), 'signed query');
-    eq(false, signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', $title)[1]['success'], 'not searchable without it');
+    $table = fn(array $body) => signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', $body);
+    // the server sends the join as a condition and names the drill; the node adds its linkCondition
+    $join = [['key' => 'author', 'expression' => 'EQ', 'value' => 1]];
+    eq(['a'], array_column($table(['condition' => $join, 'drill' => ['erupt' => 'Author', 'code' => 'Books']])[1]['list'], 'title'), 'the drilled author\'s books');
+    eq(['a', 'c'], array_column($table(['condition' => $join])[1]['list'], 'title'), 'the join alone');
+    eq(403, $table(['condition' => $join, 'drill' => ['erupt' => 'Author', 'code' => 'nope']])[0], 'an undeclared drill');
+    eq(403, $table(['drill' => ['erupt' => 'Missing', 'code' => 'Books']])[0], 'an unregistered source');
+    eq(403, $table(['drill' => 'Books'])[0], 'a malformed drill');
+    // the old headers mean nothing now
+    eq(['a', 'b', 'c'], array_column(signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [], null,
+        ['Drill' => 'Books', 'DrillSourceErupt' => 'Author', 'DrillValue' => '1'])[1]['list'], 'title'), 'drill headers');
+    $drills = signedCall($node, 'Author', 'GET', '/erupt-api/build/Author')[1]['eruptModel']['eruptJson']['drills'];
+    eq([['title' => 'Books', 'link' => ['linkErupt' => 'Book', 'joinColumn' => 'author.id', 'linkCondition' => "title <> 'c'"], 'code' => 'Books']],
+        $drills, 'the whole link in the build, code from the title');
 });
 
 $test('simple types and dependColumn', function () use ($books) {
@@ -621,9 +656,8 @@ $test('simple types and dependColumn', function () use ($books) {
     $fields = signedCall($node, 'Book', 'GET', '/erupt-api/build/Book')[1]['eruptModel']['eruptFieldModels'];
     $edit = array_column(array_map(fn($f) => [$f['fieldName'], $f['eruptFieldJson']['edit']], $fields), 1, 0);
     eq(['COLOR', 'RATE', 'HIDDEN', 'TRANSFER'], array_map(fn($n) => $edit[$n]['type'], ['colour', 'stars', 'secret', 'readers']), 'types');
-    eq('parent', $edit['shelf']['referenceTableType']['dependColumn'], 'the server reads it off the build');
-    eq([], array_column($fields, 'eruptFieldJson', 'fieldName')['secret']['views'], 'HIDDEN has no column');
-    eq(true, signedCall($node, 'Book', 'POST', '/erupt-api/data/modify/Book', ['title' => 'd', 'stars' => '4', 'readers' => [['id' => 2]]])[1]['success'], 'add');
+    eq(['id' => 'id', 'label' => 'name', 'dependField' => 'author', 'dependColumn' => 'parent'], $edit['shelf']['referenceTableType'], 'the server reads dependColumn off the build');
+    eq(true, signedCall($node, 'Book', 'POST', '/erupt-api/data/modify/Book', ['title' => 'd', 'stars' => 4, 'readers' => [2]])[1]['success'], 'add');
     $row = signedCall($node, 'Book', 'POST', '/erupt-api/data/table/Book', [])[1]['list'][3];
     eq([4, [2]], [$row['stars'], $row['readers']], 'row');
 });

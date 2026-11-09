@@ -5,31 +5,36 @@ namespace Erupt;
 /**
  * Erupt cloud node: answers the requests the erupt server forwards (handle() / run()) and registers with
  * the server from a long-running process (heartbeat()). Under php-fpm or `php -S` each request builds a
- * fresh Node, so run the heartbeat as its own process. The wire contract is erupt-cloud/PROTOCOL.md.
+ * fresh Node, so run the heartbeat as its own process. The wire contract is erupt-cloud/PROTOCOL.md, protocol v2
+ * (§12): the server signs every call, enforces the user's rights and the model's, checks and normalizes queries
+ * and records, and turns drills and link trees into conditions. The node stores and reads rows and runs its own code.
  */
 final class Node
 {
     public const VERSION = '0.1.0';
 
+    /** The node protocol this SDK speaks (PROTOCOL.md §12.2). */
+    public const PROTOCOL_VERSION = 2;
+
     // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
     private const UNSUPPORTED_POWER = ['print' => false, 'ai' => false];
 
-    // Rights the server decides per user; the node ANDs them onto the declared power
-    private const SERVER_POWER = ['add', 'edit', 'delete', 'viewDetails', 'export', 'importable'];
-
+    // operators a condition may use: a name the node puts into a query, checked whoever calls (§12.6)
     private const OPS = ['EQ', 'NEQ', 'GT', 'GTE', 'LT', 'LTE', 'LIKE', 'NOT_LIKE', 'RANGE', 'IN', 'NOT_IN', 'NULL', 'NOT_NULL'];
 
+    // A guard of the node's own: the server checks a page size too, but no call should make a node read without end
     private const MAX_PAGE_SIZE = 1000;
 
+    // verb, path, endpoint, what the server must vouch for in Erupt-Enforced (§12.2)
     private const ROUTES = [
-        ['GET', '#^/erupt-api/build/([^/]+)$#', 'build'],
-        ['POST', '#^/erupt-api/data/table/([^/]+)$#', 'table'],
-        ['GET', '#^/erupt-api/data/init-value/([^/]+)$#', 'initValue'],
-        ['GET', '#^/erupt-api/data/([^/]+)/([^/]+)$#', 'get'],
-        ['POST', '#^/erupt-api/data/modify/([^/]+)$#', 'add'],
-        ['POST', '#^/erupt-api/data/modify/([^/]+)/update$#', 'update'],
-        ['POST', '#^/erupt-api/data/modify/([^/]+)/delete$#', 'delete'],
-        ['POST', '#^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$#', 'invoke'],
+        ['GET', '#^/erupt-api/build/([^/]+)$#', 'build', []],
+        ['POST', '#^/erupt-api/data/table/([^/]+)$#', 'table', ['power', 'query']],
+        ['GET', '#^/erupt-api/data/init-value/([^/]+)$#', 'initValue', ['power']],
+        ['GET', '#^/erupt-api/data/([^/]+)/([^/]+)$#', 'get', ['power']],
+        ['POST', '#^/erupt-api/data/modify/([^/]+)$#', 'add', ['power', 'record']],
+        ['POST', '#^/erupt-api/data/modify/([^/]+)/update$#', 'update', ['power', 'record']],
+        ['POST', '#^/erupt-api/data/modify/([^/]+)/delete$#', 'delete', ['power']],
+        ['POST', '#^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$#', 'invoke', ['power']],
     ];
 
     private static ?array $user = null;
@@ -40,9 +45,6 @@ final class Node
     private readonly array $servers;
     /** @var array<string, array{0: Model, 1: Repository}> */
     private array $models = [];
-    private array $powerCache = [];
-    /** @var list<string> checks the server ran for the request being served, from a verified Erupt-Enforced */
-    private array $enforced = [];
     private int $nextServer = 0;
     private bool $stopping = false;
     private string $instanceId;
@@ -54,8 +56,6 @@ final class Node
         string|array $servers,
         private ?string $address = null,
         private readonly int $heartbeatSeconds = 15,
-        // refuse server calls without a valid Erupt-Signature, so the plain access token alone no longer passes
-        private readonly bool $requireSignature = false,
     ) {
         if ($accessToken === '') {
             throw new \InvalidArgumentException('access token is required');
@@ -130,7 +130,6 @@ final class Node
         } finally {
             self::$user = null;
             self::$token = null;
-            $this->enforced = [];
         }
         return is_string($payload)
             ? new Response($status, 'text/plain; charset=utf-8', $payload)
@@ -149,11 +148,15 @@ final class Node
         if (($headers['origin'] ?? '') !== '') {
             throw new Reply(403);
         }
-        $this->authenticate($method, $headers, $body, $target);
+        $enforced = $this->authenticate($method, $headers, $body, $target);
         $erupt = $headers['erupt'] ?? null;
-        foreach (self::ROUTES as [$verb, $pattern, $handler]) {
+        foreach (self::ROUTES as [$verb, $pattern, $handler, $required]) {
             if ($verb !== $method || !preg_match($pattern, $path, $m)) {
                 continue;
+            }
+            // what lets the node skip the checks the server made: never the negotiation alone (§12.2)
+            if (array_diff($required, $enforced)) {
+                throw new Reply(403);
             }
             $name = rawurldecode($m[1]);
             if ($erupt !== $name || !isset($this->models[$name])) {
@@ -174,15 +177,16 @@ final class Node
         throw new Reply(404);
     }
 
-    /** A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then. */
-    private function authenticate(string $method, array $headers, string $body, string $target): void
+    /**
+     * Every call is signed (§12.2); its Erupt-Enforced is what the server vouches for.
+     *
+     * @return list<string>
+     */
+    private function authenticate(string $method, array $headers, string $body, string $target): array
     {
         $signature = $headers[strtolower(Signature::HEADER_SIGNATURE)] ?? null;
         if ($signature === null) {
-            if ($this->requireSignature || !hash_equals($this->accessToken, (string) ($headers['access-token'] ?? ''))) {
-                throw new Reply(403);
-            }
-            return;
+            throw new Reply(403);
         }
         $multipart = str_contains((string) ($headers['content-type'] ?? ''), 'multipart/form-data');
         $enforced = $headers[strtolower(Signature::HEADER_ENFORCED)] ?? null;
@@ -190,52 +194,44 @@ final class Node
             $enforced, $headers['user'] ?? null, $multipart ? null : $body, (string) $signature, time())) {
             throw new Reply(403);
         }
-        $this->enforced = array_values(array_filter(explode(',', (string) $enforced)));
+        return array_values(array_filter(explode(',', (string) $enforced)));
     }
 
     // ---------------------------------------------------------------- endpoints
 
     private function build(Model $model, Repository $repo, Request $request): array
     {
-        return $model->buildModel($this->power($model, $request), self::$user);
+        // the rights the model switches off, and the features this SDK does not serve yet (§12.3)
+        return $model->buildModel(array_merge($model->power, self::UNSUPPORTED_POWER), self::$user);
     }
 
     private function table(Model $model, Repository $repo, Request $request): array
     {
-        $this->requirePower($model, $request, 'query');
-        return $this->page($model, $repo, $request->object(), $request);
+        return $this->page($model, $repo, $request->object());
     }
 
-    private function page(Model $model, Repository $repo, array $body, Request $request): array
+    private function page(Model $model, Repository $repo, array $body): array
     {
         $pageIndex = max((int) (($body['pageIndex'] ?? null) ?: 1), 1);
         $pageSize = min(max((int) (($body['pageSize'] ?? null) ?: 10), 1), self::MAX_PAGE_SIZE);
         $query = new Query([], [], ($pageIndex - 1) * $pageSize, $pageSize);
-        // under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
-        $trusted = in_array('query', $this->enforced, true);
+        // checked and normalized by the server, a drill's join and a link tree's keys among them (§12.4)
         foreach ((array) ($body['condition'] ?? []) as $c) {
-            array_push($query->conditions, ...$this->conditions($model, is_array($c) ? $c : [], $trusted));
+            array_push($query->conditions, ...$this->conditions($model, is_array($c) ? $c : []));
         }
-        $drill = $this->drill($model, $request, $query);
         foreach ((array) ($body['sort'] ?? []) as $s) {
-            $f = is_array($s) && is_string($s['field'] ?? null) ? ($model->fields[$s['field']] ?? null) : null;
-            if ($f === null || !($f->decl->sortable || $f->isPk())) {
-                throw new Fail("illegal sort field '" . (is_array($s) ? json_encode($s['field'] ?? null) : '') . "'");
-            }
+            // "field.column" sorts by a reference's label: the server resolves labels, the node orders by the key
+            $field = is_array($s) && is_string($s['field'] ?? null) ? $s['field'] : '';
+            $f = $model->fields[explode('.', $field)[0]] ?? throw new Fail("illegal sort field '$field'");
             $query->sort[] = [$f->name, strtoupper((string) ($s['direction'] ?? 'ASC')) === 'DESC'];
         }
-        // a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
-        $picked = $body['linkTreeVal'] ?? null;
-        if ($model->linkTree && $picked !== null) {
-            $query->conditions[] = $this->condition($model->fields[$model->linkTree[0]], 'IN', $picked);
-        }
-        // a @Vis view's own filter and order, then the DataProxy's
+        // a @Vis view's own filter and order, a drill's linkCondition, then the DataProxy's
         [$filters, $sort] = is_string($body['vis'] ?? null) ? ($model->vis[$body['vis']] ?? [[], []]) : [[], []];
         if (!$query->sort) {
             $query->sort = $sort ?: $model->orderBy;
         }
-        $query->filters = [...$drill, ...$filters, ...$model->filters($query->conditions)];
-        [$total, $records] = $model->linkTree && $model->linkTree[1] && $picked === null ? [0, []] : $repo->page($query);
+        $query->filters = [...$this->drill($body), ...$filters, ...$model->filters($query->conditions)];
+        [$total, $records] = $repo->page($query);
         $rows = $this->rows($model, $records);
         $model->hook('afterFetch', $rows);
         return ['pageIndex' => $pageIndex, 'pageSize' => $pageSize, 'total' => $total,
@@ -244,83 +240,66 @@ final class Node
     }
 
     /**
-     * A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
-     * joinColumn holds the source row's column; its linkCondition is returned as a filter.
+     * A drilled table (§12.4): the server sent the join as a condition and names the drill, whose linkCondition
+     * the node adds.
      *
      * @return list<array{0: string, 1: list<mixed>}>
      */
-    private function drill(Model $model, Request $request, Query $query): array
+    private function drill(array $body): array
     {
-        $code = $request->headers['drill'] ?? null;
-        if ($code === null) {
+        $drill = $body['drill'] ?? null;
+        if (!$drill) {
             return [];
         }
-        [$source, $repo] = $this->models[$request->headers['drillsourceerupt'] ?? ''] ?? [null, null];
-        $drill = $source?->drills[$code] ?? throw new Reply(403);
-        if ($drill['erupt'] !== $model->name || !isset($model->fields[$drill['join']])) {
-            throw new Fail("illegal erupt from drill '$code'");
+        $source = is_array($drill) && is_string($drill['erupt'] ?? null) ? ($this->models[$drill['erupt']][0] ?? null) : null;
+        $code = is_array($drill) && is_string($drill['code'] ?? null) ? $drill['code'] : null;
+        $condition = $code === null ? null : ($source?->drills[$code] ?? null);
+        if ($condition === null) {
+            throw new Reply(403);
         }
-        $row = $repo->get(self::pk($source, $request->headers['drillvalue'] ?? null)) ?? throw new Fail('record not found');
-        $query->conditions[] = $this->condition($model->fields[$drill['join']], 'EQ', $row[$drill['column']] ?? null);
-        return $drill['condition'] === '' ? [] : [[$drill['condition'], []]];
+        return $condition === '' ? [] : [[$condition, []]];
     }
 
     /** @return list<Cond> */
-    private function conditions(Model $model, array $c, bool $trusted = false): array
+    private function conditions(Model $model, array $c): array
     {
+        // a name the node puts into a query is one of its stored fields, whoever sends it (§12.6)
         $key = $c['key'] ?? null;
         $f = is_string($key) ? ($model->fields[$key] ?? null) : null;
-        if ($f === null || (!$trusted && ($f->isPk() || !$f->decl->search))) {
+        if ($f === null) {
             throw new Fail("illegal search field '" . (is_scalar($key) ? $key : json_encode($key)) . "'");
         }
-        $op = ($c['expression'] ?? null) ?: 'EQ';
+        $op = $c['expression'] ?? null;
         if (!in_array($op, self::OPS, true)) {
+            // never skipped: a repository building no condition would answer every row
             throw new Fail("illegal operator '" . (is_scalar($op) ? $op : json_encode($op)) . "'");
         }
         $value = $c['value'] ?? null;
-        if ($f->json === null) {
-            return [$this->condition($f, $op, $value)];
+        if ($f->json !== null && in_array($op, ['EQ', 'IN', 'NEQ', 'NOT_IN'], true)) {
+            // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+            $like = in_array($op, ['EQ', 'IN'], true) ? 'LIKE' : 'NOT_LIKE';
+            $values = is_array($value) && array_is_list($value) ? $value : [$value];
+            return array_map(fn($v) => new Cond($f->name, $like, json_encode(is_scalar($v) ? (string) $v : json_encode($v))), $values);
         }
-        // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
-        if (!in_array($op, ['EQ', 'IN', 'NEQ', 'NOT_IN'], true)) {
-            throw new Fail("illegal operator '$op' for {$f->decl->title}");
-        }
-        $like = in_array($op, ['EQ', 'IN'], true) ? 'LIKE' : 'NOT_LIKE';
-        $values = is_array($value) && array_is_list($value) ? $value : [$value];
-        return array_map(fn($v) => new Cond($f->name, $like, json_encode(is_scalar($v) ? (string) $v : json_encode($v))), $values);
-    }
-
-    private function condition(FieldSpec $f, string $op, mixed $value): Cond
-    {
         if ($op === 'NULL' || $op === 'NOT_NULL') {
-            return new Cond($f->name, $op);
-        }
-        if ($f->isReference() && !in_array($op, ['EQ', 'NEQ', 'IN', 'NOT_IN'], true)) {
-            throw new Fail("illegal operator '$op' for a reference");
+            return [new Cond($f->name, $op)];
         }
         if ($op === 'LIKE' || $op === 'NOT_LIKE') {
-            return new Cond($f->name, $op, is_scalar($value) ? (string) $value : json_encode($value));
+            return [new Cond($f->name, $op, is_scalar($value) ? (string) $value : json_encode($value))];
         }
         try {
-            if ($op === 'RANGE') {
-                if (!is_array($value) || !array_is_list($value) || count($value) !== 2) {
-                    throw new \InvalidArgumentException('range needs two values');
-                }
-                return new Cond($f->name, $op, array_map([$f, 'coerce'], $value));
-            }
-            if ($op === 'IN' || $op === 'NOT_IN') {
-                $list = is_array($value) && array_is_list($value) ? $value : [$value];
-                return new Cond($f->name, $op, array_map([$f, 'coerce'], $list));
-            }
-            return new Cond($f->name, $op, $f->coerce($value));
+            // values arrive as the JSON type their field stores; dates become the repository's date text
+            $stored = in_array($op, ['RANGE', 'IN', 'NOT_IN'], true)
+                ? array_map([$f, 'coerce'], is_array($value) ? array_values($value) : [$value])
+                : $f->coerce($value);
         } catch (\InvalidArgumentException $e) {
-            throw new Fail($e->getMessage());
+            throw new Fail("{$f->decl->title}: {$e->getMessage()}");
         }
+        return [new Cond($f->name, $op, $stored)];
     }
 
     private function initValue(Model $model, Repository $repo, Request $request): array
     {
-        $this->requirePower($model, $request, 'add');
         $record = array_fill_keys(array_keys($model->fields), null);
         $model->hook('addBehavior', $record);
         return $this->rows($model, [$record])[0];
@@ -328,10 +307,6 @@ final class Node
 
     private function get(Model $model, Repository $repo, Request $request, string $pk): array
     {
-        $power = $this->power($model, $request);
-        if (!$power['edit'] && !$power['viewDetails']) {
-            throw new Reply(403);
-        }
         $record = $repo->get(self::pk($model, $pk)) ?? throw new Fail('record not found');
         $model->hook('editBehavior', $record);
         return $this->rows($model, [$record])[0];
@@ -339,7 +314,6 @@ final class Node
 
     private function add(Model $model, Repository $repo, Request $request): array
     {
-        $this->requirePower($model, $request, 'add');
         $record = self::record($model, $request->object());
         $model->hook('validate', $record);
         $model->hook('beforeAdd', $record);
@@ -350,7 +324,6 @@ final class Node
 
     private function update(Model $model, Repository $repo, Request $request): array
     {
-        $this->requirePower($model, $request, 'edit');
         $body = $request->object();
         $pk = self::pk($model, $body[$model->pk] ?? null);
         if ($repo->get($pk) === null) {
@@ -366,7 +339,6 @@ final class Node
 
     private function delete(Model $model, Repository $repo, Request $request): array
     {
-        $this->requirePower($model, $request, 'delete');
         $body = $request->json();
         if (!is_array($body) || !array_is_list($body)) {
             throw new Fail('a list of ids is required');
@@ -480,6 +452,7 @@ final class Node
         }
     }
 
+    /** A record the server checked and normalized (§12.4), as the repository stores it. */
     private static function record(Model $model, array $body): array
     {
         $record = [];
@@ -488,14 +461,10 @@ final class Node
                 continue;
             }
             try {
-                $value = $f->coerce($body[$name] ?? null);
+                $record[$name] = $f->coerce($body[$name] ?? null);
             } catch (\InvalidArgumentException $e) {
                 throw new Fail("{$f->decl->title}: {$e->getMessage()}");
             }
-            if ($f->decl->notNull && $value === null) {
-                throw new Fail("{$f->decl->title} cannot be empty");
-            }
-            $record[$name] = $value;
         }
         return $record;
     }
@@ -503,50 +472,6 @@ final class Node
     private static function r(bool $success = true, ?string $message = null, mixed $data = null): array
     {
         return ['success' => $success, 'status' => $success ? 'SUCCESS' : 'ERROR', 'message' => $message, 'data' => $data, 'promptWay' => 'MESSAGE'];
-    }
-
-    // ---------------------------------------------------------------- permissions (PROTOCOL.md §6.1)
-
-    private function requirePower(Model $model, Request $request, string $right): void
-    {
-        if (!$this->power($model, $request)[$right]) {
-            throw new Reply(403);
-        }
-    }
-
-    /** Declared power AND the server's verdict for the session; cached for this Node's lifetime (one request under php-fpm). */
-    private function power(Model $model, Request $request): array
-    {
-        if (in_array('power', $this->enforced, true)) {
-            // the server checked the user's rights and restricts the build's power itself: the model's own
-            // declaration is all that is left to apply here
-            return array_merge($model->power, self::UNSUPPORTED_POWER);
-        }
-        $token = (string) ($request->headers['token'] ?? '');
-        $key = $token . "\0" . $model->name;
-        if (isset($this->powerCache[$key]) && $this->powerCache[$key][0] > microtime(true)) {
-            return $this->powerCache[$key][1];
-        }
-        $power = array_merge($model->power, self::UNSUPPORTED_POWER);
-        try {
-            [$status, $body] = Http::request('GET', $this->server() . '/erupt-cloud-api/erupt-power?'
-                . http_build_query(['nodeName' => $this->name, 'eruptName' => $model->name]), ['token' => $token]);
-            $remote = $status === 200 ? json_decode($body, true) : null;
-            if (!is_array($remote)) {
-                throw new \RuntimeException("erupt-power answered $status");
-            }
-        } catch (\Throwable $e) { // fail closed: without the server's verdict nothing is writable
-            error_log("erupt-power unavailable: {$e->getMessage()}");
-            $remote = [];
-        }
-        foreach (self::SERVER_POWER as $right) {
-            $power[$right] = $power[$right] && !empty($remote[$right]);
-        }
-        if (count($this->powerCache) > 10000) {
-            $this->powerCache = [];
-        }
-        $this->powerCache[$key] = [microtime(true) + 5, $power];
-        return $power;
     }
 
     // ---------------------------------------------------------------- server calls
@@ -626,28 +551,46 @@ final class Node
         return '127.0.0.1';
     }
 
-    /** One registration call; the server probes /node-health first, so the HTTP side must already be up. */
+    /**
+     * One registration call; the server probes /node-health first, so the HTTP side must already be up. A server
+     * that does not answer `{"protocolVersion": 2}` is older than this node: it would call it as v1, which it no
+     * longer answers, so registering stops for good (stop(), and stopped() turns true) instead of falling back (§12.2).
+     */
     public function registerOnce(?int $port = null): bool
     {
         $server = $this->server();
         $info = ['instanceId' => $this->instanceId, 'nodeName' => $this->name, 'accessToken' => $this->accessToken,
-            'version' => 'php-' . self::VERSION, 'nodeAddress' => [$this->address($port)], 'eruptModules' => [],
-            'erupts' => array_keys($this->models), 'resources' => new \stdClass(), 'capabilities' => ['invoke']];
+            'version' => 'php-' . self::VERSION, 'protocolVersion' => self::PROTOCOL_VERSION, 'nodeAddress' => [$this->address($port)],
+            'eruptModules' => [], 'erupts' => array_keys($this->models), 'resources' => new \stdClass(), 'capabilities' => ['invoke']];
         try {
-            [$status] = Http::request('POST', "$server/erupt-cloud-api/register-node", ['Content-Type' => 'application/json'], Json::encode($info), 10);
-            if ($status >= 200 && $status < 300) {
-                return true;
+            [$status, $answer] = Http::request('POST', "$server/erupt-cloud-api/register-node", ['Content-Type' => 'application/json'], Json::encode($info), 10);
+            if ($status < 200 || $status >= 300) {
+                error_log("$server -> register failed: HTTP $status");
+                return false;
             }
-            error_log("$server -> register failed: HTTP $status");
+            if (!self::speaksV2($answer)) {
+                error_log("$server does not speak node protocol v" . self::PROTOCOL_VERSION . ': upgrade the erupt server; registration stopped');
+                $this->stop();
+                return false;
+            }
+            return true;
         } catch (\Throwable $e) {
             error_log("$server -> register failed: {$e->getMessage()}");
         }
         return false;
     }
 
+    /** Whether a register answer comes from a server that speaks this node's protocol (§12.2). */
+    private static function speaksV2(string $answer): bool
+    {
+        $reply = json_decode($answer, true);
+        return is_array($reply) && ($reply['protocolVersion'] ?? null) === self::PROTOCOL_VERSION;
+    }
+
     /**
-     * Register every heartbeat until SIGINT / SIGTERM (or stop()), then deregister. Run it as a long-lived
-     * CLI process next to php-fpm / `php -S`; without ext-pcntl a signal ends the process without deregistering.
+     * Register every heartbeat until SIGINT / SIGTERM (or stop(), or a server too old for protocol v2), then
+     * deregister. Run it as a long-lived CLI process next to php-fpm / `php -S`; without ext-pcntl a signal ends
+     * the process without deregistering.
      */
     public function heartbeat(?int $port = null): void
     {
@@ -676,6 +619,12 @@ final class Node
     public function stop(): void
     {
         $this->stopping = true;
+    }
+
+    /** Whether registering has stopped: stop() was called, or a server answered that it is too old (§12.2). */
+    public function stopped(): bool
+    {
+        return $this->stopping;
     }
 
     /** Tell the server this instance is gone, so it stops routing to it at once. */

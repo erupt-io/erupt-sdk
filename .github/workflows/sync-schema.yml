@@ -55,7 +55,9 @@ jobs:
           swift-version: "6.1"
       - name: Regenerate every language
         run: |
-          # python copies the schema into schema/ (and its package); the others generate from schema/
+          # python copies the schema into schema/; every SDK generates its types from there and embeds no copy:
+          # the server completes and checks builds (protocol v2). erupt-node-defaults.json stays for the
+          # conformance suite, which completes a declared build the way the server does
           (cd python && python tools/gen_types.py "$RUNNER_TEMP/schema")
           (cd go && go run ./cmd/gentypes ../schema)
           (cd ts && node tools/gen-types.mjs ../schema)

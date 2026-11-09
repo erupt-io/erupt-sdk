@@ -152,6 +152,13 @@ public sealed class UnsupportedType
 }
 
 [EruptModel("Bad")]
+public sealed class BadEditType
+{
+    [Pk] public long Id { get; set; }
+    [Field("Odd", Type = (EditType)99)] public string? Odd { get; set; }
+}
+
+[EruptModel("Bad")]
 public sealed class MissingLabel
 {
     [Pk] public long Id { get; set; }
@@ -173,4 +180,26 @@ public sealed class BadName
 public sealed class NotAModel
 {
     [Pk] public long Id { get; set; }
+}
+
+[EruptModel("Palette")]
+public sealed class Palette
+{
+    [Pk] public long Id { get; set; }
+    [Field("Name")] public string? Name { get; set; }
+    [Field("Colors", Search = true), Choice("red", "Red"), Choice("blue", "Blue"), Choice("green", "Green")] public List<string>? Colors { get; set; }
+}
+
+[EruptModel("Bad")]
+public sealed class SortedJson
+{
+    [Pk] public long Id { get; set; }
+    [Field("Colors", Sortable = true), Choice("red", "Red")] public List<string>? Colors { get; set; }
+}
+
+[EruptModel("Bad")]
+public sealed class SearchedKeyValue
+{
+    [Pk] public long Id { get; set; }
+    [Field("Attrs", Search = true)] public Dictionary<string, string>? Attrs { get; set; }
 }

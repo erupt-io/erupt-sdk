@@ -73,6 +73,8 @@ internal static class Values
         bool b => b ? "True" : "False",
         string s => s,
         DateOnly or DateTime => ToJson(value)!.GetValue<string>(),
+        // a JSON value (MULTI_CHOICE, KEY_VALUE) as the JSON text a SQL repository stores, so LIKE matches alike
+        IEnumerable => ToJson(value)!.ToJsonString(),
         _ => Convert.ToString(Normalize(value), CultureInfo.InvariantCulture) ?? "",
     };
 

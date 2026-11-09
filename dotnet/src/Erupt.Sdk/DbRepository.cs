@@ -212,7 +212,7 @@ public sealed class DbRepository(Func<DbConnection> connect, string table) : IRe
             DateTime dt => DateOnly.FromDateTime(dt),
             _ => DateOnly.FromDateTime(Values.ParseDateTime(value)),
         },
-        _ when field.Type == FieldDef.TemplateDateTime => value is DateTime t ? t : Values.ParseDateTime(value),
+        _ when field.Type == FieldDef.DateTimeType => value is DateTime t ? t : Values.ParseDateTime(value),
         _ => Values.Normalize(value),
     };
 }

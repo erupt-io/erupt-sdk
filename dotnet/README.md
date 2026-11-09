@@ -1,7 +1,11 @@
 # erupt node SDK for .NET
 
 Serve .NET models as erupt admin pages. The erupt server renders the UI, logs users in and checks menus; this
-package answers the requests it forwards. Library targets **net8.0** (runs on any newer runtime); the only
+package answers the requests it forwards. It speaks node protocol v2 ("thin node", erupt-cloud/PROTOCOL.md §12):
+the server signs every call with the node's access token (an unsigned call is refused, the token itself never
+travels), enforces the user's rights and the model's, checks and normalizes queries and records, and turns drills
+and link trees into plain conditions. An erupt server that does not speak v2 is told so in the log and the node
+stops registering. Library targets **net8.0** (runs on any newer runtime); the only
 dependency is the ASP.NET Core shared framework.
 
 ```bash
@@ -46,13 +50,19 @@ class Article
 
 The classes only declare: records travel as `Record` (field name → value; a reference holds the referenced
 primary key). Raw annotation attributes and row operations go on the model builder; the raw objects are the
-generated `Edit`, `View`, `EruptOptions` (`@Erupt`) and `RowOperation` types and are checked against the erupt
-schema when declared:
+generated `Edit`, `View`, `EruptOptions` (`@Erupt`) and `RowOperation` types. The build carries only what is
+declared, those objects with only the properties they set: the erupt server completes the rest from its Java
+defaults and refuses an invalid attribute when it reads the build. Declaring checks only what the node itself
+relies on: edit types and operation modes, `OrderBy` fields, `LinkTree.Field`, drills and `Power` rights.
+
+`.Power(new Power { Delete = false })` switches features off; the erupt server enforces that and the user's own
+rights on every call, so the node does no right check of its own.
 
 ```csharp
 var article = EruptModel.Of<Article>()
     .Edit(a => a.Title, new Edit { InputType = new InputType { Length = 64 } })
     .Options(new EruptOptions { Layout = new Layout { PageSize = 30 } })
+    .Power(new Power { Delete = false })
     .Operation("publish", new OperationOptions
     {
         Title = "Publish", Form = EruptModel.Of<PublishForm>(), IfExpr = "item.status !== 'published'",
@@ -128,7 +138,7 @@ Dragging on a board, calendar or gantt view is saved by the erupt server through
 
 `Options(new EruptOptions { Tree = new Tree { Id = "id", Label = "name", Pid = "parent" } })` shows the model as a
 tree, and `LinkTree = new LinkTree { Field = "category" }` puts the tree of a reference field beside the table: the
-erupt server builds both trees from the node's table, and the node keeps the rows under the picked tree node
+erupt server builds both trees from the node's table and sends the picked tree node as an ordinary condition
 (`DependNode = true` shows none until one is picked). `LinkTree.Field` must be a reference field.
 
 ## Field types and field code
@@ -137,7 +147,8 @@ Besides the inferred types, `Type =` takes `TAGS`, `AUTO_COMPLETE`, `ATTACHMENT`
 upload, the node keeps its path), `HTML_EDITOR`, `MARKDOWN`, `CODE_EDITOR`, `COLOR`, `ICON`, `SIGNATURE`, `MAP`,
 `HIDDEN` (all text), `RATE`, `SLIDER` (numbers), `BUTTON` (form only), and `CHECKBOX` / `TAB_TREE` / `TRANSFER`
 with `Ref =`: the picked records, stored as the JSON list of their keys. A collection property with `[Choice]`s
-is a `MULTI_CHOICE`.
+is a `MULTI_CHOICE`, stored as a JSON array; it can be `Search`ed (a row matches when it holds every value searched
+for) but not sorted.
 
 A reference table depending on another field takes `[Field("Shelf", DependColumn = "province")]` plus
 `.Edit(x => x.Shelf, new Edit { ReferenceTableType = new ReferenceTableType { DependField = "province" } })`: the
@@ -177,8 +188,9 @@ node.Register(EruptModel.Of<Author>()
     .Drill(new Drill { Title = "Books", Link = new Link { LinkErupt = "Book" } }, joinColumn: "author"), repository);
 ```
 
-opens `Book` filtered to the rows whose `author` holds the author's `id` (`column:`, `id` by default);
-`Link.LinkCondition` adds SQL as written. Both models must be on the node.
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`column:`, `id` by default): the link
+goes to the erupt server, which reads the author and sends the join as a condition. `Link.LinkCondition` adds SQL
+as written, applied by the node. Both models must be on the node.
 
 ## Server config and user info
 
@@ -210,6 +222,10 @@ app.MapEruptNode();                    // /node-health and /erupt-api/**
 
 Then on the server add menus of type `table` with values `blog.Article` and `blog.Category`.
 
+`examples/Showcase` is the showcase every SDK implements (`../SHOWCASE.md`): seven models over SQLite (`ERUPT_DB`, default
+`showcase.db`) using every field type, invoke code, custom button, view, drill, data proxy hook, row operation and
+server call of this SDK.
+
 ## Storage
 
 `IRepository` (`PageAsync`, `GetAsync`, `AddAsync`, `UpdateAsync`, `DeleteAsync`) puts a model on anything.
@@ -226,8 +242,7 @@ MySQL / SQL Server), values parameterized as `@pN`, LIKE escaped with `ESCAPE '!
 
 ## Without a registry
 
-NuGet has no git source. Without nuget.org, copy `dotnet/src/Erupt.Sdk/` (the `.csproj`, the sources and
-`Resources/`, which the project embeds) into your solution and reference it:
+NuGet has no git source. Without nuget.org, copy `dotnet/src/Erupt.Sdk/` (the `.csproj` and the sources) into your solution and reference it:
 
 ```bash
 dotnet add reference third_party/Erupt.Sdk/Erupt.Sdk.csproj
@@ -238,10 +253,10 @@ A copy does not update itself: when erupt changes the protocol or the annotation
 
 ## Generated code
 
-`src/Erupt.Sdk/Types.g.cs` and the embedded `Resources/*.json` come from the erupt schema:
+`src/Erupt.Sdk/Types.g.cs` is generated from `../schema/erupt-annotations.schema.json`; the library embeds no schema:
 
 ```bash
-dotnet run --project tools/GenTypes -- ../schema          # sync schemas, regenerate types
+dotnet run --project tools/GenTypes -- ../schema          # regenerate types
 dotnet run --project tools/GenTypes -- ../schema --check  # CI: fail when stale
 ```
 
@@ -253,6 +268,8 @@ The `@Erupt` attributes are generated as `EruptOptions`, since a type named `Eru
 dotnet test tests/Erupt.Sdk.Tests
 dotnet build examples/Conformance -c Release
 python3 ../conformance/run.py -- dotnet examples/Conformance/bin/Release/net8.0/Conformance.dll   # from dotnet/
+dotnet build examples/Showcase -c Release
+python3 ../conformance/showcase.py -- dotnet examples/Showcase/bin/Release/net8.0/Showcase.dll           # from dotnet/
 ```
 
 ## Differences from Python

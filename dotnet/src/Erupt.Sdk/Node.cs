@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -29,27 +28,28 @@ public sealed class NodeOptions
     public string? Address { get; set; }
 
     public TimeSpan Heartbeat { get; init; } = TimeSpan.FromSeconds(15);
-
-    /// <summary>Refuse server calls without a valid Erupt-Signature, so the plain access token alone no longer passes.</summary>
-    public bool RequireSignature { get; init; }
 }
 
 /// <summary>
 /// An erupt cloud node: registers with the server, then answers the requests it forwards. The wire contract is
-/// erupt-cloud/PROTOCOL.md. Mount it with <c>app.MapEruptNode(node)</c> or run it with <see cref="RunAsync"/>.
+/// erupt-cloud/PROTOCOL.md, protocol v2 (§12): the server signs every call, enforces the user's rights and the model's,
+/// checks and normalizes queries and records, and turns drills and link trees into conditions. The node stores and
+/// reads rows and runs its own code. Mount it with <c>app.MapEruptNode(node)</c> or run it with <see cref="RunAsync"/>.
 /// </summary>
 public sealed partial class EruptNode
 {
     public const string Version = "0.1.0";
 
+    /// <summary>The node protocol this SDK speaks (PROTOCOL.md §12.2).</summary>
+    public const int ProtocolVersion = 2;
+
     // Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
     private static readonly string[] Unsupported = ["print", "ai"];
 
-    // Rights the server decides per user; the node ANDs them onto the declared power
-    private static readonly string[] ServerPower = ["add", "edit", "delete", "viewDetails", "export", "importable"];
-
+    // an operator is a name the node puts into a query: an unknown one fails, whoever sends it, never matches every row
     private static readonly HashSet<string> Ops = ["EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE", "NOT_LIKE", "RANGE", "IN", "NOT_IN", "NULL", "NOT_NULL"];
 
+    // a guard of the node's own: the server checks a page size too, but no call should make a node read without end
     private const int MaxPageSize = 1000;
 
     private static readonly AsyncLocal<EruptUser?> User = new();
@@ -57,8 +57,7 @@ public sealed partial class EruptNode
     private static readonly AsyncLocal<string?> Token = new();
 
     private readonly Dictionary<string, (EruptModel Model, IRepository Repo)> _models = [];
-    private readonly ConcurrentDictionary<(string, string), (DateTime Expires, JsonObject Power)> _powerCache = new();
-    private readonly List<(string Method, Regex Pattern, Func<Request, string[], Task<JsonNode?>> Handler)> _routes;
+    private readonly List<(string Method, Regex Pattern, Func<Request, string[], Task<JsonNode?>> Handler, string[] Required)> _routes;
     private readonly string[] _servers;
     private int _next;
 
@@ -76,16 +75,18 @@ public sealed partial class EruptNode
         if (options.Servers.Count == 0) throw new ArgumentException("at least one server is required");
         Options = options;
         _servers = options.Servers.Select(s => s.TrimEnd('/')).ToArray();
+        // verb, path, endpoint, what the server must vouch for in Erupt-Enforced (§12.2)
+        string[] power = ["power"], query = ["power", "query"], record = ["power", "record"];
         _routes =
         [
-            ("GET", Route("^/erupt-api/build/([^/]+)$"), Build),
-            ("POST", Route("^/erupt-api/data/table/([^/]+)$"), Table),
-            ("GET", Route("^/erupt-api/data/init-value/([^/]+)$"), InitValue),
-            ("GET", Route("^/erupt-api/data/([^/]+)/([^/]+)$"), Get),
-            ("POST", Route("^/erupt-api/data/modify/([^/]+)$"), Add),
-            ("POST", Route("^/erupt-api/data/modify/([^/]+)/update$"), Update),
-            ("POST", Route("^/erupt-api/data/modify/([^/]+)/delete$"), Delete),
-            ("POST", Route("^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$"), Invoke),
+            ("GET", Route("^/erupt-api/build/([^/]+)$"), Build, []),
+            ("POST", Route("^/erupt-api/data/table/([^/]+)$"), Table, query),
+            ("GET", Route("^/erupt-api/data/init-value/([^/]+)$"), InitValue, power),
+            ("GET", Route("^/erupt-api/data/([^/]+)/([^/]+)$"), Get, power),
+            ("POST", Route("^/erupt-api/data/modify/([^/]+)$"), Add, record),
+            ("POST", Route("^/erupt-api/data/modify/([^/]+)/update$"), Update, record),
+            ("POST", Route("^/erupt-api/data/modify/([^/]+)/delete$"), Delete, power),
+            ("POST", Route("^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$"), Invoke, power),
         ];
     }
 
@@ -160,7 +161,7 @@ public sealed partial class EruptNode
         else
         {
             context.Response.ContentType = "application/json; charset=utf-8";
-            await context.Response.WriteAsync(body is JsonNode node ? node.ToJsonString(Schema.Json) : "null");
+            await context.Response.WriteAsync(body is JsonNode node ? node.ToJsonString(Json.Options) : "null");
         }
     }
 
@@ -173,12 +174,14 @@ public sealed partial class EruptNode
         // server-to-server only: an Origin header means a browser reached the node directly
         if (!string.IsNullOrEmpty(request.Headers.Origin)) throw new Reply(403);
         var raw = await ReadBody(request);
-        Authenticate(context, raw);
+        var enforced = Authenticate(request, raw);
         var erupt = request.Headers["erupt"].ToString();
-        foreach (var (method, pattern, handler) in _routes)
+        foreach (var (method, pattern, handler, required) in _routes)
         {
             var match = pattern.Match(path);
             if (method != request.Method || !match.Success) continue;
+            // what lets the node skip the checks the server made: never the negotiation alone (§12.2)
+            if (!required.All(enforced.Contains)) throw new Reply(403);
             var name = match.Groups[1].Value;
             if (erupt != name || !_models.TryGetValue(name, out var entry)) throw new Reply(404);
             var parent = request.Headers["eruptParent"].ToString();
@@ -202,33 +205,19 @@ public sealed partial class EruptNode
         return buffer.ToArray();
     }
 
-    /// <summary>
-    /// A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then.
-    /// </summary>
-    private void Authenticate(HttpContext context, byte[] body)
+    /// <summary>Every call is signed (§12.2); its Erupt-Enforced is what the server vouches for.</summary>
+    private HashSet<string> Authenticate(HttpRequest request, byte[] body)
     {
-        var request = context.Request;
         var signature = request.Headers[Signature.HeaderSignature].ToString();
-        if (signature.Length == 0)
-        {
-            if (Options.RequireSignature || !CryptographicOperations.FixedTimeEquals(
-                    Encoding.UTF8.GetBytes(request.Headers["Access-Token"].ToString()), Encoding.UTF8.GetBytes(Options.AccessToken)))
-                throw new Reply(403);
-            return;
-        }
+        if (signature.Length == 0) throw new Reply(403);
         var multipart = (request.ContentType ?? "").Contains("multipart/form-data", StringComparison.OrdinalIgnoreCase);
         var enforced = request.Headers[Signature.HeaderEnforced].ToString();
         var pathAndQuery = request.Path.ToUriComponent() + request.QueryString.ToUriComponent();
         if (!Signature.Verify(Options.AccessToken, request.Method, pathAndQuery, request.Headers[Signature.HeaderTimestamp].ToString(),
                 enforced, request.Headers["user"].ToString(), multipart ? null : body, signature, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
             throw new Reply(403);
-        context.Items[EnforcedKey] = enforced.Split(',', StringSplitOptions.RemoveEmptyEntries).ToHashSet();
+        return enforced.Split(',', StringSplitOptions.RemoveEmptyEntries).ToHashSet();
     }
-
-    private static readonly object EnforcedKey = new();
-
-    private static bool Enforced(HttpContext http, string check) =>
-        http.Items[EnforcedKey] is HashSet<string> enforced && enforced.Contains(check);
 
     private static JsonNode? ParseJson(byte[] raw)
     {
@@ -253,41 +242,38 @@ public sealed partial class EruptNode
 
     // ---------------------------------------------------------------- endpoints
 
-    private async Task<JsonNode?> Build(Request r, string[] _) => r.Model.BuildModel(await Power(r.Model, r.Http), CurrentUser);
-
-    private async Task<JsonNode?> Table(Request r, string[] _)
+    // the rights the model switches off, and the features this SDK does not serve yet (§12.3)
+    private static Task<JsonNode?> Build(Request r, string[] _)
     {
-        await Require(r, "query");
-        return await Page(r.Model, r.Repo, BodyObject(r), r.Http);
+        var power = r.Model.PowerJson.DeepClone().AsObject();
+        foreach (var feature in Unsupported) power[feature] = false;
+        return Task.FromResult<JsonNode?>(r.Model.BuildModel(power, CurrentUser));
     }
 
-    private async Task<JsonNode> Page(EruptModel model, IRepository repo, JsonObject body, HttpContext http)
+    private async Task<JsonNode?> Table(Request r, string[] _) => await Page(r.Model, r.Repo, BodyObject(r), r.Http.RequestAborted);
+
+    private async Task<JsonNode> Page(EruptModel model, IRepository repo, JsonObject body, CancellationToken ct)
     {
-        var ct = http.RequestAborted;
         var pageIndex = Math.Max(Int(body["pageIndex"], 1), 1);
         var pageSize = Math.Min(Math.Max(Int(body["pageSize"], 10), 1), MaxPageSize);
         var query = new Query { Offset = (pageIndex - 1) * pageSize, Limit = pageSize };
-        // under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
-        var trusted = Enforced(http, "query");
-        foreach (var c in body["condition"] as JsonArray ?? []) query.Conditions.Add(Condition(model, c as JsonObject ?? [], trusted));
-        var drill = await Drill(model, http, query);
+        // checked and normalized by the server, a drill's join and a link tree's keys among them (§12.4)
+        foreach (var c in body["condition"] as JsonArray ?? []) query.Conditions.AddRange(Condition(model, c as JsonObject ?? []));
         foreach (var s in body["sort"] as JsonArray ?? [])
         {
+            // "field.column" sorts by a reference's label: the server resolves labels, the node orders by the key
             var name = Values.Plain(s?["field"]) as string;
-            if (name is null || !model.FieldMap.TryGetValue(name, out var f) || !(f.Sortable || f.IsPk))
+            if (name is null || !model.FieldMap.TryGetValue(name.Split('.')[0], out var f) || f.Virtual)
                 throw new EruptFailure($"illegal sort field '{name}'");
             query.Sort.Add((f.Name, Values.Str(Values.Plain(s?["direction"]) ?? "ASC").ToUpperInvariant() == "DESC"));
         }
-        // a @LinkTree table shows the rows under the picked tree keys; with DependNode, none until one is picked
-        var picked = Values.Plain(body["linkTreeVal"]);
-        if (model.LinkTree is (var link, _) && picked is not null) query.Conditions.Add(Condition(model.FieldMap[link], "IN", picked));
-        // a @Vis view's own filter and order, then the DataProxy's
+        // a @Vis view's own filter and order, a drill's linkCondition, then the DataProxy's
         var (filters, sort) = model.Views.GetValueOrDefault(Values.Plain(body["vis"]) as string ?? "", ([], []));
         if (query.Sort.Count == 0) query.Sort = [.. sort.Count > 0 ? sort : model.OrderBy];
-        query.Filters.AddRange(drill);
+        query.Filters.AddRange(Drill(body));
         query.Filters.AddRange(filters);
         query.Filters.AddRange(model.Filters(query.Conditions));
-        var (total, records) = model.LinkTree is { DependNode: true } && picked is null ? (0, []) : await repo.PageAsync(query, ct);
+        var (total, records) = await repo.PageAsync(query, ct);
         var rows = await Rows(model, records, ct);
         model.Hook(p => p.AfterFetch(rows.Cast<JsonObject>().ToList()));
         return new JsonObject
@@ -302,58 +288,49 @@ public sealed partial class EruptNode
         Values.Plain(node) is { } value && value is not "" and not false ? Convert.ToInt32(value, CultureInfo.InvariantCulture) : fallback;
 
     /// <summary>
-    /// A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose joinColumn
-    /// holds the source row's column; its linkCondition is returned as a filter.
+    /// A drilled table (§12.4): the server sent the join as a condition and names the drill, whose linkCondition the
+    /// node adds. The source model must be served here and declare that drill.
     /// </summary>
-    private async Task<List<SqlFilter>> Drill(EruptModel model, HttpContext http, Query query)
+    private List<SqlFilter> Drill(JsonObject body)
     {
-        var headers = http.Request.Headers;
-        var code = headers["Drill"].ToString();
-        if (code.Length == 0) return [];
-        if (!_models.TryGetValue(headers["DrillSourceErupt"].ToString(), out var source) || !source.Model.Drills.TryGetValue(code, out var link))
+        if (body["drill"] is not JsonObject drill) return [];
+        if (!_models.TryGetValue(Values.Plain(drill["erupt"]) as string ?? "", out var source)
+            || !source.Model.Drills.TryGetValue(Values.Plain(drill["code"]) as string ?? "", out var condition))
             throw new Reply(403);
-        if (link.Erupt != model.Name || !model.FieldMap.TryGetValue(link.Join, out var join) || join.Virtual)
-            throw new EruptFailure($"illegal erupt from drill '{code}'");
-        var row = await source.Repo.GetAsync(Pk(source.Model, headers["DrillValue"].ToString())!, http.RequestAborted)
-                  ?? throw new EruptFailure("record not found");
-        query.Conditions.Add(Condition(join, "EQ", row.GetValueOrDefault(link.Column)));
-        return link.Condition.Length > 0 ? [new SqlFilter(link.Condition)] : [];
+        return condition.Length > 0 ? [new SqlFilter(condition)] : [];
     }
 
-    private static Cond Condition(EruptModel model, JsonObject c, bool trusted)
+    private static IEnumerable<Cond> Condition(EruptModel model, JsonObject c)
     {
+        // a name the node puts into a query is one of its stored fields, whoever sends it (§12.6)
         var key = Values.Plain(c["key"]) as string;
-        if (key is null || !model.FieldMap.TryGetValue(key, out var f) || f.Virtual || (!trusted && (f.IsPk || !f.Search)))
-            throw new EruptFailure($"illegal search field '{key}'");
-        var op = Values.Plain(c["expression"]) as string;
-        return Condition(f, string.IsNullOrEmpty(op) ? "EQ" : op, Values.Plain(c["value"]));
-    }
-
-    private static Cond Condition(FieldDef f, string op, object? value)
-    {
+        if (key is null || !model.FieldMap.TryGetValue(key, out var f) || f.Virtual) throw new EruptFailure($"illegal search field '{key}'");
+        var op = Values.Plain(c["expression"]) as string ?? "";
         if (!Ops.Contains(op)) throw new EruptFailure($"illegal operator '{op}'");
-        if (op is "NULL" or "NOT_NULL") return new Cond(f.Name, op);
-        if (f.IsReference && op is not ("EQ" or "NEQ" or "IN" or "NOT_IN")) throw new EruptFailure($"illegal operator '{op}' for a reference");
-        if (op is "LIKE" or "NOT_LIKE") return new Cond(f.Name, op, Values.Str(value));
+        var value = Values.Plain(c["value"]);
+        if (f.IsJson && !f.IsCollection && op is "EQ" or "IN" or "NEQ" or "NOT_IN")
+        {
+            // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its JSON text
+            var like = op is "EQ" or "IN" ? "LIKE" : "NOT_LIKE";
+            return (value as List<object?> ?? [value]).Select(v => new Cond(f.Name, like, Values.ToJson(Values.Str(v))!.ToJsonString())).ToList();
+        }
+        if (op is "NULL" or "NOT_NULL") return [new Cond(f.Name, op)];
+        if (op is "LIKE" or "NOT_LIKE") return [new Cond(f.Name, op, Values.Str(value))];
         try
         {
-            if (op == "RANGE")
-            {
-                if (value is not List<object?> { Count: 2 } range) throw new FormatException("range needs two values");
-                return new Cond(f.Name, op, range.Select(f.Coerce).ToList());
-            }
-            if (op is "IN" or "NOT_IN") return new Cond(f.Name, op, (value as List<object?> ?? [value]).Select(f.Coerce).ToList());
-            return new Cond(f.Name, op, f.Coerce(value));
+            // values arrive as the JSON type their field stores; dates become the repository's date types
+            return op is "RANGE" or "IN" or "NOT_IN"
+                ? [new Cond(f.Name, op, (value as List<object?> ?? [value]).Select(f.Coerce).ToList())]
+                : [new Cond(f.Name, op, f.Coerce(value))];
         }
         catch (FormatException e)
         {
-            throw new EruptFailure(e.Message);
+            throw new EruptFailure($"{f.Title}: {e.Message}");
         }
     }
 
     private async Task<JsonNode?> InitValue(Request r, string[] _)
     {
-        await Require(r, "add");
         var record = new Record(r.Model.Stored.ToDictionary(f => f.Name, _ => (object?)null));
         r.Model.Hook(p => p.AddBehavior(record));
         return (await Rows(r.Model, [record], r.Http.RequestAborted))[0];
@@ -361,8 +338,6 @@ public sealed partial class EruptNode
 
     private async Task<JsonNode?> Get(Request r, string[] args)
     {
-        var power = await Power(r.Model, r.Http);
-        if (!(Bool(power, "edit") || Bool(power, "viewDetails"))) throw new Reply(403);
         var record = await r.Repo.GetAsync(Pk(r.Model, args[0])!, r.Http.RequestAborted) ?? throw new EruptFailure("record not found");
         r.Model.Hook(p => p.EditBehavior(record));
         return (await Rows(r.Model, [record], r.Http.RequestAborted))[0];
@@ -370,7 +345,6 @@ public sealed partial class EruptNode
 
     private async Task<JsonNode?> Add(Request r, string[] _)
     {
-        await Require(r, "add");
         var record = ToRecord(r.Model, BodyObject(r));
         r.Model.Hook(p => p.Validate(record));
         r.Model.Hook(p => p.BeforeAdd(record));
@@ -381,7 +355,6 @@ public sealed partial class EruptNode
 
     private async Task<JsonNode?> Update(Request r, string[] _)
     {
-        await Require(r, "edit");
         var body = BodyObject(r);
         var pk = Pk(r.Model, Values.Plain(body[r.Model.Pk!]));
         if (pk is null || await r.Repo.GetAsync(pk, r.Http.RequestAborted) is null) throw new EruptFailure("record not found");
@@ -395,7 +368,6 @@ public sealed partial class EruptNode
 
     private async Task<JsonNode?> Delete(Request r, string[] _)
     {
-        await Require(r, "delete");
         if (r.Body is not JsonArray ids) throw new EruptFailure("a list of ids is required");
         var pks = ids.Select(id => Pk(r.Model, Values.Plain(id))!).ToList();
         // the hooks see each record as it was; reading them costs nothing without a proxy
@@ -486,70 +458,22 @@ public sealed partial class EruptNode
         }
     }
 
+    /// <summary>A record the server checked and normalized (§12.4), as the repository stores it.</summary>
     private static Record ToRecord(EruptModel model, JsonObject body)
     {
         var record = new Record();
         foreach (var f in model.Stored.Where(f => !f.IsPk && f.Form))
         {
-            object? value;
             try
             {
-                value = f.Coerce(Values.Plain(body[f.Name]));
+                record[f.Name] = f.Coerce(Values.Plain(body[f.Name]));
             }
             catch (FormatException e)
             {
                 throw new EruptFailure($"{f.Title}: {e.Message}");
             }
-            if (f.NotNull && value is null) throw new EruptFailure($"{f.Title} cannot be empty");
-            record[f.Name] = value;
         }
         return record;
-    }
-
-    // ---------------------------------------------------------------- permissions (PROTOCOL.md §6.1)
-
-    private async Task Require(Request r, string right)
-    {
-        if (!Bool(await Power(r.Model, r.Http), right)) throw new Reply(403);
-    }
-
-    private static bool Bool(JsonObject power, string right) => power[right] is JsonValue v && v.GetValueKind() == JsonValueKind.True;
-
-    private async Task<JsonObject> Power(EruptModel model, HttpContext http)
-    {
-        if (Enforced(http, "power"))
-        {
-            // the server checked the user's rights and restricts the build's power itself: the model's own
-            // declaration is all that is left to apply here
-            var declared = model.PowerJson.DeepClone().AsObject();
-            foreach (var feature in Unsupported) declared[feature] = false;
-            return declared;
-        }
-        var token = http.Request.Headers["token"].ToString();
-        var key = (token, model.Name);
-        if (_powerCache.TryGetValue(key, out var cached) && cached.Expires > DateTime.UtcNow) return cached.Power;
-        var power = model.PowerJson.DeepClone().AsObject();
-        foreach (var feature in Unsupported) power[feature] = false;
-        JsonObject remote;
-        try
-        {
-            var query = $"?nodeName={Uri.EscapeDataString(Options.Name)}&eruptName={Uri.EscapeDataString(model.Name)}";
-            using var request = new HttpRequestMessage(HttpMethod.Get, NextServer() + "/erupt-cloud-api/erupt-power" + query);
-            request.Headers.TryAddWithoutValidation("token", token);
-            using var response = await Http.SendAsync(request, http.RequestAborted);
-            response.EnsureSuccessStatusCode();
-            remote = JsonNode.Parse(await response.Content.ReadAsStringAsync(http.RequestAborted)) as JsonObject ?? [];
-        }
-        catch (Exception e) when (e is HttpRequestException or TaskCanceledException or JsonException)
-        {
-            // fail closed: without the server's verdict nothing is writable
-            Logger.LogWarning("erupt-power unavailable: {Message}", e.Message);
-            remote = [];
-        }
-        foreach (var right in ServerPower) power[right] = Bool(power, right) && Bool(remote, right);
-        if (_powerCache.Count > 10000) _powerCache.Clear();
-        _powerCache[key] = (DateTime.UtcNow.AddSeconds(5), power);
-        return power;
     }
 
     // ---------------------------------------------------------------- server calls
@@ -619,12 +543,16 @@ public sealed partial class EruptNode
     internal JsonObject NodeInfo() => new()
     {
         ["instanceId"] = InstanceId, ["nodeName"] = Options.Name, ["accessToken"] = Options.AccessToken,
-        ["version"] = "dotnet-" + Version, ["nodeAddress"] = new JsonArray(Options.Address),
+        ["version"] = "dotnet-" + Version, ["protocolVersion"] = ProtocolVersion, ["nodeAddress"] = new JsonArray(Options.Address),
         ["eruptModules"] = new JsonArray(), ["erupts"] = new JsonArray(_models.Keys.Select(k => (JsonNode)k).ToArray()),
         ["resources"] = new JsonObject(), ["capabilities"] = new JsonArray("invoke"),
     };
 
-    /// <summary>Register every <see cref="NodeOptions.Heartbeat"/> until cancelled (half the interval after a failure).</summary>
+    /// <summary>
+    /// Register every <see cref="NodeOptions.Heartbeat"/> until cancelled (half the interval after a failure). Stops for
+    /// good when the server does not speak this node's protocol (§12.2): it would call the node as v1, which it no longer
+    /// answers.
+    /// </summary>
     internal async Task HeartbeatAsync(CancellationToken ct)
     {
         var failing = false;
@@ -636,6 +564,11 @@ public sealed partial class EruptNode
                 using var content = new StringContent(NodeInfo().ToJsonString(), Encoding.UTF8, "application/json");
                 using var response = await Http.PostAsync(server + "/erupt-cloud-api/register-node", content, ct);
                 response.EnsureSuccessStatusCode();
+                if (!SpeaksProtocol(await response.Content.ReadAsStringAsync(ct)))
+                {
+                    Logger.LogError("{Server} does not speak node protocol v{Version}: upgrade the erupt server; registration stopped", server, ProtocolVersion);
+                    return;
+                }
                 if (failing) Logger.LogInformation("{Server} -> connection success", server);
                 failing = false;
                 await Task.Delay(Options.Heartbeat, ct);
@@ -657,6 +590,20 @@ public sealed partial class EruptNode
                     return;
                 }
             }
+        }
+    }
+
+    /// <summary>Whether a register answer comes from a server that speaks this node's protocol (§12.2).</summary>
+    internal static bool SpeaksProtocol(string answer)
+    {
+        try
+        {
+            return JsonNode.Parse(answer) is JsonObject reply && reply["protocolVersion"] is JsonValue v
+                   && v.GetValueKind() == JsonValueKind.Number && v.ToJsonString() == ProtocolVersion.ToString(CultureInfo.InvariantCulture);
+        }
+        catch (JsonException)
+        {
+            return false;
         }
     }
 

@@ -3,9 +3,13 @@ using System.Text.Json.Serialization;
 
 namespace Erupt;
 
-/// <summary>Switches features of a model off (all are on by default); the server can still narrow them per user.</summary>
+/// <summary>Switches features of a model off (all are on by default); the server enforces it and narrows it per user.</summary>
 public sealed class Power
 {
+    // rights a model may switch off (@Erupt power, PowerObject)
+    internal static readonly string[] Rights =
+        ["add", "edit", "delete", "query", "viewDetails", "export", "importable", "print", "copy", "cellEdit", "batchEdit", "ai", "comment", "revision"];
+
     [JsonPropertyName("add")] public bool? Add { get; set; }
     [JsonPropertyName("edit")] public bool? Edit { get; set; }
     [JsonPropertyName("delete")] public bool? Delete { get; set; }
@@ -16,11 +20,12 @@ public sealed class Power
     [JsonPropertyName("print")] public bool? Print { get; set; }
     [JsonPropertyName("copy")] public bool? Copy { get; set; }
     [JsonPropertyName("cellEdit")] public bool? CellEdit { get; set; }
+    [JsonPropertyName("batchEdit")] public bool? BatchEdit { get; set; }
     [JsonPropertyName("ai")] public bool? Ai { get; set; }
     [JsonPropertyName("comment")] public bool? Comment { get; set; }
     [JsonPropertyName("revision")] public bool? Revision { get; set; }
 
-    internal JsonObject ToJson() => (JsonObject)System.Text.Json.JsonSerializer.SerializeToNode(this, Schema.Json)!;
+    internal JsonObject ToJson() => (JsonObject)System.Text.Json.JsonSerializer.SerializeToNode(this, Json.Options)!;
 }
 
 /// <summary>The acting user the server forwards with every request.</summary>

@@ -7,8 +7,8 @@ namespace Erupt.GenTypes;
 /// <summary>Turns erupt-annotations.schema.json into Types.g.cs.</summary>
 public static class Generator
 {
-    /// <summary>Schema files copied verbatim into the library's embedded resources.</summary>
-    public static readonly string[] Resources = ["erupt-annotations.schema.json", "erupt-node-defaults.json"];
+    /// <summary>The schema file, in the schema directory, the types are generated from.</summary>
+    public const string Schema = "erupt-annotations.schema.json";
 
     // a type named like the namespace would make every "Erupt" in user code ambiguous
     private static readonly Dictionary<string, string> Renamed = new() { ["Erupt"] = "EruptOptions" };

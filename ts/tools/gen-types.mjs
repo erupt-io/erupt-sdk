@@ -1,22 +1,16 @@
-// Sync the erupt schemas into src/ and generate src/types.ts from them.
+// Generate src/types.ts from the erupt annotation schema.
 //
-//   node tools/gen-types.mjs <erupt repo>/schema          copy schemas, regenerate types
-//   node tools/gen-types.mjs <erupt repo>/schema --check  fail when anything is out of date (CI)
+//   node tools/gen-types.mjs <erupt repo>/schema          regenerate types
+//   node tools/gen-types.mjs <erupt repo>/schema --check  fail when they are out of date (CI)
 //
-// Inputs are generated in the erupt repository by erupt-test NodeSchemaTest (annotation JSON Schema) and
-// NodeDefaultsTest (resolved field templates).
+// The input is generated in the erupt repository by erupt-test NodeSchemaTest. The package embeds no schema: the
+// server completes and checks builds (PROTOCOL.md §12.3).
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const SRC = join(ROOT, "src");
-
-// erupt schema file -> package copy
-const SCHEMAS = {
-  "erupt-annotations.schema.json": join(SRC, "schema.json"),
-  "erupt-node-defaults.json": join(SRC, "defaults.json"),
-};
+const TYPES = join(ROOT, "src", "types.ts");
 
 const PRIMITIVES = { string: "string", integer: "number", number: "number", boolean: "boolean" };
 
@@ -72,16 +66,12 @@ function main() {
     console.error("usage: node tools/gen-types.mjs <erupt repo>/schema [--check]");
     process.exit(2);
   }
-  const expected = new Map();
-  for (const [source, target] of Object.entries(SCHEMAS)) {
-    const path = resolve(dir, source);
-    if (!existsSync(path)) {
-      console.error(`missing ${path}`);
-      process.exit(1);
-    }
-    expected.set(target, readFileSync(path, "utf8"));
+  const path = resolve(dir, "erupt-annotations.schema.json");
+  if (!existsSync(path)) {
+    console.error(`missing ${path}`);
+    process.exit(1);
   }
-  expected.set(join(SRC, "types.ts"), generate(JSON.parse(expected.get(join(SRC, "schema.json")))));
+  const expected = new Map([[TYPES, generate(JSON.parse(readFileSync(path, "utf8")))]]);
   const stale = [...expected].filter(([p, text]) => !existsSync(p) || readFileSync(p, "utf8") !== text);
   for (const [p, text] of stale) {
     if (check) console.log(`stale: ${relative(ROOT, p)}`);

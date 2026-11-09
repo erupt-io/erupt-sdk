@@ -1,8 +1,9 @@
 """Erupt cloud node runtime: registers with the server, then answers the requests it forwards.
-The wire contract is erupt-cloud/PROTOCOL.md (Level 0)."""
+The wire contract is erupt-cloud/PROTOCOL.md, protocol v2 (§12): the server signs every call, enforces the user's
+rights and the model's, checks and normalizes queries and records, and turns drills and link trees into conditions.
+The node stores and reads rows and runs its own code."""
 import base64
 import contextvars
-import hmac
 import io
 import itertools
 import json
@@ -26,17 +27,19 @@ log = logging.getLogger("erupt")
 
 __version__ = "0.1.0"
 
+# the node protocol this SDK speaks (PROTOCOL.md §12.2)
+PROTOCOL_VERSION = 2
+
 _user = contextvars.ContextVar("erupt_user", default=None)
 _token = contextvars.ContextVar("erupt_token", default=None)
 
 # Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
 _UNSUPPORTED_POWER = {"print": False, "ai": False}
 
-# Rights the server decides per user; the node ANDs them onto the declared power
-_SERVER_POWER = ("add", "edit", "delete", "viewDetails", "export", "importable")
-
+# the operators a condition may name: like a field name, it goes into a query, so it is checked whoever sends it
 _OPS = {"EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE", "NOT_LIKE", "RANGE", "IN", "NOT_IN", "NULL", "NOT_NULL"}
 
+# a guard of the node's own: the server checks a page size too, but no call should make a node read without end
 _MAX_PAGE_SIZE = 1000
 
 
@@ -75,27 +78,27 @@ def _r(success=True, message=None, data=None):
 
 class Node:
 
-    def __init__(self, name, access_token, servers, *, address=None, heartbeat=15, require_signature=False):
-        """``require_signature`` refuses server calls without a valid Erupt-Signature, so the plain access
-        token alone no longer passes (servers sign since erupt 2.3.x)."""
+    def __init__(self, name, access_token, servers, *, address=None, heartbeat=15):
+        """``access_token`` is the key the server signs every call with (PROTOCOL.md §4.3)."""
         if not access_token:
             raise ValueError("access_token is required")
-        self.name, self.access_token, self.require_signature = name, access_token, require_signature
+        self.name, self.access_token = name, access_token
         self.servers = [s.rstrip("/") for s in ([servers] if isinstance(servers, str) else servers)]
         self.address, self.heartbeat = address, heartbeat
         self.models = {}
         self._server_cycle = itertools.cycle(self.servers)
-        self._power_cache = {}
         self._stop = threading.Event()
+        # verb, path, endpoint, what the server must vouch for in Erupt-Enforced (§12.2)
+        power, query, record = frozenset({"power"}), frozenset({"power", "query"}), frozenset({"power", "record"})
         self._routes = [
-            ("GET", re.compile(r"^/erupt-api/build/([^/]+)$"), self._build),
-            ("POST", re.compile(r"^/erupt-api/data/table/([^/]+)$"), self._table),
-            ("GET", re.compile(r"^/erupt-api/data/init-value/([^/]+)$"), self._init_value),
-            ("GET", re.compile(r"^/erupt-api/data/([^/]+)/([^/]+)$"), self._get),
-            ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)$"), self._add),
-            ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)/update$"), self._update),
-            ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)/delete$"), self._delete),
-            ("POST", re.compile(r"^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$"), self._invoke),
+            ("GET", re.compile(r"^/erupt-api/build/([^/]+)$"), self._build, frozenset()),
+            ("POST", re.compile(r"^/erupt-api/data/table/([^/]+)$"), self._table, query),
+            ("GET", re.compile(r"^/erupt-api/data/init-value/([^/]+)$"), self._init_value, power),
+            ("GET", re.compile(r"^/erupt-api/data/([^/]+)/([^/]+)$"), self._get, power),
+            ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)$"), self._add, record),
+            ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)/update$"), self._update, record),
+            ("POST", re.compile(r"^/erupt-api/data/modify/([^/]+)/delete$"), self._delete, power),
+            ("POST", re.compile(r"^/erupt-api/invoke/([^/]+)/([^/]+)/([^/]+)$"), self._invoke, power),
         ]
 
     def register(self, cls, repository):
@@ -138,11 +141,14 @@ class Node:
         # server-to-server only: an Origin header means a browser reached the node directly
         if environ.get("HTTP_ORIGIN"):
             raise _Reply(403, "")
-        self._authenticate(environ)
+        enforced = self._authenticate(environ)
         erupt = environ.get("HTTP_ERUPT")
-        for verb, pattern, handler in self._routes:
+        for verb, pattern, handler, required in self._routes:
             match = pattern.match(path)
             if verb == method and match:
+                # what lets the node skip the checks the server made: never the negotiation alone (§12.2)
+                if not required <= enforced:
+                    raise _Reply(403, "")
                 name = urllib.parse.unquote(match.group(1))
                 if erupt != name or name not in self.models:
                     raise _Reply(404, "")
@@ -159,13 +165,10 @@ class Node:
         raise _Reply(404, "")
 
     def _authenticate(self, environ):
-        """A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then."""
-        environ["erupt.enforced"] = frozenset()
+        """Every call is signed (§12.2); its Erupt-Enforced is what the server vouches for."""
         signature = environ.get("HTTP_ERUPT_SIGNATURE")
         if signature is None:
-            if self.require_signature or not hmac.compare_digest(environ.get("HTTP_ACCESS_TOKEN", "").encode(), self.access_token.encode()):
-                raise _Reply(403, "")
-            return
+            raise _Reply(403, "")
         length = int(environ.get("CONTENT_LENGTH") or 0)
         body = environ["wsgi.input"].read(length) if length > 0 else b""
         environ["wsgi.input"] = io.BytesIO(body)  # handed on to the endpoint unchanged
@@ -175,111 +178,84 @@ class Node:
                                  environ.get("HTTP_ERUPT_TIMESTAMP"), enforced, environ.get("HTTP_USER"),
                                  None if multipart else body, signature, int(time.time())):
             raise _Reply(403, "")
-        environ["erupt.enforced"] = frozenset(filter(None, (enforced or "").split(",")))
+        return frozenset(filter(None, (enforced or "").split(",")))
 
     # ---------------------------------------------------------------- endpoints
 
     def _build(self, model, repo, environ):
-        return model.build_model(self._power(model, environ), current_user())
+        # the rights the model switches off, and the features this SDK does not serve yet (§12.3)
+        return model.build_model({**model.power, **_UNSUPPORTED_POWER}, current_user())
 
     def _table(self, model, repo, environ):
-        self._require(model, environ, "query")
-        return self._page(model, repo, _read_json(environ) or {}, environ)
+        return self._page(model, repo, _read_json(environ) or {})
 
-    def _page(self, model, repo, body, environ):
+    def _page(self, model, repo, body):
         page_index = max(int(body.get("pageIndex") or 1), 1)
         page_size = min(max(int(body.get("pageSize") or 10), 1), _MAX_PAGE_SIZE)
         query = Query(offset=(page_index - 1) * page_size, limit=page_size)
-        # under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
-        trusted = "query" in environ.get("erupt.enforced", ())
+        # checked and normalized by the server, a drill's join and a link tree's keys among them (§12.4)
         for c in body.get("condition") or []:
-            query.conditions.extend(self._conditions(model, c, trusted))
-        drill = self._drill(model, environ, query)
+            query.conditions.extend(self._conditions(model, c))
         for s in body.get("sort") or []:
-            f = model.fields.get(s.get("field"))
-            if f is None or not (f.sortable or f.pk):
+            # "field.column" sorts by a reference's label: the server resolves labels, the node orders by the key
+            f = model.fields.get(str(s.get("field") or "").split(".")[0])
+            if f is None:
                 raise Fail(f"illegal sort field '{s.get('field')}'")
             query.sort.append((f.name, str(s.get("direction", "ASC")).upper() == "DESC"))
-        # a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
-        picked = body.get("linkTreeVal")
-        if model.link_tree and picked is not None:
-            query.conditions.append(self._condition(model.fields[model.link_tree[0]], "IN", picked))
-        # a @Vis view's own filter and order, then the DataProxy's
+        # a @Vis view's own filter and order, a drill's linkCondition, then the DataProxy's
         filters, sort = model.vis.get(body.get("vis"), ([], []))
         if not query.sort:
             query.sort = list(sort or model.order_by)
-        query.filters = drill + filters + model.filters(query.conditions)
-        total, records = (0, []) if model.link_tree and model.link_tree[1] and picked is None else repo.page(query)
+        query.filters = self._drill(body) + filters + model.filters(query.conditions)
+        total, records = repo.page(query)
         rows = self._rows(model, records)
         model.hook("after_fetch", rows)
         return {"pageIndex": page_index, "pageSize": page_size, "total": total,
                 "totalPage": math.ceil(total / page_size), "list": rows,
                 "sort": None, "alert": None, "extraContent": None}
 
-    def _drill(self, model, environ, query):
-        """A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
-        joinColumn holds the source row's column; its linkCondition is returned as a filter."""
-        code = environ.get("HTTP_DRILL")
-        if code is None:
+    def _drill(self, body):
+        """A drilled table (§12.4): the server sent the join as a condition and names the drill, whose linkCondition
+        the node adds."""
+        drill = body.get("drill")
+        if not drill:
             return []
-        source = self.models.get(environ.get("HTTP_DRILLSOURCEERUPT") or "")
-        link = source[0].drills.get(code) if source else None
-        if link is None:
+        source = self.models.get(drill.get("erupt") or "")
+        condition = source[0].drills.get(drill.get("code")) if source else None
+        if condition is None:
             raise _Reply(403, "")
-        if link.erupt != model.name or link.join not in model.fields:
-            raise Fail(f"illegal erupt from drill '{code}'")
-        row = source[1].get(self._pk(source[0], environ.get("HTTP_DRILLVALUE")))
-        if row is None:
-            raise Fail("record not found")
-        query.conditions.append(self._condition(model.fields[link.join], "EQ", row.get(link.column)))
-        return [(link.condition, [])] if link.condition else []
+        return [(condition, [])] if condition else []
 
     @staticmethod
-    def _conditions(model, c, trusted=False):
+    def _conditions(model, c):
+        # a name the node puts into a query is one of its stored fields, whoever sends it (§12.6)
         f = model.fields.get(c.get("key"))
-        if f is None or (not trusted and (f.pk or not f.search)):
+        if f is None:
             raise Fail(f"illegal search field '{c.get('key')}'")
-        op = c.get("expression") or "EQ"
+        op, value = c.get("expression"), c.get("value")
         if op not in _OPS:
             raise Fail(f"illegal operator '{op}'")
-        value = c.get("value")
-        if f.json:
+        if f.json and op in ("EQ", "IN", "NEQ", "NOT_IN"):
             # a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
-            if op not in ("EQ", "IN", "NEQ", "NOT_IN"):
-                raise Fail(f"illegal operator '{op}' for {f.title}")
             like = "LIKE" if op in ("EQ", "IN") else "NOT_LIKE"
             return [Cond(f.name, like, json.dumps(str(v))) for v in (value if isinstance(value, list) else [value])]
-        return [Node._condition(f, op, value)]
-
-    @staticmethod
-    def _condition(f, op, value):
         if op in ("NULL", "NOT_NULL"):
-            return Cond(f.name, op)
-        if f.type in ("REFERENCE_TABLE", "REFERENCE_TREE") and op not in ("EQ", "NEQ", "IN", "NOT_IN"):
-            raise Fail(f"illegal operator '{op}' for a reference")
+            return [Cond(f.name, op)]
         if op in ("LIKE", "NOT_LIKE"):
-            return Cond(f.name, op, str(value))
+            return [Cond(f.name, op, str(value))]
         try:
-            if op == "RANGE":
-                if not isinstance(value, list) or len(value) != 2:
-                    raise ValueError("range needs two values")
-                return Cond(f.name, op, [f.coerce(v) for v in value])
-            if op in ("IN", "NOT_IN"):
-                return Cond(f.name, op, [f.coerce(v) for v in (value if isinstance(value, list) else [value])])
-            return Cond(f.name, op, f.coerce(value))
+            # values arrive as the JSON type their field stores; dates become the repository's date types
+            stored = [f.coerce(v) for v in value] if op in ("RANGE", "IN", "NOT_IN") else f.coerce(value)
         except (TypeError, ValueError) as e:
-            raise Fail(str(e))
+            raise Fail(f"{f.title}: {e}")
+        return [Cond(f.name, op, stored)]
 
     def _init_value(self, model, repo, environ):
-        self._require(model, environ, "add")
         record = {name: None for name in model.fields}
         model.hook("add_behavior", record)
         return self._rows(model, [record])[0]
 
     def _get(self, model, repo, environ, pk):
-        power = self._power(model, environ)
-        if not (power["edit"] or power["viewDetails"]):
-            raise _Reply(403, "")
         record = repo.get(self._pk(model, pk))
         if record is None:
             raise Fail("record not found")
@@ -287,7 +263,6 @@ class Node:
         return self._rows(model, [record])[0]
 
     def _add(self, model, repo, environ):
-        self._require(model, environ, "add")
         record = self._record(model, _read_json(environ) or {})
         model.hook("validate", record)
         model.hook("before_add", record)
@@ -296,7 +271,6 @@ class Node:
         return _r()
 
     def _update(self, model, repo, environ):
-        self._require(model, environ, "edit")
         body = _read_json(environ) or {}
         pk = self._pk(model, body.get(model.pk))
         if repo.get(pk) is None:
@@ -309,7 +283,6 @@ class Node:
         return _r()
 
     def _delete(self, model, repo, environ):
-        self._require(model, environ, "delete")
         body = _read_json(environ)
         if not isinstance(body, list):
             raise Fail("a list of ids is required")
@@ -394,48 +367,16 @@ class Node:
 
     @staticmethod
     def _record(model, body):
+        """A record the server checked and normalized (§12.4), as the repository stores it."""
         record = {}
         for f in model.fields.values():
             if f.pk or not f.form:
                 continue
             try:
-                value = f.coerce(body.get(f.name))
+                record[f.name] = f.coerce(body.get(f.name))
             except (TypeError, ValueError) as e:
                 raise Fail(f"{f.title}: {e}")
-            if f.not_null and value is None:
-                raise Fail(f"{f.title} cannot be empty")
-            record[f.name] = value
         return record
-
-    # ---------------------------------------------------------------- permissions (PROTOCOL.md §6.1)
-
-    def _require(self, model, environ, right):
-        if not self._power(model, environ)[right]:
-            raise _Reply(403, "")
-
-    def _power(self, model, environ):
-        if "power" in environ.get("erupt.enforced", ()):
-            # the server checked the user's rights and restricts the build's power itself: the model's own
-            # declaration is all that is left to apply here
-            return {**model.power, **_UNSUPPORTED_POWER}
-        token = environ.get("HTTP_TOKEN") or ""
-        key = (token, model.name)
-        cached = self._power_cache.get(key)
-        if cached and cached[0] > time.monotonic():
-            return cached[1]
-        power = {**model.power, **_UNSUPPORTED_POWER}
-        try:
-            remote = self._server_get("/erupt-cloud-api/erupt-power",
-                                      {"nodeName": self.name, "eruptName": model.name}, {"token": token})
-        except Exception as e:  # fail closed: without the server's verdict nothing is writable
-            log.warning("erupt-power unavailable: %s", e)
-            remote = {}
-        for right in _SERVER_POWER:
-            power[right] = power[right] and bool(remote.get(right))
-        self._power_cache[key] = (time.monotonic() + 5, power)
-        if len(self._power_cache) > 10000:
-            self._power_cache.clear()
-        return power
 
     # ---------------------------------------------------------------- server calls
 
@@ -457,14 +398,9 @@ class Node:
         with urllib.request.urlopen(urllib.request.Request(next(self._server_cycle) + path, headers=headers), timeout=5) as resp:
             return resp.read().decode("utf-8")
 
-    def _server_get(self, path, params, headers):
-        url = next(self._server_cycle) + path + "?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=5) as resp:
-            return json.loads(resp.read() or b"null")
-
     def _node_info(self):
         return {"instanceId": self._instance_id, "nodeName": self.name, "accessToken": self.access_token,
-                "version": f"python-{__version__}", "nodeAddress": [self.address],
+                "version": f"python-{__version__}", "protocolVersion": PROTOCOL_VERSION, "nodeAddress": [self.address],
                 "eruptModules": [], "erupts": list(self.models), "resources": {}, "capabilities": ["invoke"]}
 
     def _heartbeat_loop(self):
@@ -475,7 +411,13 @@ class Node:
                 req = urllib.request.Request(server + "/erupt-cloud-api/register-node", method="POST",
                                              data=json.dumps(self._node_info()).encode(),
                                              headers={"Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=10).close()
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    answer = resp.read()
+                if not _speaks_v2(answer):
+                    # an older server: it would call this node as v1, which it no longer answers (§12.2)
+                    log.error("%s does not speak node protocol v%s: upgrade the erupt server; registration stopped",
+                              server, PROTOCOL_VERSION)
+                    return
                 if failing:
                     log.info("%s -> connection success", server)
                 failing = False
@@ -522,6 +464,15 @@ class _QuietHandler(WSGIRequestHandler):
 
 
 _REASONS = {200: "OK", 403: "Forbidden", 404: "Not Found", 500: "Internal Server Error"}
+
+
+def _speaks_v2(answer):
+    """Whether a register answer comes from a server that speaks this node's protocol (§12.2)."""
+    try:
+        reply = json.loads(answer or b"null")
+    except ValueError:
+        return False
+    return isinstance(reply, dict) and reply.get("protocolVersion") == PROTOCOL_VERSION
 
 
 def _read_json(environ):

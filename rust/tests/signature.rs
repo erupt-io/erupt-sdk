@@ -1,6 +1,6 @@
 use erupt::http::Request;
 use erupt::signature::{sign, verify, WINDOW_SECONDS};
-use erupt::{Error, Field, MemoryRepository, Model, Node};
+use erupt::{Field, MemoryRepository, Model, Node};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -54,16 +54,13 @@ fn vectors() {
     }
 }
 
-fn node(require_signature: bool) -> Node {
+fn node() -> Node {
     let post = Model::new("Post", "Post")
         .field("id", Field::pk())
         .field("title", Field::input("Title"))
         .build()
         .unwrap();
-    let mut node = Node::new("n", TOKEN, ["http://127.0.0.1:1"])
-        .require_signature(require_signature)
-        // the server is unreachable: only an enforced power lets a write through
-        .power_source(|_, _| Err(Error::Other("server down".into())));
+    let mut node = Node::new("n", TOKEN, ["http://127.0.0.1:1"]);
     node.register(&post, MemoryRepository::new()).unwrap();
     node
 }
@@ -93,57 +90,59 @@ fn signed(method: &str, target: &str, enforced: Option<&str>, body: &str) -> Req
 
 #[test]
 fn authentication() {
-    // `power` is enforced on the signed calls, so the build does not depend on the (down) server
-    let n = node(false);
-    // a valid signature stands for the access token
+    let n = node();
     assert_eq!(
         200,
-        n.handle(&signed("GET", "/erupt-api/build/Post", Some("power"), ""))
+        n.handle(&signed("GET", "/erupt-api/build/Post", None, ""))
+            .status
+    );
+    assert_eq!(
+        200,
+        n.handle(&signed("GET", "/erupt-api/build/Post?_probe=1", None, ""))
             .status
     );
     // a signature that does not verify is refused even with the right token
-    let tampered =
-        signed("GET", "/erupt-api/build/Post", Some("power"), "").header("Erupt-Timestamp", "1");
+    let tampered = signed("GET", "/erupt-api/build/Post", None, "").header("Erupt-Timestamp", "1");
     assert_eq!(
         403,
         n.handle(&tampered.header("Access-Token", TOKEN)).status
     );
-    // unsigned: the token decides, unless signatures are required
-    let plain = || {
-        Request::new("GET", "/erupt-api/build/Post")
-            .header("token", "t")
-            .header("erupt", "Post")
-            .header("Access-Token", TOKEN)
-    };
-    assert_eq!(200, n.handle(&plain()).status);
-    assert_eq!(403, node(true).handle(&plain()).status);
-    assert_eq!(
-        200,
-        node(true)
-            .handle(&signed("GET", "/erupt-api/build/Post", Some("power"), ""))
-            .status
-    );
+    // unsigned: refused whatever the token (PROTOCOL.md §12.2)
+    let plain = Request::new("GET", "/erupt-api/build/Post")
+        .header("token", "t")
+        .header("erupt", "Post")
+        .header("Access-Token", TOKEN);
+    assert_eq!(403, n.handle(&plain).status);
+    // the body is signed
+    let query = r#"{"pageIndex": 1}"#;
+    let altered = signed(
+        "POST",
+        "/erupt-api/data/table/Post",
+        Some("power,query"),
+        query,
+    )
+    .body(r#"{"pageIndex": 2}"#);
+    assert_eq!(403, n.handle(&altered).status);
 }
 
 #[test]
-fn enforced_power() {
-    let n = node(false);
+fn enforced() {
+    let n = node();
     let add = json!({"title": "a"}).to_string();
     let target = "/erupt-api/data/modify/Post";
-    // signed `power`: the declared power applies without asking the (down) server
+    // what the server vouched for decides: an add needs power and record
     assert_eq!(
         200,
         n.handle(&signed("POST", target, Some("power,record"), &add))
             .status
     );
-    // signed without `power`: the callback fails closed
+    assert_eq!(
+        403,
+        n.handle(&signed("POST", target, Some("power"), &add))
+            .status
+    );
     assert_eq!(403, n.handle(&signed("POST", target, None, &add)).status);
-    // an unsigned Erupt-Enforced is ignored
-    let unsigned = Request::new("POST", target)
-        .header("token", "t")
-        .header("erupt", "Post")
-        .header("Access-Token", TOKEN)
-        .header("Erupt-Enforced", "power")
-        .body(add.clone());
-    assert_eq!(403, n.handle(&unsigned).status);
+    // an Erupt-Enforced added after signing does not verify
+    let forged = signed("POST", target, None, &add).header("Erupt-Enforced", "power,record");
+    assert_eq!(403, n.handle(&forged).status);
 }

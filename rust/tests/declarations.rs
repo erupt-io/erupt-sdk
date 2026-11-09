@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use erupt::types::{Edit, InputType, RowOperationMode};
-use erupt::{schema, Error, Field, Model, Operation};
+use erupt::{Error, Field, Model, Operation};
 use serde_json::json;
 
 #[path = "../tools/generate.rs"]
@@ -25,28 +25,21 @@ fn rejects_unknown_annotation_values() {
         (
             base().field(
                 "t",
-                Field::input("T").edit(json!({"inputTyp": {"length": 9}})),
-            ),
-            "Edit has no attribute 'inputTyp'",
-        ),
-        (
-            base().field("t", Field::input("T").view(json!({"sortable": "yes"}))),
-            "expected boolean",
-        ),
-        (
-            base().field(
-                "t",
                 Field::input("T").edit(json!({"search": {"operator": "ABOUT"}})),
             ),
-            "is not a QueryExpression",
+            "t.edit.search.operator: 'ABOUT' is not one of",
         ),
         (
-            base().raw(json!({"orderBy": "id"})),
-            "Erupt has no attribute 'orderBy'",
+            base().field("t", Field::input("T").edit(json!({"type": "NOPE"}))),
+            "t.edit.type: 'NOPE' is not one of",
         ),
         (
-            base().raw(json!({"layout": {"pageSize": "10"}})),
-            "expected integer",
+            base().raw(json!({"drills": [{"title": "D", "link": {"linkErupt": "X"}}]})),
+            "drill 'D' needs link.linkErupt and link.joinColumn",
+        ),
+        (
+            base().raw(json!({"drills": [{"title": "D", "link": {"joinColumn": "x"}}]})),
+            "needs link.linkErupt",
         ),
         (base().order_by("missing desc"), "illegal order_by"),
         (
@@ -57,7 +50,14 @@ fn rejects_unknown_annotation_values() {
             base().raw(json!({"vis": [{"title": "V", "filter": 1}]})),
             "a vis filter must be SQL text",
         ),
-        (base().power(json!({"remove": false})), "illegal power"),
+        (
+            base().power(json!({"remove": false})),
+            "illegal power 'remove'",
+        ),
+        (
+            base().power(json!({"delete": "no"})),
+            "illegal power 'delete'",
+        ),
         (base().field("id2", Field::pk()), "at most one"),
         (
             base()
@@ -68,10 +68,10 @@ fn rejects_unknown_annotation_values() {
         (
             base().operation(
                 Operation::new("go", "Go")
-                    .raw(json!({"colour": "red"}))
+                    .raw(json!({"mode": "SOMETIMES"}))
                     .handler(|_| Ok(None)),
             ),
-            "RowOperation has no attribute 'colour'",
+            "Bad.go.mode: 'SOMETIMES' is not one of",
         ),
         (
             base().operation(Operation::new("go", "Go")),
@@ -144,10 +144,20 @@ fn typed_and_raw_overrides_pass_through() {
         }),
         ..Default::default()
     };
+    // attribute names are the server's to check (PROTOCOL.md §12.3): an unknown one passes here
     let model = Model::new("Ok", "Ok")
-        .raw(json!({"layout": {"pageSize": 30}}))
+        .raw(json!({"layout": {"pageSize": 30}, "orderBy": "id"}))
         .field("id", Field::pk())
-        .field("t", Field::input("T").edit(typed))
+        .field(
+            "t",
+            Field::input("T")
+                .edit(typed)
+                .view(json!({"sortable": "yes"})),
+        )
+        .field(
+            "u",
+            Field::input("U").edit(json!({"inputTyp": {"length": 9}})),
+        )
         .operation(
             Operation::new("go", "Go")
                 .mode(RowOperationMode::Button)
@@ -160,26 +170,10 @@ fn typed_and_raw_overrides_pass_through() {
 }
 
 #[test]
-fn bundled_defaults_match_the_schema() {
-    let defaults: serde_json::Value =
-        serde_json::from_str(include_str!("../erupt-node-defaults.json")).unwrap();
-    schema::check(
-        "RowOperation",
-        &defaults["rowOperation"],
-        "rowOperation",
-        false,
-    )
-    .unwrap();
-    for (name, field) in defaults["fields"].as_object().unwrap() {
-        schema::check("EruptField", &field["eruptFieldJson"], name, false).unwrap();
-    }
-}
-
-#[test]
 fn generated_types_are_current() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let schema: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(dir.join("erupt-annotations.schema.json")).unwrap(),
+        &std::fs::read_to_string(dir.join("../schema/erupt-annotations.schema.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(

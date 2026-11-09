@@ -1,17 +1,18 @@
 //! Erupt cloud node runtime: registers with the server, then answers the requests it forwards. The wire
-//! contract is erupt-cloud/PROTOCOL.md (Level 0, references and row operations).
+//! contract is erupt-cloud/PROTOCOL.md, protocol v2 (§12): the server signs every call, enforces the user's
+//! rights and the model's, checks and normalizes queries and records, and turns drills and link trees into
+//! conditions. The node stores and reads rows and runs its own code.
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::net::{TcpListener, ToSocketAddrs, UdpSocket};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
 use crate::http::{self, base64_decode, decode, encode, Request, Response};
-use crate::model::{json_value, Field, Model, OpContext};
+use crate::model::{json_value, Model, OpContext};
 use crate::repo::{Cond, Filter, Query, Repository};
 use crate::signature;
 use crate::types::{QueryExpression, RowOperationMode};
@@ -20,30 +21,18 @@ use crate::{Error, Record, Result};
 
 pub const VERSION: &str = "0.1.0";
 
+/// The node protocol this SDK speaks (PROTOCOL.md §12.2).
+pub const PROTOCOL_VERSION: u64 = 2;
+
 /// Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there.
 const UNSUPPORTED_POWER: [&str; 2] = ["print", "ai"];
-/// Rights the server decides per user; the node ANDs them onto the declared power.
-const SERVER_POWER: [&str; 6] = [
-    "add",
-    "edit",
-    "delete",
-    "viewDetails",
-    "export",
-    "importable",
-];
+/// A guard of the node's own: the server checks a page size too, but no call should make a node read without end.
 const MAX_PAGE_SIZE: u64 = 1000;
-const POWER_TTL: Duration = Duration::from_secs(5);
 
 thread_local! {
     static USER: RefCell<Option<Value>> = const { RefCell::new(None) };
     // the session token of the request on this thread
     static TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
-    // what the server checked (a signed `Erupt-Enforced`, e.g. `power`, `query`) for the request on this thread
-    static ENFORCED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-}
-
-fn enforced(what: &str) -> bool {
-    ENFORCED.with(|e| e.borrow().iter().any(|v| v == what))
 }
 
 /// The acting user of the request being served on this thread: `{"uid", "account", "name", "tenantId"}`.
@@ -68,9 +57,13 @@ impl From<Error> for Reply {
 }
 
 type Out = std::result::Result<Value, Reply>;
-/// (session token, erupt) -> when the entry expires, the computed power
-type PowerCache = HashMap<(String, String), (Instant, Map<String, Value>)>;
-type PowerSource = Box<dyn Fn(&str, &str) -> Result<Map<String, Value>> + Send + Sync>;
+
+/// How a server answered a register call.
+enum Registration {
+    Accepted,
+    /// the server does not speak this node's protocol (the server's URL)
+    Outdated(String),
+}
 
 fn r_ok() -> Value {
     json!({"success": true, "status": "SUCCESS", "message": null, "data": null, "promptWay": "MESSAGE"})
@@ -84,18 +77,16 @@ fn fail<T>(message: impl Into<String>) -> std::result::Result<T, Reply> {
 pub struct Node {
     name: String,
     access_token: String,
-    require_signature: bool,
     servers: Vec<String>,
     address: Option<String>,
     heartbeat: Duration,
     models: Vec<(Arc<Model>, Box<dyn Repository>)>,
-    power_cache: Mutex<PowerCache>,
-    power_source: Option<PowerSource>,
     next_server: AtomicUsize,
     instance_id: String,
 }
 
 impl Node {
+    /// `access_token` is the key the server signs every call with (PROTOCOL.md §4.3).
     pub fn new<S: Into<String>>(
         name: &str,
         access_token: &str,
@@ -109,7 +100,6 @@ impl Node {
         Node {
             name: name.to_string(),
             access_token: access_token.to_string(),
-            require_signature: false,
             servers: servers
                 .into_iter()
                 .map(|s| s.into().trim_end_matches('/').to_string())
@@ -117,8 +107,6 @@ impl Node {
             address: None,
             heartbeat: Duration::from_secs(15),
             models: Vec::new(),
-            power_cache: Mutex::new(HashMap::new()),
-            power_source: None,
             next_server: AtomicUsize::new(0),
             instance_id: format!("{:06x}", seed & 0xff_ffff),
         }
@@ -130,25 +118,8 @@ impl Node {
         self
     }
 
-    /// Refuse server calls without a valid `Erupt-Signature`, so the plain access token alone no longer
-    /// passes (servers sign since erupt 2.3.x).
-    pub fn require_signature(mut self, required: bool) -> Self {
-        self.require_signature = required;
-        self
-    }
-
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat = interval;
-        self
-    }
-
-    /// Where per-user rights come from (`token`, `erupt name`): the server's erupt-power by default. For
-    /// tests and custom hosting; an error denies every right.
-    pub fn power_source(
-        mut self,
-        source: impl Fn(&str, &str) -> Result<Map<String, Value>> + Send + Sync + 'static,
-    ) -> Self {
-        self.power_source = Some(Box::new(source));
         self
     }
 
@@ -185,7 +156,6 @@ impl Node {
         let result = self.dispatch(request);
         USER.with(|u| *u.borrow_mut() = None);
         TOKEN.with(|t| *t.borrow_mut() = None);
-        ENFORCED.with(|e| e.borrow_mut().clear());
         match result {
             Ok(Value::String(text)) => Response::text(200, &text),
             Ok(value) => Response::json(200, &value),
@@ -216,7 +186,7 @@ impl Node {
         if req.get_header("origin").is_some() {
             return Err(Reply::Status(403));
         }
-        self.authenticate(req)?;
+        let enforced = self.authenticate(req)?;
         let segments: Vec<&str> = rest.split('/').collect();
         let m = req.method.as_str();
         let route = match (m, segments.as_slice()) {
@@ -233,6 +203,14 @@ impl Node {
         let Some((erupt, route)) = route else {
             return Err(Reply::Status(404));
         };
+        // what lets the node skip the checks the server made: never the negotiation alone (§12.2)
+        if !route
+            .enforced()
+            .iter()
+            .all(|need| enforced.iter().any(|e| e == need))
+        {
+            return Err(Reply::Status(403));
+        }
         let name = decode(erupt);
         let Some((model, repo)) = self
             .entry(&name)
@@ -258,13 +236,16 @@ impl Node {
         TOKEN.with(|t| *t.borrow_mut() = req.get_header("token").map(str::to_string));
         let (model, repo) = (model.as_ref(), repo.as_ref());
         match route {
-            Route::Build => Ok(model.build_model(&self.power(model, req), current_user().as_ref())),
-            Route::Table => {
-                self.require(model, req, "query")?;
-                self.page(model, repo, &body_object(req)?, req)
+            Route::Build => {
+                // the rights the model switches off, and the features this SDK does not serve yet (§12.3)
+                let mut power = model.power.clone();
+                for right in UNSUPPORTED_POWER {
+                    power.insert(right.to_string(), Value::Bool(false));
+                }
+                Ok(model.build_model(&power, current_user().as_ref()))
             }
+            Route::Table => self.page(model, repo, &body_object(req)?),
             Route::InitValue => {
-                self.require(model, req, "add")?;
                 let mut record: Record = model
                     .stored()
                     .map(|f| (f.name.clone(), Value::Null))
@@ -273,10 +254,6 @@ impl Node {
                 Ok(Value::Object(self.rows(model, vec![record]).remove(0)))
             }
             Route::Get(id) => {
-                let power = self.power(model, req);
-                if !(power["edit"] == json!(true) || power["viewDetails"] == json!(true)) {
-                    return Err(Reply::Status(403));
-                }
                 let pk = primary_key(model, &Value::String(id))?;
                 let mut record = repo
                     .get(&pk)?
@@ -285,7 +262,6 @@ impl Node {
                 Ok(Value::Object(self.rows(model, vec![record]).remove(0)))
             }
             Route::Add => {
-                self.require(model, req, "add")?;
                 let mut record = record(model, &body_object(req)?)?;
                 model.hook(|p| p.validate(&record))?;
                 model.hook(|p| p.before_add(&mut record))?;
@@ -294,7 +270,6 @@ impl Node {
                 Ok(r_ok())
             }
             Route::Update => {
-                self.require(model, req, "edit")?;
                 let body = body_object(req)?;
                 let pk = primary_key(
                     model,
@@ -311,7 +286,6 @@ impl Node {
                 Ok(r_ok())
             }
             Route::Delete => {
-                self.require(model, req, "delete")?;
                 let Some(Value::Array(ids)) = read_json(req)? else {
                     return fail("a list of ids is required");
                 };
@@ -374,13 +348,7 @@ impl Node {
         }
     }
 
-    fn page(
-        &self,
-        model: &Model,
-        repo: &dyn Repository,
-        body: &Map<String, Value>,
-        req: &Request,
-    ) -> Out {
+    fn page(&self, model: &Model, repo: &dyn Repository, body: &Map<String, Value>) -> Out {
         let int = |key: &str| {
             body.get(key)
                 .and_then(as_f64)
@@ -389,8 +357,6 @@ impl Node {
         };
         let page_index = int("pageIndex").unwrap_or(1).max(1) as u64;
         let page_size = int("pageSize").unwrap_or(10).clamp(1, MAX_PAGE_SIZE as i64) as u64;
-        // under a signed `query` the server checked the browser's conditions and may add its own (a dependent picker)
-        let trusted = enforced("query");
         let mut query = Query {
             conditions: Vec::new(),
             sort: Vec::new(),
@@ -398,23 +364,25 @@ impl Node {
             offset: (page_index - 1) * page_size,
             limit: page_size,
         };
+        // checked and normalized by the server, a drill's join and a link tree's keys among them (§12.4)
         for c in body
             .get("condition")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            query.conditions.push(condition(model, c, trusted)?);
+            query.conditions.extend(condition(model, c)?);
         }
-        let drill = self.drill(model, req, &mut query)?;
         for s in body
             .get("sort")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
+            // "field.column" sorts by a reference's label: the server resolves labels, the node orders by the key
             let name = s.get("field").map(text).unwrap_or_default();
-            let Some(f) = model.field(&name).filter(|f| f.sortable || f.is_pk()) else {
+            let stored = name.split('.').next().unwrap_or("");
+            let Some(f) = model.stored().find(|f| f.name == stored) else {
                 return fail(format!("illegal sort field '{name}'"));
             };
             let desc = s
@@ -423,15 +391,7 @@ impl Node {
                 .unwrap_or(false);
             query.sort.push((f.name.clone(), desc));
         }
-        // a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
-        let picked = body.get("linkTreeVal").filter(|v| !v.is_null());
-        if let (Some((name, _)), Some(keys)) = (&model.link_tree, picked) {
-            let f = model.field(name).expect("linkTree field");
-            query
-                .conditions
-                .push(field_condition(f, "IN", keys.clone())?);
-        }
-        // a @Vis view's own filter and order, then the DataProxy's
+        // a @Vis view's own filter and order, a drill's linkCondition, then the DataProxy's
         let (filters, sort) = body
             .get("vis")
             .and_then(Value::as_str)
@@ -445,13 +405,10 @@ impl Node {
                 sort
             };
         }
-        query.filters = drill;
+        query.filters = self.drill(body)?;
         query.filters.extend(filters);
         query.filters.extend(model.filters(&query.conditions)?);
-        let (total, records) = match &model.link_tree {
-            Some((_, true)) if picked.is_none() => (0, Vec::new()),
-            _ => repo.page(&query)?,
-        };
+        let (total, records) = repo.page(&query)?;
         let mut rows = self.rows(model, records);
         model.hook(|p| p.after_fetch(&mut rows))?;
         Ok(json!({
@@ -460,41 +417,22 @@ impl Node {
         }))
     }
 
-    /// A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
-    /// `joinColumn` holds the source row's `column`; its `linkCondition` is returned as a filter.
-    fn drill(
-        &self,
-        model: &Model,
-        req: &Request,
-        query: &mut Query,
-    ) -> std::result::Result<Vec<Filter>, Reply> {
-        let Some(code) = req.get_header("drill") else {
+    /// A drilled table (PROTOCOL.md §12.4): the server sent the join as a condition and names the drill in the
+    /// body, `{"erupt": <source>, "code": <code>}`; the node adds its `linkCondition`. A source model this node
+    /// does not serve, or a code it does not declare, is refused.
+    fn drill(&self, body: &Map<String, Value>) -> std::result::Result<Vec<Filter>, Reply> {
+        let Some(drill) = body.get("drill").filter(|d| !d.is_null()) else {
             return Ok(Vec::new());
         };
-        let source = req
-            .get_header("drillsourceerupt")
-            .and_then(|s| self.entry(s));
-        let Some((source, source_repo, link)) =
-            source.and_then(|(m, r)| Some((m, r, m.drills.get(code)?)))
-        else {
+        let source = drill.get("erupt").and_then(Value::as_str).unwrap_or("");
+        let code = drill.get("code").map(text).unwrap_or_default();
+        let Some(condition) = self.entry(source).and_then(|(m, _)| m.drills.get(&code)) else {
             return Err(Reply::Status(403));
         };
-        let Some(join) = model
-            .field(&link.join)
-            .filter(|_| link.erupt == model.name())
-        else {
-            return fail(format!("illegal erupt from drill '{code}'"));
-        };
-        let key = Value::String(req.get_header("drillvalue").unwrap_or("").to_string());
-        let row = source_repo
-            .get(&primary_key(source, &key)?)?
-            .ok_or(Reply::Fail("record not found".into()))?;
-        let value = json_value(row.get(&link.column));
-        query.conditions.push(field_condition(join, "EQ", value)?);
-        Ok(if link.condition.is_empty() {
+        Ok(if condition.is_empty() {
             Vec::new()
         } else {
-            vec![link.condition.as_str().into()]
+            vec![condition.as_str().into()]
         })
     }
 
@@ -567,18 +505,10 @@ impl Node {
 
     // ------------------------------------------------------------------ authentication (PROTOCOL.md §4.3)
 
-    /// A signed call must verify, and then stands for the token; its `Erupt-Enforced` is trusted only then.
-    fn authenticate(&self, req: &Request) -> std::result::Result<(), Reply> {
+    /// Every call is signed (§12.2); its `Erupt-Enforced` is what the server vouches for.
+    fn authenticate(&self, req: &Request) -> std::result::Result<Vec<String>, Reply> {
         let Some(given) = req.get_header(signature::HEADER_SIGNATURE) else {
-            let token_ok = constant_time_eq(
-                req.get_header("access-token").unwrap_or("").as_bytes(),
-                self.access_token.as_bytes(),
-            );
-            return if self.require_signature || !token_ok {
-                Err(Reply::Status(403))
-            } else {
-                Ok(())
-            };
+            return Err(Reply::Status(403));
         };
         let multipart = req
             .get_header("content-type")
@@ -606,62 +536,12 @@ impl Node {
         ) {
             return Err(Reply::Status(403));
         }
-        let checked = enforced.into_iter().flat_map(|e| e.split(','));
-        ENFORCED.with(|e| *e.borrow_mut() = checked.map(|v| v.trim().to_string()).collect());
-        Ok(())
-    }
-
-    // ------------------------------------------------------------------ permissions (PROTOCOL.md §6.1)
-
-    fn require(&self, model: &Model, req: &Request, right: &str) -> std::result::Result<(), Reply> {
-        if self.power(model, req).get(right) == Some(&Value::Bool(true)) {
-            Ok(())
-        } else {
-            Err(Reply::Status(403))
-        }
-    }
-
-    fn power(&self, model: &Model, req: &Request) -> Map<String, Value> {
-        if enforced("power") {
-            // the server checked the user's rights and restricts the build's power itself: the model's own
-            // declaration is all that is left to apply here
-            let mut power = model.power.clone();
-            for right in UNSUPPORTED_POWER {
-                power.insert(right.to_string(), Value::Bool(false));
-            }
-            return power;
-        }
-        let token = req.get_header("token").unwrap_or("").to_string();
-        let key = (token.clone(), model.name().to_string());
-        if let Some((expires, power)) = self.power_cache.lock().expect("power cache").get(&key) {
-            if *expires > Instant::now() {
-                return power.clone();
-            }
-        }
-        let mut power = model.power.clone();
-        for right in UNSUPPORTED_POWER {
-            power.insert(right.to_string(), Value::Bool(false));
-        }
-        let remote = match &self.power_source {
-            Some(source) => source(&token, model.name()),
-            None => self.server_power(&token, model.name()),
-        };
-        // fail closed: without the server's verdict nothing is writable
-        let remote = remote.unwrap_or_else(|e| {
-            eprintln!("erupt-power unavailable: {e}");
-            Map::new()
-        });
-        for right in SERVER_POWER {
-            let allowed = power.get(right) == Some(&Value::Bool(true))
-                && remote.get(right) == Some(&Value::Bool(true));
-            power.insert(right.to_string(), Value::Bool(allowed));
-        }
-        let mut cache = self.power_cache.lock().expect("power cache");
-        if cache.len() > 10_000 {
-            cache.clear();
-        }
-        cache.insert(key, (Instant::now() + POWER_TTL, power.clone()));
-        power
+        Ok(enforced
+            .into_iter()
+            .flat_map(|e| e.split(','))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect())
     }
 
     // ------------------------------------------------------------------ server calls
@@ -672,29 +552,6 @@ impl Node {
             .get(i % self.servers.len().max(1))
             .map(String::as_str)
             .unwrap_or("")
-    }
-
-    fn server_power(&self, token: &str, erupt: &str) -> Result<Map<String, Value>> {
-        let url = format!(
-            "{}/erupt-cloud-api/erupt-power?nodeName={}&eruptName={}",
-            self.server(),
-            encode(&self.name),
-            encode(erupt)
-        );
-        let (status, body) = http::fetch(
-            "GET",
-            &url,
-            &[("token", token)],
-            None,
-            Duration::from_secs(5),
-        )?;
-        if status != 200 {
-            return Err(Error::Other(format!("erupt-power answered {status}")));
-        }
-        match serde_json::from_slice(&body) {
-            Ok(Value::Object(power)) => Ok(power),
-            _ => Err(Error::Other("erupt-power answered no object".into())),
-        }
     }
 
     /// The config text set for this node on the erupt server (Node Config).
@@ -739,46 +596,63 @@ impl Node {
     fn node_info(&self) -> Value {
         json!({
             "instanceId": self.instance_id, "nodeName": self.name, "accessToken": self.access_token,
-            "version": format!("rust-{VERSION}"), "nodeAddress": [self.address], "eruptModules": [],
+            "version": format!("rust-{VERSION}"), "protocolVersion": PROTOCOL_VERSION, "nodeAddress": [self.address], "eruptModules": [],
             "erupts": self.models.iter().map(|(m, _)| m.name()).collect::<Vec<_>>(), "resources": {},
             "capabilities": ["invoke"],
         })
     }
 
-    /// Register once with the next server.
+    /// Register once with the next server. A server that does not answer `{"protocolVersion": 2}` is too old
+    /// for this node (PROTOCOL.md §12.2) and fails the call.
     pub fn register_once(&self) -> Result<()> {
+        match self.register_at_server()? {
+            Registration::Accepted => Ok(()),
+            Registration::Outdated(server) => Err(Error::Other(outdated(&server))),
+        }
+    }
+
+    fn register_at_server(&self) -> Result<Registration> {
         if self.address.is_none() {
             return Err(Error::Declaration("the node address is not set".into()));
         }
-        let url = format!("{}/erupt-cloud-api/register-node", self.server());
+        let server = self.server();
+        let url = format!("{server}/erupt-cloud-api/register-node");
         let body = self.node_info().to_string();
-        let (status, _) = http::fetch(
+        let (status, answer) = http::fetch(
             "POST",
             &url,
             &[("Content-Type", "application/json")],
             Some(body.as_bytes()),
             Duration::from_secs(10),
         )?;
-        if (200..300).contains(&status) {
-            Ok(())
-        } else {
-            Err(Error::Other(format!("register-node answered {status}")))
+        if !(200..300).contains(&status) {
+            return Err(Error::Other(format!("register-node answered {status}")));
         }
+        Ok(if speaks_protocol(&answer) {
+            Registration::Accepted
+        } else {
+            Registration::Outdated(server.to_string())
+        })
     }
 
-    /// Register now and then every heartbeat interval on a background thread.
+    /// Register now and then every heartbeat interval on a background thread. An older server stops it for
+    /// good: it would call this node in a protocol the node no longer answers.
     pub fn start_heartbeat(self: &Arc<Self>) {
         let node = self.clone();
         std::thread::spawn(move || {
             let mut failing = false;
             loop {
-                match node.register_once() {
-                    Ok(()) => {
+                match node.register_at_server() {
+                    Ok(Registration::Accepted) => {
                         if failing {
                             eprintln!("erupt node '{}': connection success", node.name);
                         }
                         failing = false;
                         std::thread::sleep(node.heartbeat);
+                    }
+                    Ok(Registration::Outdated(server)) => {
+                        eprintln!("erupt node '{}': {}", node.name, outdated(&server));
+                        return;
                     }
                     Err(e) => {
                         failing = true;
@@ -853,6 +727,20 @@ impl Node {
     }
 }
 
+/// Whether a register answer comes from a server that speaks this node's protocol (PROTOCOL.md §12.2).
+fn speaks_protocol(answer: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(answer)
+        .ok()
+        .and_then(|a| a.get("protocolVersion").and_then(Value::as_u64))
+        == Some(PROTOCOL_VERSION)
+}
+
+fn outdated(server: &str) -> String {
+    format!(
+        "{server} does not speak node protocol v{PROTOCOL_VERSION}: upgrade the erupt server; registration stopped"
+    )
+}
+
 enum Route {
     Build,
     Table,
@@ -865,8 +753,16 @@ enum Route {
     Invoke(String, String),
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+impl Route {
+    /// What the server must vouch for in `Erupt-Enforced` (PROTOCOL.md §12.2).
+    fn enforced(&self) -> &'static [&'static str] {
+        match self {
+            Route::Build => &[],
+            Route::Table => &["power", "query"],
+            Route::Add | Route::Update => &["power", "record"],
+            _ => &["power"],
+        }
+    }
 }
 
 fn operation_of<'a>(
@@ -909,72 +805,66 @@ fn primary_key(model: &Model, value: &Value) -> std::result::Result<Value, Reply
         .map_err(|_| Reply::Fail(format!("illegal id '{}'", text(value))))
 }
 
-/// A condition the browser sent; `trusted` (checked by the server) takes any stored field.
-fn condition(model: &Model, c: &Value, trusted: bool) -> std::result::Result<Cond, Reply> {
+/// A condition the server checked and normalized (PROTOCOL.md §12.4). Its field must be one the model stores,
+/// whoever sends it: a name the node puts into a query is never trusted (§12.6). A search for values of a JSON
+/// field (MULTI_CHOICE) becomes one LIKE per value, matching `"value"` in its JSON text.
+fn condition(model: &Model, c: &Value) -> std::result::Result<Vec<Cond>, Reply> {
     let key = c.get("key").map(text).unwrap_or_default();
-    let allowed = |f: &&Field| !f.transient && (trusted || (!f.is_pk() && f.search));
-    let Some(f) = model.field(&key).filter(allowed) else {
+    let Some(f) = model.stored().find(|f| f.name == key) else {
         return fail(format!("illegal search field '{key}'"));
     };
-    let name = c
-        .get("expression")
-        .map(text)
-        .filter(|e| !e.is_empty() && e != "None")
-        .unwrap_or_else(|| "EQ".into());
-    field_condition(f, &name, c.get("value").cloned().unwrap_or(Value::Null))
-}
-
-/// A condition on a field, its value coerced to the field.
-fn field_condition(f: &Field, name: &str, value: Value) -> std::result::Result<Cond, Reply> {
-    let op = match QueryExpression::from_str(name) {
+    let name = c.get("expression").map(text).unwrap_or_default();
+    let op = match QueryExpression::from_str(&name) {
         Ok(op) if op != QueryExpression::Auto => op,
         _ => return fail(format!("illegal operator '{name}'")),
     };
     use QueryExpression::*;
-    if matches!(op, Null | NotNull) {
-        return Ok(Cond::new(&f.name, op, Value::Null));
+    let value = c.get("value").cloned().unwrap_or(Value::Null);
+    if f.json && matches!(op, Eq | In | Neq | NotIn) {
+        let like = if matches!(op, Eq | In) { Like } else { NotLike };
+        let values = match value {
+            Value::Array(items) => items,
+            other => vec![other],
+        };
+        return Ok(values
+            .iter()
+            .map(|v| Cond::new(&f.name, like, json!(Value::String(text(v)).to_string())))
+            .collect());
     }
-    if f.is_reference() && !matches!(op, Eq | Neq | In | NotIn) {
-        return fail(format!("illegal operator '{name}' for a reference"));
-    }
-    if matches!(op, Like | NotLike) {
-        return Ok(Cond::new(&f.name, op, Value::String(text(&value))));
-    }
-    let coerce = |v: &Value| f.coerce(v).map_err(Reply::Fail);
     let value = match op {
-        Range => match value.as_array() {
-            Some(bounds) if bounds.len() == 2 => {
-                Value::Array(vec![coerce(&bounds[0])?, coerce(&bounds[1])?])
+        Null | NotNull => Value::Null,
+        // the text the user typed: the repository adds the wildcards and escapes it
+        Like | NotLike => Value::String(text(&value)),
+        // values to the types the repository stores (dates, numbers, keys)
+        _ => {
+            let coerce = |v: &Value| {
+                f.coerce(v)
+                    .map_err(|e| Reply::Fail(format!("{}: {e}", f.title)))
+            };
+            match (op, value) {
+                (Range | In | NotIn, Value::Array(items)) => Value::Array(
+                    items
+                        .iter()
+                        .map(coerce)
+                        .collect::<std::result::Result<_, _>>()?,
+                ),
+                (Range | In | NotIn, other) => {
+                    return fail(format!("{}: {name} needs an array, got {other}", f.title))
+                }
+                (_, value) => coerce(&value)?,
             }
-            _ => return fail("range needs two values"),
-        },
-        In | NotIn => {
-            let items = value
-                .as_array()
-                .cloned()
-                .unwrap_or_else(|| vec![value.clone()]);
-            Value::Array(
-                items
-                    .iter()
-                    .map(coerce)
-                    .collect::<std::result::Result<_, _>>()?,
-            )
         }
-        _ => coerce(&value)?,
     };
-    Ok(Cond::new(&f.name, op, value))
+    Ok(vec![Cond::new(&f.name, op, value)])
 }
 
-/// A write body to a record: every form field coerced, required ones present.
+/// A record the server checked and normalized (PROTOCOL.md §12.4), as the repository stores it.
 fn record(model: &Model, body: &Map<String, Value>) -> std::result::Result<Record, Reply> {
     let mut record = Record::new();
     for f in model.stored().filter(|f| !f.is_pk() && f.form) {
         let value = f
             .coerce(body.get(&f.name).unwrap_or(&Value::Null))
             .map_err(|e| Reply::Fail(format!("{}: {e}", f.title)))?;
-        if f.not_null && value.is_null() {
-            return fail(format!("{} cannot be empty", f.title));
-        }
         record.insert(f.name.clone(), value);
     }
     Ok(record)
@@ -1042,9 +932,10 @@ mod tests {
     }
 
     #[test]
-    fn constant_time() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"", b"a"));
+    fn register_answers() {
+        assert!(speaks_protocol(br#"{"protocolVersion": 2}"#));
+        assert!(!speaks_protocol(b""));
+        assert!(!speaks_protocol(br#"{"protocolVersion": 1}"#));
+        assert!(!speaks_protocol(b"ok"));
     }
 }

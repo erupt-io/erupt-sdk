@@ -61,7 +61,7 @@ class DatabaseTest(unittest.TestCase):
         repo.add({"title": "a_b", "views": None, "live": False, "day": None, "at": None})
 
         def titles(*conds, sort=(("title", False),)):
-            return [r["title"] for r in repo.page(Query(list(conds), list(sort), 0, 10))[1]]
+            return [r["title"] for r in repo.page(Query(conditions=list(conds), sort=list(sort), offset=0, limit=10))[1]]
 
         self.assertEqual(["100% pure", "wow!", "a_b"], titles(sort=()), "default order is primary key ascending")
         self.assertEqual(["100% pure"], titles(Cond("title", "LIKE", "%")), "LIKE escapes %")
@@ -74,7 +74,7 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(["100% pure"], titles(Cond("live", "EQ", True)), "boolean")
         self.assertEqual(["100% pure"], titles(Cond("views", "GT", 2)), "GT")
         self.assertEqual(["a_b"], titles(Cond("views", "NULL")), "NULL")
-        total, rows = repo.page(Query([], [("views", True)], 1, 1))
+        total, rows = repo.page(Query(sort=[("views", True)], offset=1, limit=1))
         self.assertEqual((3, 1), (total, len(rows)), "total and page size")
 
         row = repo.get(1)

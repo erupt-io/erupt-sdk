@@ -39,7 +39,8 @@ public final class SQLClosureExecutor: SQLExecutor {
 public final class SQLRepository: Repository {
     private static let ops = ["EQ": "=", "NEQ": "<>", "GT": ">", "GTE": ">=", "LT": "<", "LTE": "<="]
     private static let sqliteTypes = [
-        EditType.number.rawValue: "NUMERIC", EditType.boolean.rawValue: "INTEGER", EditType.date.rawValue: "DATE",
+        EditType.number.rawValue: "NUMERIC", EditType.rate.rawValue: "NUMERIC", EditType.slider.rawValue: "NUMERIC",
+        EditType.boolean.rawValue: "INTEGER", EditType.date.rawValue: "DATE",
         dateTimeType: "TIMESTAMP", EditType.referenceTable.rawValue: "INTEGER", EditType.referenceTree.rawValue: "INTEGER",
     ]
 
@@ -202,7 +203,7 @@ public final class SQLRepository: Repository {
             if case .string(let s) = value { return try JSON.parse(s) }
             return value
         }
-        if field.pk || field.isReference || field.type == EditType.number.rawValue { return try Values.number(value) }
+        if field.pk || field.isReference || Field.numeric.contains(field.type) { return try Values.number(value) }
         switch field.type {
         case EditType.boolean.rawValue: return .bool([.bool(true), .int(1), "1", "t", "true"].contains(value))
         case EditType.date.rawValue: return .string(try Values.date(value))

@@ -30,12 +30,18 @@ try node.serve(port: 9090)
 2. Add a menu of type `table` with value `blog.Article`.
 3. Run the node. The server must be able to reach it on `http://<node ip>:9090`; pass `address:` otherwise.
 
+The node speaks node protocol v2 (erupt-cloud/PROTOCOL.md §12) and needs an erupt server that speaks it too: on an
+older server it logs an error and stops registering. The server signs every call with the access token
+(`Erupt-Signature`; a plain `Access-Token` is refused), enforces the user's rights and the ones a model switches off
+(`power:`), and checks and normalizes queries and records before they reach the node.
+
 `Field(name, title, kind)` infers the edit type from `kind`: `.string` (default) INPUT, `.number` NUMBER, `.bool`
 BOOLEAN, `.date` DATE, `.dateTime` DATE with a time picker, `choices:` CHOICE; `type:` overrides it. `view:` /
 `edit:` on a field and `erupt:` on a model take the typed annotation attributes generated from the erupt schema
 (`Edit(inputType: InputType(length: 64))`, `Erupt(layout: Layout(pageSize: 30))`), and every value an enum
-(`.textarea`, `.multiChoice`, `.single`); what they produce is checked against the schema when the model is
-declared.
+(`.textarea`, `.multiChoice`, `.single`). The build carries only what a model declares: the erupt server completes
+it from the Java defaults and checks it (node protocol v2), so a misspelt attribute fails there. A misspelt power
+key, order, link tree field or drill still fails when the model is declared.
 
 Records are `[String: JSON]` (`row["title"]`); `JSON` takes literals (`["status": "published", "views": 3]`).
 Dates travel as text: a DATE as `2026-01-05`, a DATE_TIME as `2026-01-05T10:30:00.000`.
@@ -170,7 +176,7 @@ Dragging on a board, calendar or gantt view is saved by the erupt server through
 
 `Erupt(tree: Tree(id: "id", label: "name", pid: "parent"))` shows the model as a tree, and
 `Erupt(linkTree: LinkTree(field: "category"))` puts the tree of a reference field beside the table: the erupt
-server builds both trees from the node's table, and the node keeps the rows under the picked tree node
+server builds both trees from the node's table and sends the picked tree node as a plain condition on that field
 (`dependNode: true` shows none until one is picked). `linkTree.field` must be a reference field.
 
 ## Field types and field code
@@ -213,8 +219,10 @@ let author = try Model(
 ```
 
 opens `Book` filtered to the rows whose `author` holds the author's `id` (`DrillJoin(column:)`, `id` by default);
-`link.linkCondition` adds SQL as written. `column` and `joinColumn` are `@Transient` in Java, so they go in
-`drillJoin`, keyed by the drill's code (its title when it has none). Both models must be on the node.
+`link.linkCondition` adds SQL as written, applied by the node. `column` and `joinColumn` are `@Transient` in Java,
+so they go in `drillJoin`, keyed by the drill's code (its title when it has none); the node writes them into the
+drill's link in the build, and the erupt server reads the source row and sends the join as a condition. Both
+models must be on the node.
 
 ## Server config and user info
 
@@ -255,9 +263,10 @@ To vendor it instead, copy `swift/Sources/EruptSDK/` into your package as a targ
 ```bash
 swift build
 swift test                                            # Swift 6 toolchain (swift-testing)
-swift run erupt-gen-types ../schema --check           # Types.swift / Embedded.swift match ../schema
+swift run erupt-gen-types ../schema --check           # Types.swift matches ../schema
 swift build -c release --product Conformance && python3 ../conformance/run.py -- .build/release/Conformance
-ERUPT_ACCESS_TOKEN=... ERUPT_SERVER=http://localhost:8080 swift run Blog   # the SHOWCASE.md blog
+ERUPT_ACCESS_TOKEN=... ERUPT_SERVER=http://localhost:8080 swift run Showcase   # the SHOWCASE.md showcase (SQLite file ERUPT_DB)
+swift build -c release --product Showcase && python3 ../conformance/showcase.py -- .build/release/Showcase   # its scenarios
 ```
 
 With only the Command Line Tools (no Xcode) on macOS, point `swift test` at their Testing framework:
@@ -268,5 +277,5 @@ swift test -Xswiftc -F -Xswiftc $F -Xlinker -F -Xlinker $F -Xlinker -rpath -Xlin
   -Xlinker -rpath -Xlinker /Library/Developer/CommandLineTools/Library/Developer/usr/lib
 ```
 
-`Sources/EruptSDK/Types.swift` and `Embedded.swift` are generated from `../schema` by `erupt-gen-types`; do not
-edit them.
+`Sources/EruptSDK/Types.swift` is generated from `../schema/erupt-annotations.schema.json` by `erupt-gen-types`; do
+not edit it.

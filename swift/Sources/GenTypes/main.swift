@@ -1,11 +1,10 @@
-// Generates Sources/EruptSDK/Types.swift (enums and typed annotation attributes) and
-// Sources/EruptSDK/Embedded.swift (the schema and the field templates, compiled in) from the erupt schemas.
+// Generates Sources/EruptSDK/Types.swift (enums and typed annotation attributes) from the erupt annotation schema.
+// Nothing else is compiled in: the server completes and checks every build (erupt-cloud/PROTOCOL.md §12.3).
 //
 //   swift run erupt-gen-types ../schema          # regenerate
 //   swift run erupt-gen-types ../schema --check  # fail when anything is out of date (CI)
 //
-// Inputs are generated in the erupt repository by erupt-test NodeSchemaTest (annotation JSON Schema) and
-// NodeDefaultsTest (resolved field templates).
+// The input is generated in the erupt repository by erupt-test NodeSchemaTest (annotation JSON Schema).
 import EruptSDK
 import Foundation
 
@@ -100,27 +99,6 @@ func generateTypes(_ defs: [String: JSON]) -> String {
     return out.joined(separator: "\n") + "\n"
 }
 
-/// A raw string literal holding `text` verbatim.
-func rawLiteral(_ text: String) -> String {
-    var hashes = "#"
-    while text.contains("\"\"\"" + hashes) || text.contains("\\" + hashes) { hashes += "#" }
-    return "\(hashes)\"\"\"\n\(text.hasSuffix("\n") ? String(text.dropLast()) : text)\n\"\"\"\(hashes)"
-}
-
-func generateEmbedded(schema: String, defaults: String) -> String {
-    """
-    \(header)
-
-    /// The contract erupt generates, compiled in: erupt-annotations.schema.json and erupt-node-defaults.json.
-    enum Embedded {
-        static let annotationsSchema = \(rawLiteral(schema))
-
-        static let nodeDefaults = \(rawLiteral(defaults))
-    }
-
-    """
-}
-
 let args = CommandLine.arguments.dropFirst()
 guard let sourceDir = args.first(where: { !$0.hasPrefix("--") }) else {
     FileHandle.standardError.write("usage: swift run erupt-gen-types <schema dir> [--check]\n".data(using: .utf8)!)
@@ -134,13 +112,8 @@ func read(_ name: String) -> String {
     }
     return text
 }
-let schemaText = read("erupt-annotations.schema.json")
-let defaultsText = read("erupt-node-defaults.json")
-let defs = try JSON.parse(schemaText)["$defs"]!.object!
-let expected = [
-    "Sources/EruptSDK/Types.swift": generateTypes(defs),
-    "Sources/EruptSDK/Embedded.swift": generateEmbedded(schema: schemaText, defaults: defaultsText),
-]
+let defs = try JSON.parse(read("erupt-annotations.schema.json"))["$defs"]!.object!
+let expected = ["Sources/EruptSDK/Types.swift": generateTypes(defs)]
 let stale = expected.filter { path, text in
     (try? String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)) != text
 }

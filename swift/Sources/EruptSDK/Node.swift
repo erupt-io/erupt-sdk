@@ -13,20 +13,23 @@ import Foundation
 #endif
 
 /// Erupt cloud node runtime: registers with the server, then answers the requests it forwards. The wire contract
-/// is erupt-cloud/PROTOCOL.md (Level 0) in the erupt repository.
+/// is erupt-cloud/PROTOCOL.md in the erupt repository, protocol v2 (§12): the server signs every call, enforces the
+/// user's rights and the model's, checks and normalizes queries and records, and turns drills and link trees into
+/// conditions. The node stores and reads rows and runs its own code.
 ///
 /// `serve` runs it on a small built-in HTTP server. To mount it in Vapor or Hummingbird instead, route
 /// `/erupt-api/**` and `/node-health` to `handle(_:)` and call `start(port:)` / `stop()`.
 public final class Node: @unchecked Sendable {
     public static let version = "0.1.0"
+    /// The node protocol this SDK speaks (PROTOCOL.md §12.2)
+    public static let protocolVersion = 2
 
     /// Features whose endpoints this SDK does not serve yet: hidden from the UI instead of failing there
     static let unsupportedPower = ["print": false, "ai": false]
-    /// Rights the server decides per user; the node ANDs them onto the declared power
-    static let serverPower = ["add", "edit", "delete", "viewDetails", "export", "importable"]
-    static let ops: Set<String> = ["EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE", "NOT_LIKE", "RANGE", "IN", "NOT_IN", "NULL", "NOT_NULL"]
+    /// A guard of the node's own: the server checks a page size too, but no call should make a node read without end
     static let maxPageSize = 1000
-    static let powerTTL: TimeInterval = 5
+    /// The condition operators a query may name: checked like a field name, whoever calls (§12.6)
+    static let ops: Set<String> = ["EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE", "NOT_LIKE", "RANGE", "IN", "NOT_IN", "NULL", "NOT_NULL"]
 
     public enum LogLevel: String { case info = "INFO", warn = "WARN", error = "ERROR" }
 
@@ -35,22 +38,19 @@ public final class Node: @unchecked Sendable {
     private let accessToken: String
     private let servers: [String]
     private let heartbeat: TimeInterval
-    private let requireSignature: Bool
     private let log: (LogLevel, String) -> Void
     private var models: [String: (model: Model, repo: Repository)] = [:]
     private let lock = NSLock()
     private var tick = 0
-    private var powerCache: [String: (expires: TimeInterval, power: [String: Bool])] = [:]
     private var instanceId = ""
     private var heartbeatThread: Thread?
     private let wake = DispatchSemaphore(value: 0)
 
-    /// `requireSignature` refuses server calls without a valid Erupt-Signature, so the plain access token alone
-    /// no longer passes (servers sign since erupt 2.3.x). `address` is where the server reaches this node;
-    /// guessed from the local interface when nil.
+    /// `accessToken` is the key the server signs every call with (PROTOCOL.md §4.3). `address` is where the server
+    /// reaches this node; guessed from the local interface when nil.
     public init(
         name: String, accessToken: String, servers: [String], address: String? = nil, heartbeat: TimeInterval = 15,
-        requireSignature: Bool = false, log: ((LogLevel, String) -> Void)? = nil
+        log: ((LogLevel, String) -> Void)? = nil
     ) throws {
         guard !accessToken.isEmpty else { throw DeclarationError("accessToken is required") }
         guard !servers.isEmpty else { throw DeclarationError("at least one erupt server is required") }
@@ -59,7 +59,6 @@ public final class Node: @unchecked Sendable {
         self.servers = servers.map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }
         self.address = address
         self.heartbeat = heartbeat
-        self.requireSignature = requireSignature
         self.log = log ?? { level, message in FileHandle.standardError.write("[erupt] \(level.rawValue) \(message)\n".data(using: .utf8)!) }
     }
 
@@ -120,7 +119,7 @@ public final class Node: @unchecked Sendable {
         thread.cancel()
         wake.signal()
         do {
-            _ = try serverCall(
+            _ = try serverData(
                 "POST", "/erupt-cloud-api/remove-instance-node",
                 form: ["nodeName": name, "accessToken": accessToken, "locations": address ?? ""])
         } catch {
@@ -133,7 +132,12 @@ public final class Node: @unchecked Sendable {
         while !Thread.current.isCancelled {
             let server = nextServer()
             do {
-                _ = try serverCall("POST", "/erupt-cloud-api/register-node", server: server, json: nodeInfo(), timeout: 10)
+                let answer = try serverData("POST", "/erupt-cloud-api/register-node", server: server, json: nodeInfo(), timeout: 10)
+                guard Node.speaksProtocol(answer) else {
+                    // an older server: it would call this node as v1, which it no longer answers (§12.2)
+                    log(.error, "\(server) does not speak node protocol v\(Node.protocolVersion): upgrade the erupt server; registration stopped")
+                    return
+                }
                 if failing { log(.info, "\(server) -> connection success") }
                 failing = false
                 _ = wake.wait(timeout: .now() + heartbeat)
@@ -145,11 +149,16 @@ public final class Node: @unchecked Sendable {
         }
     }
 
+    /// Whether a register answer comes from a server that speaks this node's protocol (§12.2).
+    static func speaksProtocol(_ answer: Data) -> Bool {
+        (try? JSON.parse(Array(answer)))?["protocolVersion"]?.int == Int64(protocolVersion)
+    }
+
     private func nodeInfo() -> JSON {
         let erupts = lock.locked { models.keys.sorted() }
         return [
             "instanceId": .string(instanceId), "nodeName": .string(name), "accessToken": .string(accessToken),
-            "version": .string("swift-\(Node.version)"), "nodeAddress": [.string(address ?? "")], "eruptModules": [],
+            "version": .string("swift-\(Node.version)"), "protocolVersion": .int(Int64(Node.protocolVersion)), "nodeAddress": [.string(address ?? "")], "eruptModules": [],
             "erupts": .array(erupts.map(JSON.string)), "resources": [:], "capabilities": ["invoke"],
         ]
     }
@@ -185,18 +194,22 @@ public final class Node: @unchecked Sendable {
         return NodeResponse(status: status, contentType: "application/json; charset=utf-8", body: Array(body.serialized().utf8))
     }
 
-    private typealias Route = (method: String, pattern: [String], handler: (Node) -> (Context) throws -> JSON)
+    /// verb, path, endpoint, and what the server must vouch for in Erupt-Enforced (§12.2)
+    private typealias Route = (method: String, pattern: [String], handler: (Node) -> (Context) throws -> JSON, enforced: Set<String>)
 
-    private static let routes: [Route] = [
-        ("GET", ["build", "*"], { $0.build }),
-        ("POST", ["data", "table", "*"], { $0.table }),
-        ("GET", ["data", "init-value", "*"], { $0.initValue }),
-        ("GET", ["data", "*", "*"], { $0.get }),
-        ("POST", ["data", "modify", "*"], { $0.add }),
-        ("POST", ["data", "modify", "*", "update"], { $0.update }),
-        ("POST", ["data", "modify", "*", "delete"], { $0.delete }),
-        ("POST", ["invoke", "*", "*", "*"], { $0.invoke }),
-    ]
+    private static let routes: [Route] = {
+        let power: Set<String> = ["power"], query: Set<String> = ["power", "query"], record: Set<String> = ["power", "record"]
+        return [
+            ("GET", ["build", "*"], { $0.build }, []),
+            ("POST", ["data", "table", "*"], { $0.table }, query),
+            ("GET", ["data", "init-value", "*"], { $0.initValue }, power),
+            ("GET", ["data", "*", "*"], { $0.get }, power),
+            ("POST", ["data", "modify", "*"], { $0.add }, record),
+            ("POST", ["data", "modify", "*", "update"], { $0.update }, record),
+            ("POST", ["data", "modify", "*", "delete"], { $0.delete }, power),
+            ("POST", ["invoke", "*", "*", "*"], { $0.invoke }, power),
+        ]
+    }()
 
     /// One request being served: its model, repository and the path parameters after the erupt name.
     private struct Context {
@@ -205,7 +218,6 @@ public final class Node: @unchecked Sendable {
         let repo: Repository
         let args: [String]
         var arg: String? { args.first }
-        let enforced: [String]
         var user: User? { User.current }
     }
 
@@ -221,6 +233,8 @@ public final class Node: @unchecked Sendable {
                 if p == "*" { captures.append(unescape(s)); return !s.isEmpty }
                 return p == s
             }) else { continue }
+            // what lets the node skip the checks the server made: never the negotiation alone (§12.2)
+            guard route.enforced.isSubset(of: enforced) else { throw Reply(status: 403) }
             let eruptName = captures[0]
             guard req.header("erupt") == eruptName, let entry = lock.locked({ models[eruptName] }) else { throw Reply(status: 404) }
             // nesting is not supported yet, so a parent can only vouch for itself
@@ -236,7 +250,7 @@ public final class Node: @unchecked Sendable {
                 }
                 return User(json)
             }
-            let context = Context(request: req, model: entry.model, repo: entry.repo, args: Array(captures.dropFirst()), enforced: enforced)
+            let context = Context(request: req, model: entry.model, repo: entry.repo, args: Array(captures.dropFirst()))
             return try Node.$token.withValue(req.header("token")) {
                 try User.$current.withValue(user) { try route.handler(self)(context) }
             }
@@ -244,12 +258,9 @@ public final class Node: @unchecked Sendable {
         throw Reply(status: 404)
     }
 
-    /// A signed call must verify, and then stands for the token; its Erupt-Enforced is trusted only then.
-    private func authenticate(_ req: NodeRequest) throws -> [String] {
-        guard let signature = req.header("Erupt-Signature") else {
-            guard !requireSignature, constantTimeEquals(req.header("Access-Token") ?? "", accessToken) else { throw Reply(status: 403) }
-            return []
-        }
+    /// Every call is signed (§12.2); its Erupt-Enforced is what the server vouches for.
+    private func authenticate(_ req: NodeRequest) throws -> Set<String> {
+        guard let signature = req.header("Erupt-Signature") else { throw Reply(status: 403) }
         let enforced = req.header("Erupt-Enforced")
         let multipart = (req.header("Content-Type") ?? "").contains("multipart/form-data")
         let ok = Signature.verify(
@@ -257,39 +268,37 @@ public final class Node: @unchecked Sendable {
             timestamp: req.header("Erupt-Timestamp"), enforced: enforced, user: req.header("user"),
             body: multipart ? nil : req.body, signature: signature, now: Int64(Date().timeIntervalSince1970))
         guard ok else { throw Reply(status: 403) }
-        return (enforced ?? "").split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        return Set((enforced ?? "").split(separator: ",").map(String.init).filter { !$0.isEmpty })
     }
 
     // MARK: - endpoints
 
-    private func build(_ c: Context) throws -> JSON { c.model.buildModel(power: try power(c.model, c), user: c.user) }
-
-    private func table(_ c: Context) throws -> JSON {
-        try requirePower(c.model, c, "query")
-        return try page(c.model, c.repo, try readObject(c), c)
+    /// The rights the model switches off and the features this SDK does not serve yet (§12.3).
+    private func build(_ c: Context) throws -> JSON {
+        c.model.buildModel(power: c.model.power.merging(Node.unsupportedPower) { _, off in off }, user: c.user)
     }
 
-    private func page(_ model: Model, _ repo: Repository, _ body: [String: JSON], _ c: Context) throws -> JSON {
+    private func table(_ c: Context) throws -> JSON { try page(c.model, c.repo, try readObject(c)) }
+
+    private func page(_ model: Model, _ repo: Repository, _ body: [String: JSON]) throws -> JSON {
         let pageIndex = max(try int(body["pageIndex"] ?? 1), 1)
         let pageSize = min(max(try int(body["pageSize"] ?? 10), 1), Node.maxPageSize)
         var query = Query(offset: (pageIndex - 1) * pageSize, limit: pageSize)
-        // under a signed "query" the server checked the browser's conditions and may add its own (a dependent picker)
-        let trusted = c.enforced.contains("query")
-        for cond in body["condition"]?.array ?? [] { query.conditions += try conditions(model, cond, trusted: trusted) }
-        let drill = try self.drill(model, c, &query)
+        // checked and normalized by the server, a drill's join and a link tree's keys among them (§12.4)
+        for cond in body["condition"]?.array ?? [] { query.conditions += try conditions(model, cond) }
         for s in body["sort"]?.array ?? [] {
+            // "field.column" sorts by a reference's label: the server resolves labels, the node orders by the key
             let fieldName = s["field"]?.text ?? ""
-            guard let f = model.field(fieldName), f.sortable || f.pk else { throw EruptFailure("illegal sort field '\(fieldName)'") }
+            guard let f = model.field(String(fieldName.split(separator: ".", omittingEmptySubsequences: false).first ?? "")) else {
+                throw EruptFailure("illegal sort field '\(fieldName)'")
+            }
             query.sort.append((f.name, (s["direction"]?.text ?? "").uppercased() == "DESC"))
         }
-        // a @LinkTree table shows the rows under the picked tree keys; with dependNode, none until one is picked
-        let picked = body["linkTreeVal"].flatMap { $0 == .null ? nil : $0 }
-        if let link = model.linkTree, let picked { query.conditions.append(try condition(model.field(link.field)!, "IN", picked)) }
-        // a @Vis view's own filter and order, then the DataProxy's
+        // a @Vis view's own filter and order, a drill's linkCondition, then the DataProxy's
         let vis = body["vis"]?.string.flatMap { model.vis[$0] }
         if query.sort.isEmpty { query.sort = vis?.order.isEmpty == false ? vis!.order : model.order }
-        query.filters = drill + (vis?.filters ?? []) + (try model.filters(query.conditions))
-        let (total, records) = model.linkTree?.dependNode == true && picked == nil ? (0, []) : try repo.page(query)
+        query.filters = try drill(body) + (vis?.filters ?? []) + (try model.filters(query.conditions))
+        let (total, records) = try repo.page(query)
         var list = rows(model, records)
         try model.hook { try $0.afterFetch(&list) }
         return [
@@ -299,65 +308,57 @@ public final class Node: @unchecked Sendable {
         ]
     }
 
-    /// A drill into this table from a row of another model (erupt-cloud/PROTOCOL.md §7.2): the rows whose
-    /// joinColumn holds the source row's column; its linkCondition is returned as a filter.
-    private func drill(_ model: Model, _ c: Context, _ query: inout Query) throws -> [SQLFilter] {
-        guard let code = c.request.header("Drill") else { return [] }
-        guard let source = lock.locked({ models[c.request.header("DrillSourceErupt") ?? ""] }), let link = source.model.drills[code] else {
+    /// A drilled table (§12.4): the server sent the join as a condition and names the drill, whose linkCondition the
+    /// node adds. The source model must be on this node and declare that drill.
+    private func drill(_ body: [String: JSON]) throws -> [SQLFilter] {
+        guard let drill = body["drill"], drill != .null else { return [] }
+        guard let source = lock.locked({ models[drill["erupt"]?.text ?? ""] }), let condition = source.model.drills[drill["code"]?.text ?? ""] else {
             throw Reply(status: 403)
         }
-        guard link.erupt == model.name, let join = model.field(link.join) else { throw EruptFailure("illegal erupt from drill '\(code)'") }
-        guard let row = try source.repo.get(try pkOf(source.model, .string(c.request.header("DrillValue") ?? ""))) else {
-            throw EruptFailure("record not found")
-        }
-        query.conditions.append(try condition(join, "EQ", row[link.column] ?? .null))
-        return link.condition.isEmpty ? [] : [SQLFilter(link.condition)]
+        return condition.isEmpty ? [] : [SQLFilter(condition)]
     }
 
-    private func conditions(_ model: Model, _ c: JSON, trusted: Bool) throws -> [Cond] {
+    private func conditions(_ model: Model, _ c: JSON) throws -> [Cond] {
+        // a name the node puts into a query is one of its stored fields, whoever sends it (§12.6)
         let key = c["key"]?.text ?? ""
-        guard let f = model.field(key), trusted || (!f.pk && f.search) else { throw EruptFailure("illegal search field '\(key)'") }
-        let op = c["expression"]?.string ?? "EQ"
+        guard let f = model.field(key) else { throw EruptFailure("illegal search field '\(key)'") }
+        // so is the operator: an unknown one must fail, never be left out of the query (§12.6)
+        let op = c["expression"]?.text ?? ""
         guard Node.ops.contains(op) else { throw EruptFailure("illegal operator '\(op)'") }
         let value = c["value"] ?? .null
-        guard f.isJSON else { return [try condition(f, op, value)] }
-        // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
-        guard ["EQ", "IN", "NEQ", "NOT_IN"].contains(op) else { throw EruptFailure("illegal operator '\(op)' for \(f.title)") }
-        let like = op == "EQ" || op == "IN" ? "LIKE" : "NOT_LIKE"
-        let values = value.array ?? (value == .null ? [] : [value])
-        return values.map { Cond(f.name, like, .string(JSON.string($0.text).serialized())) }
-    }
-
-    private func condition(_ f: Field, _ op: String, _ value: JSON) throws -> Cond {
-        if op == "NULL" || op == "NOT_NULL" { return Cond(f.name, op) }
-        if f.isReference, !["EQ", "NEQ", "IN", "NOT_IN"].contains(op) { throw EruptFailure("illegal operator '\(op)' for a reference") }
+        if f.isJSON, ["EQ", "IN", "NEQ", "NOT_IN"].contains(op) {
+            // a JSON value (MULTI_CHOICE) holds every value searched for, matched as "<value>" in its text
+            let like = op == "EQ" || op == "IN" ? "LIKE" : "NOT_LIKE"
+            let values = value.array ?? (value == .null ? [] : [value])
+            return values.map { Cond(f.name, like, .string(JSON.string($0.text).serialized())) }
+        }
         switch op {
-        case "LIKE", "NOT_LIKE": return Cond(f.name, op, .string(value == .null ? "" : value.text))
-        case "RANGE":
-            guard let range = value.array, range.count == 2 else { throw EruptFailure("range needs two values") }
-            return Cond(f.name, op, .array(try range.map { try coerce(f, $0) }))
-        case "IN", "NOT_IN": return Cond(f.name, op, .array(try (value.array ?? [value]).map { try coerce(f, $0) }))
-        default: return Cond(f.name, op, try coerce(f, value))
+        case "NULL", "NOT_NULL": return [Cond(f.name, op)]
+        case "LIKE", "NOT_LIKE": return [Cond(f.name, op, .string(value == .null ? "" : value.text))]
+        default:
+            // values arrive as the JSON type their field stores; converted to what the repository stores
+            do {
+                if ["RANGE", "IN", "NOT_IN"].contains(op) { return [Cond(f.name, op, .array(try (value.array ?? [value]).map(f.coerce)))] }
+                return [Cond(f.name, op, try f.coerce(value))]
+            } catch let failure as EruptFailure {
+                throw EruptFailure("\(f.title): \(failure.message)")
+            }
         }
     }
 
     private func initValue(_ c: Context) throws -> JSON {
-        try requirePower(c.model, c, "add")
         var record = Record(uniqueKeysWithValues: c.model.fieldNames.map { ($0, JSON.null) })
         try c.model.hook { try $0.addBehavior(&record) }
         return .object(rows(c.model, [record])[0])
     }
 
     private func get(_ c: Context) throws -> JSON {
-        let granted = try power(c.model, c)
-        guard granted["edit"] == true || granted["viewDetails"] == true else { throw Reply(status: 403) }
         guard var record = try c.repo.get(try pkOf(c.model, .string(c.arg!))) else { throw EruptFailure("record not found") }
         try c.model.hook { try $0.editBehavior(&record) }
         return .object(rows(c.model, [record])[0])
     }
 
     private func add(_ c: Context) throws -> JSON {
-        try requirePower(c.model, c, "add")
         var rec = try record(c.model, try readObject(c))
         try c.model.hook { try $0.validate(rec) }
         try c.model.hook { try $0.beforeAdd(&rec) }
@@ -367,7 +368,6 @@ public final class Node: @unchecked Sendable {
     }
 
     private func update(_ c: Context) throws -> JSON {
-        try requirePower(c.model, c, "edit")
         let body = try readObject(c)
         let pk = try pkOf(c.model, body[c.model.pk!] ?? .null)
         guard try c.repo.get(pk) != nil else { throw EruptFailure("record not found") }
@@ -380,7 +380,6 @@ public final class Node: @unchecked Sendable {
     }
 
     private func delete(_ c: Context) throws -> JSON {
-        try requirePower(c.model, c, "delete")
         guard let ids = try readJSON(c)?.array else { throw EruptFailure("a list of ids is required") }
         let pks = try ids.map { try pkOf(c.model, $0) }
         // the hooks see each record as it was; reading them costs nothing without a proxy
@@ -452,19 +451,17 @@ public final class Node: @unchecked Sendable {
 
     private func coerce(_ f: Field, _ value: JSON) throws -> JSON { try f.coerce(value) }
 
+    /// A record the server checked and normalized (§12.4), as the repository stores it.
     private func record(_ model: Model, _ body: [String: JSON]) throws -> Record {
         var out: Record = [:]
         for name in model.fieldNames {
             let f = model.field(name)!
             if f.pk || !f.form { continue }
-            let value: JSON
             do {
-                value = try f.coerce(body[name] ?? .null)
+                out[name] = try f.coerce(body[name] ?? .null)
             } catch let failure as EruptFailure {
                 throw EruptFailure("\(f.title): \(failure.message)")
             }
-            if f.notNull, value == .null { throw EruptFailure("\(f.title) cannot be empty") }
-            out[name] = value
         }
         return out
     }
@@ -474,37 +471,6 @@ public final class Node: @unchecked Sendable {
             "success": .bool(success), "status": success ? "SUCCESS" : "ERROR", "message": message.map(JSON.string) ?? nil,
             "data": data, "promptWay": "MESSAGE",
         ]
-    }
-
-    // MARK: - permissions (PROTOCOL.md §6.1)
-
-    private func requirePower(_ model: Model, _ c: Context, _ right: String) throws {
-        guard try power(model, c)[right] == true else { throw Reply(status: 403) }
-    }
-
-    private func power(_ model: Model, _ c: Context) throws -> [String: Bool] {
-        var granted = model.power.merging(Node.unsupportedPower) { _, off in off }
-        // the server checked the user's rights and restricts the build's power itself: the model's own
-        // declaration is all that is left to apply here
-        if c.enforced.contains("power") { return granted }
-        let token = c.request.header("token") ?? ""
-        let key = "\(token)\n\(model.name)"
-        let now = ProcessInfo.processInfo.systemUptime
-        if let cached = lock.locked({ powerCache[key] }), cached.expires > now { return cached.power }
-        var remote: [String: JSON] = [:]
-        do {
-            remote = try serverCall(
-                "GET", "/erupt-cloud-api/erupt-power", query: ["nodeName": name, "eruptName": model.name],
-                headers: ["token": token])?.object ?? [:]
-        } catch {  // fail closed: without the server's verdict nothing is writable
-            log(.warn, "erupt-power unavailable: \(error)")
-        }
-        for right in Node.serverPower { granted[right] = (granted[right] ?? false) && remote[right]?.bool == true }
-        lock.locked {
-            if powerCache.count > 10_000 { powerCache.removeAll() }
-            powerCache[key] = (now + Node.powerTTL, granted)
-        }
-        return granted
     }
 
     // MARK: - server calls
@@ -540,21 +506,12 @@ public final class Node: @unchecked Sendable {
         let description: String
     }
 
-    /// GET with a query (JSON answer), or POST a JSON / form body; throws unless the server answers 2xx.
-    private func serverCall(
-        _ method: String, _ path: String, server: String? = nil, query: [String: String]? = nil, json: JSON? = nil,
-        form: [String: String]? = nil, headers: [String: String] = [:], timeout: TimeInterval = 5
-    ) throws -> JSON? {
-        let data = try serverData(method, path, server: server, query: query, json: json, form: form, headers: headers, timeout: timeout)
-        return data.isEmpty ? nil : try JSON.parse(Array(data))
-    }
-
+    /// GET, or POST a JSON / form body; throws unless the server answers 2xx.
     private func serverData(
-        _ method: String, _ path: String, server: String? = nil, query: [String: String]? = nil, json: JSON? = nil,
-        form: [String: String]? = nil, headers: [String: String] = [:], timeout: TimeInterval = 5
+        _ method: String, _ path: String, server: String? = nil, json: JSON? = nil, form: [String: String]? = nil,
+        headers: [String: String] = [:], timeout: TimeInterval = 5
     ) throws -> Data {
-        guard var url = URLComponents(string: (server ?? nextServer()) + path) else { throw ServerError(description: "illegal server URL") }
-        if let query { url.queryItems = query.keys.sorted().map { URLQueryItem(name: $0, value: query[$0]) } }
+        guard let url = URLComponents(string: (server ?? nextServer()) + path) else { throw ServerError(description: "illegal server URL") }
         var request = URLRequest(url: url.url!, timeoutInterval: timeout)
         request.httpMethod = method
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }

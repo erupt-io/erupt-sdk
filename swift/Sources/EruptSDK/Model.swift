@@ -42,7 +42,10 @@ public struct FormChange {
     }
 
     var json: JSON {
-        var o: [String: JSON] = ["formData": .object(formData), "editExpr": .object(editExpr)]
+        // nothing to change answers an empty object (as the Go and Python SDKs do); a missing key changes nothing
+        var o: [String: JSON] = [:]
+        if !formData.isEmpty { o["formData"] = .object(formData) }
+        if !editExpr.isEmpty { o["editExpr"] = .object(editExpr) }
         if let eval { o["eval"] = .string(eval) }
         return .object(o)
     }
@@ -108,6 +111,20 @@ public struct Field {
     static let collections = [EditType.checkbox.rawValue, EditType.tabTree.rawValue, EditType.transfer.rawValue]
     /// the edit attribute that names a fetchHandler, by the type that fetches options
     static let fetched = [EditType.choice.rawValue: "choiceType", EditType.multiChoice.rawValue: "multiChoiceType", EditType.tags.rawValue: "tagsType"]
+    /// the edit types this SDK stores and serves (DATE_TIME is a DATE with a time picker)
+    static let supported: Set<String> = Set(
+        [
+            EditType.attachment, .autoComplete, .boolean, .button, .checkbox, .choice, .codeEditor, .color, .date, .hidden,
+            .htmlEditor, .icon, .input, .map, .markdown, .multiChoice, .number, .rate, .referenceTable, .referenceTree,
+            .signature, .slider, .tabTree, .tags, .textarea, .transfer,
+        ].map(\.rawValue) + [dateTimeType])
+    /// fieldReturnName by edit type (PROTOCOL.md §7.1); a reference names its target, the rest are "String"
+    /// the edit types that hold a number (NUMBER, RATE, SLIDER)
+    static let numeric: Set<String> = [EditType.number.rawValue, EditType.rate.rawValue, EditType.slider.rawValue]
+    static let returnNames = [
+        EditType.number.rawValue: "number", EditType.rate.rawValue: "number", EditType.slider.rawValue: "number",
+        EditType.boolean.rawValue: "Boolean", EditType.date.rawValue: "Date", dateTimeType: "Date",
+    ]
 
     var isCollection: Bool { Field.collections.contains(type) }
 
@@ -126,8 +143,6 @@ public struct Field {
 
     mutating func resolve(_ path: String) throws {
         guard isIdentifier(name) else { throw DeclarationError("\(path): name must be an identifier") }
-        if let view { try Schema.check("View", view.json, path: "\(path).view") }
-        if let edit { try Schema.check("Edit", edit.json, path: "\(path).edit") }
         if pk { return }
         var fetchesOptions = false
         if case .options = fetch { fetchesOptions = true }
@@ -152,7 +167,7 @@ public struct Field {
                 }
             }
         }
-        guard Model.defaults["fields"]?[type] != nil else {
+        guard Field.supported.contains(type) else {
             throw DeclarationError("\(path): edit type \(type) is not supported yet")
         }
         var fetchFits = true
@@ -175,103 +190,83 @@ public struct Field {
         }
     }
 
+    /// The field as declared (PROTOCOL.md §12.3): the server completes the rest from Java's defaults.
     func build() -> JSON {
-        var tpl = Model.defaults["fields"]![pk ? "id" : type]!
-        tpl["fieldName"] = .string(name)
-        tpl["componentValue"] = .null
-        if pk { return tpl }
-        var edit = tpl["eruptFieldJson"]!["edit"]!
-        // a BUTTON is a form element only: its template has no table column
-        let columns = !(tpl["eruptFieldJson"]!["views"]!.array?.isEmpty ?? true)
-        var view = tpl["eruptFieldJson"]!["views"]![0] ?? [:]
-        edit["title"] = .string(title)
-        edit["notNull"] = .bool(notNull)
-        edit["show"] = .bool(form)
-        edit["search"]!["value"] = .bool(search)
-        view["title"] = .string(title)
-        view["sortable"] = .bool(sortable)
-        if type == EditType.date.rawValue { view["type"] = "DATE" }
-        if let (target, label, _) = reference, isCollection {
-            // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
-            tpl["fieldReturnName"] = .string(target.name)
-            view["column"] = .string(label)
-        } else if let (target, label, pid) = reference {
-            tpl["fieldReturnName"] = .string(target.name)
-            let picker = type == EditType.referenceTable.rawValue ? "referenceTableType" : "referenceTreeType"
-            edit[picker]!["id"] = .string(target.pk!)
-            edit[picker]!["label"] = .string(label)
-            if let pid { edit[picker]!["pid"] = .string(pid) }
-            view["column"] = .string(label)
+        if pk {
+            return [
+                "fieldName": .string(name), "fieldReturnName": "number", "componentValue": nil,
+                "eruptFieldJson": ["edit": ["title": "", "type": "NUMBER"]],
+            ]
         }
-        if fetch != nil, let attr = Field.fetched[type] { edit[attr]!["fetchHandler"] = ["invoke"] }
+        // a DATE_TIME is a DATE whose dateType says so; a DATE says it too, as AUTO is the node's to resolve
+        var edit: JSON = ["title": .string(title), "type": .string(type == dateTimeType ? EditType.date.rawValue : type)]
+        if type == dateTimeType || type == EditType.date.rawValue { edit["dateType"] = ["type": .string(type)] }
+        if notNull { edit["notNull"] = true }
+        if !form { edit["show"] = false }
+        if search { edit["search"] = ["value": true] }
+        var view: JSON = ["title": .string(title)]
+        if sortable { view["sortable"] = true }
+        var returnName = Field.returnNames[type] ?? "String"
+        if let (target, label, pid) = reference {
+            // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
+            returnName = target.name
+            view["column"] = .string(label)
+            if type == EditType.referenceTable.rawValue {
+                edit["referenceTableType"] = ["id": .string(target.pk!), "label": .string(label)]
+            } else if type == EditType.referenceTree.rawValue {
+                edit["referenceTreeType"] = ["id": .string(target.pk!), "label": .string(label), "pid": pid.map(JSON.string) ?? ""]
+            }
+        }
+        if fetch != nil, let attr = Field.fetched[type] { edit[attr] = ["fetchHandler": ["invoke"]] }
         if onchange != nil { edit["onchange"] = "invoke" }
         if let override = self.edit { merge(&edit, override.json) }
-        if let dependColumn { edit["referenceTableType"]!["dependColumn"] = .string(dependColumn) }
+        // @Transient in Java: not in ReferenceTableType, read by the server off the build
+        if let dependColumn {
+            if edit["referenceTableType"] == nil { edit["referenceTableType"] = [:] }
+            edit["referenceTableType"]!["dependColumn"] = .string(dependColumn)
+        }
         if let override = self.view { merge(&view, override.json) }
-        tpl["eruptFieldJson"]!["edit"] = edit
-        tpl["eruptFieldJson"]!["views"] = table && columns ? [view] : []
+        // a BUTTON is a form element only: no table column
+        let views: JSON = table && type != EditType.button.rawValue ? [view] : []
+        var options: JSON = nil
         if let choices {  // CHOICE, or MULTI_CHOICE over a JSON array
-            tpl["componentValue"] = .array(choices.map {
+            options = .array(choices.map {
                 ["value": .string($0.value), "label": .string($0.label), "desc": nil, "color": nil, "disable": false]
             })
         }
-        return tpl
+        return [
+            "fieldName": .string(name), "fieldReturnName": .string(returnName), "componentValue": options,
+            "eruptFieldJson": ["edit": edit, "views": views],
+        ]
     }
 
-    /// A JSON value from the browser as the value the repository stores.
+    /// A JSON value as the server sends it (PROTOCOL.md §12.4) as the value the repository stores: a DATE_TIME in
+    /// its stored form, a number as a number, a key as its key type. The server has checked it; a key in a path
+    /// segment, a delete body or an operation's ids arrives as the browser sent it, so it may fail here.
     func coerce(_ value: JSON) throws -> JSON {
         if isCollection, let (target, _, _) = reference {
-            // picked records arrive as [{"id": key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), and are stored as keys
-            var v = value
-            if case .string(let s) = value { v = s.isEmpty ? [] : (try? JSON.parse(s)) ?? .null }
-            if value == .null { v = [] }
-            guard let items = v.array else { throw EruptFailure("must be a JSON array") }
+            // the picked keys, stored as the JSON list of them
+            if value == .null { return [] }
+            guard let items = value.array else { throw EruptFailure("must be a JSON array") }
             let pk = target.fields[target.pk!]!
-            return .array(try items.map { item in
-                guard case .object(let o) = item else { return try pk.coerce(item) }
-                return try pk.coerce(o[target.pk!] ?? o["id"] ?? .null)
-            })
+            return .array(try items.map { try pk.coerce($0) })
         }
-        if let (target, _, _) = reference {
-            // the browser sends the picked record as {<id>: ..., <label>: ...}
-            var v = value
-            if case .object(let o) = value { v = o[target.pk!] ?? .null }
-            return try target.fields[target.pk!]!.coerce(v)
-        }
+        if let (target, _, _) = reference { return try target.fields[target.pk!]!.coerce(value) }
         if value == .null || value == "" { return .null }
         if pk {
             if let i = value.int, value.double != nil { return .int(i) }
             if case .string(let s) = value, let i = Int64(s.trimmingSpaces) { return .int(i) }
             throw EruptFailure("illegal id '\(value.text)'")
         }
-        if isJSON {
-            var v = value
-            if case .string(let s) = value {
-                guard let parsed = try? JSON.parse(s) else { throw EruptFailure("must be a JSON array or object") }
-                v = parsed
-            }
-            switch v {
-            case .array(let items):
-                if let choices, let bad = items.first(where: { item in !choices.contains { $0.value == item.text } }) {
-                    throw EruptFailure("illegal option '\(bad.text)'")
-                }
-                return v
-            case .object: return v
-            default: throw EruptFailure("must be a JSON array or object")
-            }
-        }
+        if isJSON { return value }
         switch type {
         case EditType.boolean.rawValue:
             if case .bool = value { return value }
             return .bool(["true", "1"].contains(value.text.lowercased()))
-        case EditType.number.rawValue, EditType.rate.rawValue, EditType.slider.rawValue: return try Values.number(value)
+        case _ where Field.numeric.contains(type): return try Values.number(value)
+        // the server sends `yyyy-MM-dd HH:mm:ss`; stored as `yyyy-MM-ddTHH:mm:ss.SSS`, which compares as text
         case dateTimeType: return .string(try Values.dateTime(value))
         case EditType.date.rawValue: return .string(try Values.date(value))
-        case EditType.choice.rawValue:
-            if let choices, !choices.contains(where: { $0.value == value.text }) {
-                throw EruptFailure("illegal option '\(value.text)'")
-            }
-            return .string(value.text)
         default: return .string(value.text)
         }
     }
@@ -361,15 +356,12 @@ public struct RowAction {
 
     func isVisible(to user: User?) -> Bool { show?(user) ?? true }
 
+    /// The operation as declared (PROTOCOL.md §12.3).
     func build() -> JSON {
-        var tpl = Model.defaults["rowOperation"]!
-        tpl["code"] = .string(code)
-        tpl["title"] = .string(title)
-        tpl["mode"] = mode.json
-        tpl["tip"] = .string(tip)
-        tpl["ifExpr"] = .string(ifExpr)
-        tpl["type"] = "ERUPT"
-        tpl["eruptClass"] = .string(form?.name ?? "void")
+        var tpl: JSON = [
+            "code": .string(code), "title": .string(title), "mode": mode.json, "tip": .string(tip), "ifExpr": .string(ifExpr),
+            "eruptClass": .string(form?.name ?? "void"),
+        ]
         if let icon { tpl["icon"] = .string(icon) }
         switch confirm {
         case .ask: break
@@ -437,9 +429,10 @@ public struct VisQuery {
     public init(filter: String, orderBy: String? = nil) { self.init(filter: [filter], orderBy: orderBy) }
 }
 
-/// What the node applies when a table is drilled into from a row of this model, given as `Model(..., drillJoin:)`
-/// under the drill's code: the linked model's rows whose `joinColumn` (a field, `"author"` or `"author.id"`) holds
-/// the row's `column`. Java keeps both `@Transient`: they are not in `Link` and never in the build.
+/// How a drill from a row of this model joins the linked model, given as `Model(..., drillJoin:)` under the drill's
+/// code: the linked model's rows whose `joinColumn` (a field, `"author"` or `"author.id"`) holds the row's `column`.
+/// Java keeps both `@Transient`, so they are not in `Link`; they are written into the drill's link in the build, as
+/// the server turns a drill into a condition (PROTOCOL.md §12.3, §12.4).
 public struct DrillJoin {
     let column: String
     let joinColumn: String
@@ -469,9 +462,8 @@ public enum ModelBuilder {
 
 /// A declared erupt model, compiled into erupt build JSON.
 ///
-/// Nothing here re-implements annotation semantics. Every field and operation starts from the template the
-/// Java proxies emit (erupt-node-defaults.json, generated by erupt-test NodeDefaultsTest); a declaration only
-/// overrides values on top of it.
+/// Nothing here re-implements annotation semantics. The build carries only what a model declares; the server
+/// completes every annotation from its Java defaults and checks it (erupt-cloud/PROTOCOL.md §12.3, protocol v2).
 ///
 /// ```swift
 /// let article = try Model("Article", orderBy: "id desc") {
@@ -481,10 +473,11 @@ public enum ModelBuilder {
 /// }
 /// ```
 public final class Model {
-    static let defaults: JSON = {
-        guard let d = try? JSON.parse(Embedded.nodeDefaults) else { fatalError("the embedded erupt-node-defaults.json is malformed") }
-        return d
-    }()
+    /// rights a model may switch off (@Erupt power, PowerObject)
+    static let rights: Set<String> = [
+        "add", "edit", "delete", "query", "viewDetails", "export", "importable", "print", "copy", "cellEdit", "batchEdit",
+        "ai", "comment", "revision",
+    ]
 
     /// The erupt name the server addresses as `<node>.<name>`.
     public let name: String
@@ -493,6 +486,7 @@ public final class Model {
     public let pk: String?
     /// The stored fields, in declaration order (virtual ones left out).
     public let fieldNames: [String]
+    /// the rights the model switches off; the server enforces them and the user's (PROTOCOL.md §12.5)
     let power: [String: Bool]
     let raw: Erupt?
     let declared: [Field]
@@ -503,17 +497,17 @@ public final class Model {
     let order: [(field: String, descending: Bool)]
     /// view code -> the filters and order the node applies to that view's table queries
     let vis: [String: (filters: [SQLFilter], order: [(field: String, descending: Bool)])]
-    /// (field, dependNode) of a @LinkTree: the reference the tree beside the table filters
-    let linkTree: (field: String, dependNode: Bool)?
-    /// drill code -> the linked model, the source row's column, the linked field holding it and the linkCondition
-    let drills: [String: (erupt: String, column: String, join: String, condition: String)]
+    /// drill code -> its linkCondition, which the node adds to a drilled table (PROTOCOL.md §12.4)
+    let drills: [String: String]
+    /// drill code -> the columns its link joins on, written into the build
+    private let drillJoins: [String: DrillJoin]
 
     /// `name` is what the server addresses; `power` switches features off (`["delete": false]`); `orderBy` is
     /// the default table order (`"views desc, id"`); `erupt` carries other `@Erupt` attributes
     /// (`Erupt(layout: Layout(pageSize: 30))`); `dataProxy` runs around every read and write of the model, in
     /// order; `visQuery` gives a `@Vis` view (by its code, or its title when it has none) a filter and an order;
     /// `drillJoin` gives every drill (by its code, or its title when it has none) the columns it joins on.
-    /// An unknown attribute or value fails here, not in the browser.
+    /// A misspelt power key, order or drill fails here; the server checks every other attribute (PROTOCOL.md §12.3).
     public init(
         _ name: String, title: String? = nil, power: [String: Bool] = [:], orderBy: String? = nil, erupt: Erupt? = nil,
         dataProxy: [DataProxy] = [], visQuery: [String: VisQuery] = [:], drillJoin: [String: DrillJoin] = [:],
@@ -522,12 +516,10 @@ public final class Model {
         guard isIdentifier(name) else { throw DeclarationError("erupt name '\(name)' must be an identifier") }
         self.name = name
         self.title = title ?? name
-        var granted = Dictionary(uniqueKeysWithValues: (Model.defaults["power"]?.object ?? [:]).map { ($0, $1.bool ?? false) })
-        for (right, value) in power {
-            guard granted[right] != nil else { throw DeclarationError("erupt \(name): unknown power '\(right)'") }
-            granted[right] = value
+        if let right = power.keys.sorted().first(where: { !Model.rights.contains($0) }) {
+            throw DeclarationError("erupt \(name): unknown power '\(right)', expected some of \(Model.rights.sorted().joined(separator: ", "))")
         }
-        self.power = granted
+        self.power = power
         var erupt = erupt
         // a view without a code is addressed by its title
         let views = erupt?.vis?.map { v in
@@ -543,20 +535,20 @@ public final class Model {
             return d
         }
         erupt?.drills = drillList
-        var drills: [String: (erupt: String, column: String, join: String, condition: String)] = [:]
+        var drills: [String: String] = [:]
         for d in drillList ?? [] {
-            guard let target = d.link?.linkErupt, let join = drillJoin[d.code!] else {
+            guard d.link?.linkErupt?.isEmpty == false, drillJoin[d.code!]?.joinColumn.isEmpty == false else {
                 throw DeclarationError("erupt \(name): drill '\(d.code!)' needs link.linkErupt and a drillJoin")
             }
-            drills[d.code!] = (target, join.column, String(join.joinColumn.split(separator: ".").first ?? ""), d.link?.linkCondition ?? "")
+            drills[d.code!] = d.link?.linkCondition ?? ""
         }
         if let code = drillJoin.keys.sorted().first(where: { drills[$0] == nil }) {
             throw DeclarationError("erupt \(name): drillJoin '\(code)' is not a declared drill")
         }
         self.drills = drills
+        self.drillJoins = drillJoin
         self.raw = erupt
         self.proxies = dataProxy
-        if let erupt { try Schema.check("Erupt", erupt.json, path: "erupt \(name)") }
 
         var declared: [Field] = [], fields: [String: Field] = [:], names: [String] = [], actions: [RowAction] = []
         var pk: String?
@@ -580,7 +572,6 @@ public final class Model {
                 guard !actions.contains(where: { $0.code == a.code }) else {
                     throw DeclarationError("\(name): operation code '\(a.code)' declared twice")
                 }
-                if let raw = a.raw { try Schema.check("RowOperation", raw.json, path: "operation \(a.code)") }
                 actions.append(a)
             }
         }
@@ -605,9 +596,9 @@ public final class Model {
         if let code = visQuery.keys.sorted().first(where: { !codes.contains($0) }) {
             throw DeclarationError("\(name): visQuery '\(code)' is not a declared vis")
         }
-        self.linkTree = erupt?.linkTree?.field.flatMap { $0.isEmpty ? nil : ($0, erupt?.linkTree?.dependNode ?? false) }
-        if let link = linkTree, fields[link.field]?.isReference != true {
-            throw DeclarationError("\(name): linkTree.field '\(link.field)' must be a reference field")
+        // the server filters by the tree beside the table (PROTOCOL.md §12.4); the field it names is checked here
+        if let field = erupt?.linkTree?.field, !field.isEmpty, fields[field]?.isReference != true {
+            throw DeclarationError("\(name): linkTree.field '\(field)' must be a reference field")
         }
     }
 
@@ -632,17 +623,15 @@ public final class Model {
     }
 
     func buildErupt(_ actions: [RowAction] = []) -> JSON {
-        var erupt = Model.defaults["erupt"]!
-        erupt["primaryKeyCol"] = .string(pk ?? "id")
-        erupt["rowOperation"] = .array(actions.map { $0.build() })
+        var erupt: JSON = ["primaryKeyCol": .string(pk ?? "id"), "rowOperation": .array(actions.map { $0.build() })]
         if let raw { merge(&erupt, raw.json) }
-        // a drill as Java emits it: every attribute left out at its default
+        // a drill's link goes to the server whole: it reads the source row and joins on column / joinColumn
         if let drills = raw?.drills {
             erupt["drills"] = .array(drills.map { d in
-                var o = JSON.object(Schema.defaults("Drill"))
-                merge(&o, d.json)
-                o["link"] = .object(Schema.defaults("Link"))
-                merge(&o["link"]!, d.link!.json)
+                var o = d.json
+                let join = drillJoins[d.code!]!
+                o["link"]!["column"] = .string(join.column)
+                o["link"]!["joinColumn"] = .string(join.joinColumn)
                 return o
             })
         }

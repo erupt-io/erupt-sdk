@@ -28,10 +28,18 @@ node.serve(port: 9090)
 2. Add a menu of type `table` with value `blog.Article`.
 3. Run the node. The server must be able to reach it on `http://<node ip>:9090`; pass `address:` otherwise.
 
+The node speaks node protocol v2 (erupt-cloud `PROTOCOL.md` §12), so the erupt server must speak it too: an
+older server is reported in the log and the node stops registering. The server signs every call with the access
+token, enforces the user's rights and the ones a model switches off (`power:`), checks and normalizes queries
+and records, and turns drills and link trees into plain conditions; the node stores rows and runs your code.
+
 `field name, title, kind` infers the edit type from `kind`: `String` (or nothing) INPUT, `Integer` / `Float`
 NUMBER, `:boolean` BOOLEAN, `Date` DATE, `Time` DATE_TIME, `choices:` CHOICE; `type:` overrides it.
 `view: {...}` / `edit: {...}` on a field and extra keywords on `erupt` pass raw annotation attributes through.
-Enum values have constants (`Erupt::EditType::TEXTAREA`, `Erupt::RowOperationMode::SINGLE`, ...).
+Enum values have constants (`Erupt::EditType::TEXTAREA`, `Erupt::RowOperationMode::SINGLE`, ...). The build
+carries only what a model declares: the erupt server completes it from the annotation defaults and refuses a
+misspelt attribute, naming the model and the attribute. An unknown edit type, operation mode or `power:` right
+fails when the model is declared.
 
 Records are hashes keyed by field name (`row["title"]`); hashes handed to a repository may use symbols.
 
@@ -160,7 +168,7 @@ Dragging on a board, calendar or gantt view is saved by the erupt server through
 
 `tree: { id: "id", label: "name", pid: "parent" }` shows the model as a tree, and
 `linkTree: { field: "category" }` puts the tree of a reference field beside the table: the erupt server builds
-both trees from the node's table, and the node keeps the rows under the picked tree node (`dependNode: true`
+both trees from the node's table and sends the picked tree keys as a condition on that field (`dependNode: true`
 shows none until one is picked). `linkTree.field` must be a reference field.
 
 ## Field types and field code
@@ -201,8 +209,9 @@ picked model's rows whose `dependColumn` holds the depend field's value.
 erupt "Author", drills: [{ title: "Books", link: { linkErupt: "Book", joinColumn: "author" } }]
 ```
 
-opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
-`link.linkCondition` adds SQL as written. Both models must be on the node.
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default): the
+erupt server reads the author and sends that join as a condition. `link.linkCondition` adds SQL as written,
+applied by the node. Both models must be on the node.
 
 ## Server config and user info
 
@@ -251,21 +260,19 @@ From the repository, without RubyGems (Bundler):
 gem "erupt-sdk", git: "https://github.com/erupt-io/erupt-sdk", tag: "ruby/v0.1.0", glob: "ruby/*.gemspec"
 ```
 
-Or copy `ruby/lib/` (`erupt.rb` and `erupt/`, including its `.json` files) onto your load path and
+Or copy `ruby/lib/` (`erupt.rb` and `erupt/`) onto your load path and
 `require "erupt"`. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `Erupt::VERSION` untouched so the server shows which release the node runs.
 
 ## Generated code
 
 `lib/erupt/types.rb` (a constant for every annotation enum value) and `sig/erupt/types.rbs` (RBS records for
 every annotation attribute: `edit`, `view`, `erupt`, `row_operation`, ...) are generated from the erupt
-annotation JSON Schema. Raw `view:` / `edit:` / `erupt` / `operation` attributes are checked against the same
-schema when a model is declared, so a misspelt key or enum value fails at load instead of silently doing
-nothing in the browser.
+annotation JSON Schema (`../schema`). The gem embeds no schema: the erupt server checks every build against it.
 
 After an annotation change in erupt (regenerate there with `mvn -pl erupt-test -Pnode-schema test`):
 
 ```bash
-ruby tools/gen_types.rb ../schema          # sync schemas, regenerate types.rb / types.rbs
+ruby tools/gen_types.rb ../schema          # regenerate types.rb / types.rbs
 ruby tools/gen_types.rb ../schema --check  # CI: fail when stale
 ```
 

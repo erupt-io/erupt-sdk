@@ -22,6 +22,14 @@ Every SDK serves: CRUD with search / sort / paging, CHOICE, dates, references (t
 row operations (with forms, confirm text, per-user visibility) and the server's per-user power; raw
 annotation attributes are typed from and validated against `schema/`.
 
+## Compatibility
+
+Every SDK here speaks node protocol v2 (`erupt-cloud/PROTOCOL.md` §12): the server completes and checks the
+build, enforces the user's rights and the model's, checks and normalizes queries and records, and turns drills
+and link trees into conditions; the node stores rows and runs its own code. A v2 node needs an erupt server that
+speaks v2. Against an older server it logs that the server needs an upgrade and stops registering; it never
+falls back to v1. The Java node (`jvm/`) speaks v1 and ships with erupt.
+
 ## Keeping in step with erupt
 
 `schema/` is the whole contract between the two repositories. After an annotation change erupt regenerates

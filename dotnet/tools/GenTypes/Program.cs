@@ -1,7 +1,7 @@
-// Sync the erupt schemas into the library and regenerate src/Erupt.Sdk/Types.g.cs from them.
+// Regenerate src/Erupt.Sdk/Types.g.cs from the erupt annotation schema.
 //
-//   dotnet run --project tools/GenTypes -- <erupt repo>/schema          copy schemas, regenerate types
-//   dotnet run --project tools/GenTypes -- <erupt repo>/schema --check  fail when anything is out of date (CI)
+//   dotnet run --project tools/GenTypes -- <erupt repo>/schema          regenerate types
+//   dotnet run --project tools/GenTypes -- <erupt repo>/schema --check  fail when they are out of date (CI)
 using Erupt.GenTypes;
 
 var positional = args.Where(a => !a.StartsWith("--")).ToArray();
@@ -23,19 +23,17 @@ if (root is null)
 }
 var library = Path.Combine(root.FullName, "src", "Erupt.Sdk");
 
-var expected = new Dictionary<string, string>();
-foreach (var file in Generator.Resources)
+// the library embeds no schema: the server completes and checks builds (PROTOCOL.md §12.3)
+var source = Path.Combine(schemaDir, Generator.Schema);
+if (!File.Exists(source))
 {
-    var source = Path.Combine(schemaDir, file);
-    if (!File.Exists(source))
-    {
-        Console.Error.WriteLine($"missing {source}");
-        return 2;
-    }
-    expected[Path.Combine(library, "Resources", file)] = File.ReadAllText(source);
+    Console.Error.WriteLine($"missing {source}");
+    return 2;
 }
-expected[Path.Combine(library, "Types.g.cs")] =
-    Generator.Generate(expected[Path.Combine(library, "Resources", "erupt-annotations.schema.json")]);
+var expected = new Dictionary<string, string>
+{
+    [Path.Combine(library, "Types.g.cs")] = Generator.Generate(File.ReadAllText(source)),
+};
 
 var stale = expected.Where(e => !File.Exists(e.Key) || File.ReadAllText(e.Key) != e.Value).Select(e => e.Key).ToList();
 foreach (var path in stale)

@@ -6,6 +6,10 @@ The command must start the fixture described in conformance/README.md, reading E
 ERUPT_SERVER and PORT from the environment. This script plays the erupt server: it accepts the
 registration (probing /node-health like the real one), answers erupt-power per session token, then sends
 the requests the real server would forward and checks the answers. Standard library only.
+
+A node registering with ``protocolVersion: 2`` is checked as a thin node (PROTOCOL.md §12): every call signed with
+the Erupt-Enforced its endpoint needs, values normalized, drills and searches sent as plain conditions, and the
+build declaring only what the node sets. Any other node is checked against protocol v1.
 """
 import base64
 import hashlib
@@ -25,8 +29,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python" / "src"))
-from erupt import _schema  # noqa: E402  (the validator generated from the same schema/)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import annotations  # noqa: E402  (the schema check and the server's build completion, from schema/)
 
 NODE_NAME = "conformance"
 ACCESS_TOKEN = "conformance-access-token"
@@ -36,6 +40,22 @@ POWERS = {"t1": FULL, "t-noadd": {**FULL, "add": False}}
 
 
 VECTORS = Path(__file__).resolve().parent / "signature-vectors.json"
+
+# the protocol the node registered with; v2 answers every register call (PROTOCOL.md §12.2)
+V2 = False
+SERVER_PROTOCOL = 2
+
+
+def required_enforced(method, path):
+    """What a v2 node requires in Erupt-Enforced for an endpoint (PROTOCOL.md §12.2)."""
+    path = path.split("?")[0]
+    if method == "GET" and path.startswith("/erupt-api/build/"):
+        return ""
+    if path.startswith("/erupt-api/data/table/"):
+        return "power,query"
+    if path.startswith("/erupt-api/data/modify/") and not path.endswith("/delete"):
+        return "power,record"
+    return "power"
 
 
 def sign(method, path_and_query, timestamp, enforced, user, body):
@@ -84,16 +104,27 @@ class FakeServer(BaseHTTPRequestHandler):
                         ok = ok and r.read().decode() == NODE_NAME
                 except Exception:
                     ok = False
-            if ok:
-                FakeServer.registrations.append(info)
-            return self.reply(200 if ok else 500)
+            if not ok:
+                return self.reply(500)
+            FakeServer.registrations.append(info)
+            return self.reply(200, json.dumps({"protocolVersion": SERVER_PROTOCOL}).encode())
         if self.path == "/erupt-cloud-api/remove-instance-node":
             FakeServer.deregistrations.append(urllib.parse.parse_qs(body.decode()))
             return self.reply(200)
         self.reply(404)
 
+    # what a node reads back from the server: its config text and the acting user's info (PROTOCOL.md §6)
+    NODE_CONFIG = '{"theme":"dark"}'
+    USER_INFO = {"account": "admin", "roles": ["editor", "viewer"]}
+
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
+        if url.path == f"/erupt-cloud-api/node-config/{NODE_NAME}":
+            ok = self.headers.get("Access-Token") == ACCESS_TOKEN
+            return self.reply(200 if ok else 403, FakeServer.NODE_CONFIG.encode() if ok else b"")
+        if url.path == f"/erupt-cloud-api/userinfo/{NODE_NAME}":
+            ok = self.headers.get("Access-Token") == ACCESS_TOKEN
+            return self.reply(200 if ok else 403, json.dumps(FakeServer.USER_INFO).encode() if ok else b"")
         if url.path == "/erupt-cloud-api/erupt-power":
             FakeServer.power_calls.append(urllib.parse.parse_qs(url.query))
             power = POWERS.get(self.headers.get("token"))
@@ -108,9 +139,14 @@ class Node:
         self.address = address
 
     def call(self, method, path, body=None, erupt="Article", token="t1", account="admin", headers=None,
-             signed=False, enforced=None, signed_body=None, timestamp=None):
+             signed=None, enforced=None, signed_body=None, timestamp=None):
         """``signed`` sends Erupt-Signature (and Erupt-Enforced) instead of the plain Access-Token, as erupt
-        2.3.x servers do; ``signed_body`` / ``timestamp`` sign something other than what is sent."""
+        2.3.x servers do; ``signed_body`` / ``timestamp`` sign something other than what is sent. A v2 node is
+        called signed by default, with the Erupt-Enforced its endpoint needs (``enforced=""`` sends none)."""
+        if signed is None:
+            signed = V2
+        if enforced is None and V2:
+            enforced = required_enforced(method, path)
         raw = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
         h = {"Access-Token": ACCESS_TOKEN, "token": token, "Content-Type": "application/json",
              "user": base64.b64encode(json.dumps({"uid": 1, "account": account, "name": account, "tenantId": None}).encode()).decode()}
@@ -164,9 +200,10 @@ def fail_r(r, what=""):
     return body
 
 
-def table(n, condition=(), sort=(), size=10, erupt="Article", headers=None):
+def table(n, condition=(), sort=(), size=10, erupt="Article", headers=None, **extra):
     status, page = n.call("POST", f"/erupt-api/data/table/{erupt}",
-                          {"pageIndex": 1, "pageSize": size, "condition": list(condition), "sort": list(sort)}, erupt=erupt, headers=headers)
+                          {"pageIndex": 1, "pageSize": size, "condition": list(condition), "sort": list(sort), **extra},
+                          erupt=erupt, headers=headers)
     eq(200, status, f"table {condition} {sort} -> {page}")
     return page
 
@@ -195,8 +232,17 @@ def health(n):
 @check
 def guards(n):
     eq(403, n.call("GET", "/erupt-api/build/Article", headers={"Origin": "http://evil"})[0], "origin")
-    eq(403, n.call("GET", "/erupt-api/build/Article", headers={"Access-Token": "bad"})[0], "bad token")
-    eq(403, n.call("GET", "/erupt-api/build/Article", headers={"Access-Token": None})[0], "no token")
+    if V2:
+        # a v2 node takes signed calls only, each with the Erupt-Enforced its endpoint needs (§12.2)
+        eq(403, n.call("GET", "/erupt-api/build/Article", signed=False)[0], "plain Access-Token")
+        eq(403, n.call("POST", "/erupt-api/data/table/Article", {}, enforced="power")[0], "table without query")
+        eq(403, n.call("POST", "/erupt-api/data/modify/Article", {"title": "x"}, enforced="power")[0], "add without record")
+        eq(403, n.call("POST", "/erupt-api/data/modify/Article/update", {"id": 1}, enforced="power,query")[0], "update without record")
+        eq(403, n.call("POST", "/erupt-api/data/modify/Article/delete", [1], enforced="")[0], "delete without power")
+        eq(403, n.call("GET", "/erupt-api/data/Article/1", enforced="")[0], "get without power")
+    else:
+        eq(403, n.call("GET", "/erupt-api/build/Article", headers={"Access-Token": "bad"})[0], "bad token")
+        eq(403, n.call("GET", "/erupt-api/build/Article", headers={"Access-Token": None})[0], "no token")
     eq(404, n.call("GET", "/erupt-api/build/Missing", erupt="Missing")[0], "unknown erupt")
     eq(404, n.call("GET", "/erupt-api/build/Article", erupt="Note")[0], "header / path mismatch")
     eq(404, n.call("GET", "/erupt-api/build/Article", erupt=None)[0], "no erupt header")
@@ -205,10 +251,29 @@ def guards(n):
     eq(404, n.call("GET", "/erupt-api/nothing/here")[0], "unknown path")
 
 
+def read_build(n, name="Article", account="admin"):
+    """A build as the browser reads it: a v2 node's declaration is checked, then completed as the server does."""
+    status, b = n.call("GET", f"/erupt-api/build/{name}", erupt=name, account=account)
+    eq(200, status, f"build {name}")
+    if V2:
+        annotations.check_declared(b, "declared build")
+        b = annotations.complete(b)
+    return b
+
+
 @check
 def build(n):
-    status, b = n.call("GET", "/erupt-api/build/Article")
-    eq(200, status, "build")
+    if V2:
+        status, declared = n.call("GET", "/erupt-api/build/Category", erupt="Category")
+        link = declared["eruptModel"]["eruptJson"]["drills"][0]["link"]
+        # the server turns a drill into a condition, so a v2 node declares the link's columns (§12.3)
+        eq(("Article", "category"), (link.get("linkErupt"), link.get("joinColumn")), "drill link sent to the server")
+        eq("id", link.get("column", "id"), "drill link column")
+        f = {x["fieldName"]: x for x in n.call("GET", "/erupt-api/build/Article")[1]["eruptModel"]["eruptFieldModels"]}
+        for name, field in f.items():
+            if (field["eruptFieldJson"].get("edit") or {}).get("type", "AUTO") == "AUTO" and name != "id":
+                raise AssertionError(f"declared build: {name} leaves edit.type AUTO, which the node resolves")
+    b = read_build(n)
     m = b["eruptModel"]
     eq("Article", m["eruptName"], "eruptName")
     for key in ("name", "orderBy"):
@@ -251,7 +316,7 @@ def build(n):
     eq(["note"], [x["fieldName"] for x in b["operationErupts"]["publish"]["eruptFieldModels"]], "form fields")
     eq((True, True), (b["power"]["export"], b["power"]["cellEdit"]), "export and cell editing pass: the server does them for every node")
     eq(True, b["power"]["add"], "add")
-    status, b = n.call("GET", "/erupt-api/build/Article", account="root")
+    b = read_build(n, account="root")
     eq(["publish", "feature", "rebuild"], [o["code"] for o in b["eruptModel"]["eruptJson"]["rowOperation"]], "operations visible to root")
 
 
@@ -260,8 +325,9 @@ def signature(n):
     eq(200, n.call("GET", "/erupt-api/build/Article", signed=True)[0], "signed, no Access-Token")
     eq(200, n.call("GET", "/erupt-api/build/Article?_probe=1", signed=True)[0], "signed with a query string")
     query = {"pageIndex": 1, "pageSize": 10}
-    eq(200, n.call("POST", "/erupt-api/data/table/Article", query, signed=True)[0], "signed body")
-    eq(403, n.call("POST", "/erupt-api/data/table/Article", query, signed=True, signed_body=b"{}")[0], "body altered after signing")
+    table_enforced = "power,query" if V2 else None
+    eq(200, n.call("POST", "/erupt-api/data/table/Article", query, signed=True, enforced=table_enforced)[0], "signed body")
+    eq(403, n.call("POST", "/erupt-api/data/table/Article", query, signed=True, enforced=table_enforced, signed_body=b"{}")[0], "body altered after signing")
     eq(403, n.call("GET", "/erupt-api/build/Article", signed=True, headers={"Erupt-Signature": "00" * 32})[0], "wrong signature")
     eq(403, n.call("GET", "/erupt-api/build/Article", signed=True, timestamp=int(time.time()) - 301)[0], "outside the 300 s window")
     eq(403, n.call("GET", "/erupt-api/build/Article", signed=True, headers={"Erupt-Enforced": "power"})[0], "Erupt-Enforced added after signing")
@@ -269,6 +335,11 @@ def signature(n):
 
 @check
 def enforced_power(n):
+    if V2:
+        # the server enforces every right of a v2 node: it never asks back (§12.2), so t-down changes nothing
+        ok_r(n.call("POST", "/erupt-api/data/modify/Article", {"title": "enforced"}, token="t-down"), "add")
+        eq(200, n.call("GET", "/erupt-api/build/Note", erupt="Note", token="t-down")[0], "build")
+        return
     calls = len(FakeServer.power_calls)
     # with power enforced by the server, the node must not ask it (t-down would fail closed) ...
     s, b = n.call("GET", "/erupt-api/build/Article", token="t-down", signed=True, enforced="power")
@@ -285,26 +356,34 @@ def enforced_power(n):
 @check
 def build_matches_schema(n):
     for name in ("Article", "Note", "Category"):
-        status, b = n.call("GET", f"/erupt-api/build/{name}", erupt=name, account="root")
-        eq(200, status, f"build {name}")
-        for m in [b["eruptModel"], *(b.get("operationErupts") or {}).values()]:
-            _schema.check("Erupt", m["eruptJson"], m["eruptName"], partial=False)
+        b = read_build(n, name, account="root")
+        for m in annotations.models(b):
+            annotations.check("Erupt", m["eruptJson"], m["eruptName"], partial=False)
             for op in m["eruptJson"]["rowOperation"]:
-                _schema.check("RowOperation", op, f"{m['eruptName']}.{op['code']}", partial=False)
+                annotations.check("RowOperation", op, f"{m['eruptName']}.{op['code']}", partial=False)
             for fm in m["eruptFieldModels"]:
-                _schema.check("EruptField", fm["eruptFieldJson"], f"{m['eruptName']}.{fm['fieldName']}", partial=False)
+                annotations.check("EruptField", fm["eruptFieldJson"], f"{m['eruptName']}.{fm['fieldName']}", partial=False)
 
 
 @check
 def power(n):
-    eq(403, n.call("POST", "/erupt-api/data/modify/Article", {"title": "x"}, token="t-noadd")[0], "server denies add")
-    eq(403, n.call("POST", "/erupt-api/data/modify/Article", {"title": "x"}, token="t-down")[0], "fails closed")
     status, b = n.call("GET", "/erupt-api/build/Note", erupt="Note")
     eq(False, b["power"]["delete"], "declared power")
+    if V2:
+        # the declared rights are the server's to enforce (§12.5); the node never asks for erupt-power
+        eq([], FakeServer.power_calls, "no erupt-power callback from a v2 node")
+        return
+    eq(403, n.call("POST", "/erupt-api/data/modify/Article", {"title": "x"}, token="t-noadd")[0], "server denies add")
+    eq(403, n.call("POST", "/erupt-api/data/modify/Article", {"title": "x"}, token="t-down")[0], "fails closed")
     eq(403, n.call("POST", "/erupt-api/data/modify/Note/delete", [1], erupt="Note")[0], "declared delete off")
     if not FakeServer.power_calls:
         raise AssertionError("the node never asked the server for erupt-power")
     eq([NODE_NAME], FakeServer.power_calls[-1].get("nodeName"), "erupt-power nodeName")
+
+
+def wire_date_time(value):
+    """A row's DATE_TIME as the server normalizes it on the way back in (§12.4): seconds, a space, no fraction."""
+    return value.replace("T", " ")[:19] if isinstance(value, str) else value
 
 
 @check
@@ -312,7 +391,7 @@ def crud(n):
     clear_articles(n)
     add(n, title="Hello erupt", status="published", views=10, featured=True, publish_date="2026-01-05",
         review_at="2026-01-05 10:30:00", body="...")
-    add(n, title="Second", status="draft", views="3", featured=False, publish_date="2026-03-01")
+    add(n, title="Second", status="draft", views=3 if V2 else "3", featured=False, publish_date="2026-03-01")
     page = table(n)
     eq((2, 1), (page["total"], page["totalPage"]), "total")
     eq(["Second", "Hello erupt"], titles(page), "default order id desc")
@@ -325,15 +404,37 @@ def crud(n):
     eq(["Hello erupt", "Second"], titles(table(n, [{"key": "title", "expression": "IN", "value": ["Second", "Hello erupt"]}], sort=[{"field": "title", "direction": "ASC"}])), "IN")
     eq(["Second", "Hello erupt"], titles(table(n, sort=[{"field": "views", "direction": "ASC"}])), "sort")
     eq(1, len(table(n, size=1)["list"]), "page size")
+    if V2:
+        eq(["Hello erupt"], titles(table(n, [{"key": "review_at", "expression": "RANGE",
+                                                  "value": ["2026-01-05 10:00:00", "2026-01-05 11:00:00"]}])), "RANGE date time")
+        eq(["Second"], titles(table(n, [{"key": "views", "expression": "LT", "value": 5}])), "LT number")
     pk = first["id"]
     status, row = n.call("GET", f"/erupt-api/data/Article/{pk}")
     eq((200, "Hello erupt"), (status, row["title"]), "get")
+    if V2:
+        # the server sends the stored row patched with the edit, normalized
+        row = {**row, "review_at": wire_date_time(row["review_at"])}
     ok_r(n.call("POST", "/erupt-api/data/modify/Article/update", {**row, "title": "Renamed"}), "update")
-    eq("Renamed", n.call("GET", f"/erupt-api/data/Article/{pk}")[1]["title"], "updated")
+    renamed = n.call("GET", f"/erupt-api/data/Article/{pk}")[1]
+    eq(("Renamed", "2026-01-05T10:30:00.000"), (renamed["title"], renamed["review_at"]), "updated")
     ok_r(n.call("POST", "/erupt-api/data/modify/Article/delete", [pk]), "delete")
     eq(1, table(n)["total"], "deleted")
     status, init = n.call("GET", "/erupt-api/data/init-value/Article")
     eq(200, status, "init-value")
+
+
+@check
+def like_is_literal(n):
+    if not V2:
+        return
+    clear_articles(n)
+    add(n, title="50% off")
+    add(n, title="500 off")
+    add(n, title="a_b")
+    add(n, title="axb")
+    # the node adds the wildcards; a % or _ the user typed is a literal (§12.4, §10)
+    eq(["50% off"], titles(table(n, [{"key": "title", "expression": "LIKE", "value": "50%"}])), "LIKE with %")
+    eq(["a_b"], titles(table(n, [{"key": "title", "expression": "LIKE", "value": "a_"}])), "LIKE with _")
 
 
 @check
@@ -346,8 +447,9 @@ def data_proxy(n):
 
 
 def invoked():
-    """Whether the node serves invoke (PROTOCOL.md §5.5); a Java node keeps the Java endpoints."""
-    return "invoke" in (FakeServer.registrations[0].get("capabilities") or [])
+    """Whether the node serves invoke (PROTOCOL.md §5.5); a Java node keeps the Java endpoints. A v2 node always does
+    (§12.4)."""
+    return V2 or "invoke" in (FakeServer.registrations[0].get("capabilities") or [])
 
 
 @check
@@ -372,7 +474,11 @@ def references(n):
         status, page = n.call("POST", "/erupt-api/data/Article/reference-table/category?tabRef=false", query)
         eq((200, [{"id": 2, "name": "Python", "parent": 1}]), (status, page["list"]), "picker")
         eq(404, n.call("POST", "/erupt-api/data/Article/reference-table/topic", {})[0], "table picker on a tree field")
-    add(n, title="Ref", category={"id": "2", "name": "Python"}, topic={"id": 1, "name": "Tech"})
+    if V2:
+        # a reference arrives as the referenced key alone, typed like the target's primary key (§12.4)
+        add(n, title="Ref", category=2, topic=1)
+    else:
+        add(n, title="Ref", category={"id": "2", "name": "Python"}, topic={"id": 1, "name": "Tech"})
     row = table(n)["list"][0]
     # a reference travels as its key: the server resolves the label and the flattened column
     eq((2, 1), (row["category"], row["topic"]), "reference row: the key")
@@ -380,6 +486,10 @@ def references(n):
         if flattened in row:
             raise AssertionError(f"reference row: {flattened} is the server's to add")
     eq(2, n.call("GET", f"/erupt-api/data/Article/{row['id']}")[1]["category"], "reference get: the key")
+    if V2:
+        eq(1, table(n, [{"key": "category", "expression": "EQ", "value": 2}])["total"], "search by reference")
+        eq(0, table(n, [{"key": "category", "expression": "IN", "value": [1, 3]}])["total"], "IN by reference")
+        return
     eq(1, table(n, [{"key": "category", "expression": "EQ", "value": {"id": 2, "name": "Python"}}])["total"], "search by reference")
     eq(0, table(n, [{"key": "category", "expression": "IN", "value": [{"id": 1}, {"id": 3}]}])["total"], "IN by reference")
     fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "category", "expression": "LIKE", "value": "x"}]}), "LIKE on a reference")
@@ -388,8 +498,16 @@ def references(n):
 @check
 def drill(n):
     clear_articles(n)
-    add(n, title="Py", category={"id": 2, "name": "Python"})
-    add(n, title="Other", category={"id": 3, "name": "Life"})
+    add(n, title="Py", category=2 if V2 else {"id": 2, "name": "Python"})
+    add(n, title="Other", category=3 if V2 else {"id": 3, "name": "Life"})
+    if V2:
+        # the server reads the source row and sends the join as a condition; the body names the drill so the node
+        # adds its linkCondition (§12.4)
+        drilled = {"erupt": "Category", "code": "Articles"}
+        eq(["Py"], titles(table(n, [{"key": "category", "expression": "EQ", "value": 2}], drill=drilled)), "the rows of the drilled category")
+        status, _ = n.call("POST", "/erupt-api/data/table/Article", {"drill": {"erupt": "Category", "code": "nope"}})
+        eq(403, status, "an undeclared drill")
+        return
     headers = {"Drill": "Articles", "DrillSourceErupt": "Category", "DrillValue": "2"}
     eq(["Py"], [r["title"] for r in table(n, headers=headers)["list"]], "the rows of the drilled category")
     eq(403, n.call("POST", "/erupt-api/data/table/Article", {}, headers={**headers, "Drill": "nope"})[0], "an undeclared drill")
@@ -405,6 +523,9 @@ def trusted_query(n):
     eq(200, status, "signed query")
     if not isinstance(page, dict) or "list" not in page:
         raise AssertionError(f"signed query: expected a page, got {page}")
+    if V2:
+        # the primary key too: a link tree with nothing picked under dependNode (§12.4)
+        eq(0, table(n, [{"key": "id", "expression": "NULL"}])["total"], "NULL on the primary key")
 
 
 @check
@@ -421,7 +542,9 @@ def operations(n):
     ids = [r["id"] for r in table(n)["list"]]
     # a node serving invoke runs operations through it, under the operation code
     path = "/erupt-api/invoke/Article/operation/" if invoked() else "/erupt-api/data/Article/operator/"
-    fail_r(n.call("POST", path + "publish", {"ids": ids, "param": {}}), "form validation")
+    if not V2:
+        # a v2 node receives a param the server checked against the form (§12.4)
+        fail_r(n.call("POST", path + "publish", {"ids": ids, "param": {}}), "form validation")
     r = ok_r(n.call("POST", path + "publish", {"ids": ids, "param": {"note": "go"}}), "publish")
     eq("Executed successfully", r["message"], "publish message")
     eq(["published", "published"], [x["status"] for x in table(n)["list"]], "publish effect")
@@ -442,19 +565,29 @@ def operations(n):
 
 @check
 def illegal_input(n):
-    fail_r(n.call("POST", "/erupt-api/data/modify/Article", {"status": "draft"}), "notNull")
-    fail_r(n.call("POST", "/erupt-api/data/modify/Article", {"title": "x", "status": "deleted"}), "illegal choice")
-    fail_r(n.call("POST", "/erupt-api/data/modify/Article", {"title": "x", "views": "many"}), "illegal number")
-    fail_r(n.call("POST", "/erupt-api/data/modify/Article", {"title": "x", "publish_date": "someday"}), "illegal date")
-    fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "views", "expression": "EQ", "value": 1}]}), "not searchable")
-    fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title\" OR 1=1 --", "value": 1}]}), "injected key")
-    fail_r(n.call("POST", "/erupt-api/data/table/Article", {"sort": [{"field": "body", "direction": "ASC"}]}), "not sortable")
-    fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title", "expression": "DROP", "value": 1}]}), "illegal operator")
+    if not V2:
+        # a v2 node receives records and queries the server checked (§12.7)
+        fail_r(n.call("POST", "/erupt-api/data/modify/Article", {"status": "draft"}), "notNull")
+        fail_r(n.call("POST", "/erupt-api/data/modify/Article", {"title": "x", "status": "deleted"}), "illegal choice")
+        fail_r(n.call("POST", "/erupt-api/data/modify/Article", {"title": "x", "views": "many"}), "illegal number")
+        fail_r(n.call("POST", "/erupt-api/data/modify/Article", {"title": "x", "publish_date": "someday"}), "illegal date")
+        fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "views", "expression": "EQ", "value": 1}]}), "not searchable")
+        fail_r(n.call("POST", "/erupt-api/data/table/Article", {"sort": [{"field": "body", "direction": "ASC"}]}), "not sortable")
+        fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title", "expression": "DROP", "value": 1}]}), "illegal operator")
+    # what a node checks whoever calls it: names it puts into a query, the shape of a body, its own keys (§12.6)
+    fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title\" OR 1=1 --", "expression": "EQ", "value": 1}]}), "injected key")
+    fail_r(n.call("POST", "/erupt-api/data/table/Article", {"sort": [{"field": "title\" --", "direction": "ASC"}]}), "injected sort")
     fail_r(n.call("POST", "/erupt-api/data/modify/Article", b"{not json"), "malformed body")
     fail_r(n.call("POST", "/erupt-api/data/modify/Article/delete", {"id": 1}), "delete needs a list")
     status, body = n.call("GET", "/erupt-api/data/Article/abc")
     if status == 200 and body.get("success") is not False:
         raise AssertionError(f"illegal id: {status} {body}")
+    if V2:
+        # an operator goes into a query like a field name: an unknown one fails, it never matches every row
+        fail_r(n.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title", "expression": "DROP", "value": 1}]}), "unknown operator")
+        page = table(n, size=100000)
+        if page["pageSize"] >= 100000:
+            raise AssertionError(f"page size: a v2 node still caps it, got {page['pageSize']}")
 
 
 # ---------------------------------------------------------------- runner
@@ -477,7 +610,10 @@ def main():
                 sys.exit("the node did not register")
             time.sleep(0.2)
         info = FakeServer.registrations[0]
-        print(f"registered: {info['nodeName']} {info['version']} {info['nodeAddress']} erupts={info['erupts']}")
+        global V2
+        V2 = info.get("protocolVersion") == 2
+        print(f"registered: {info['nodeName']} {info['version']} {info['nodeAddress']} erupts={info['erupts']} "
+              f"protocol v{2 if V2 else 1}")
         eq(["Article", "Category", "Note"], sorted(info["erupts"]), "registered erupts (forms are not registered)")
         n = Node(info["nodeAddress"][0])
         for fn in CHECKS:

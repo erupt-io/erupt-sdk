@@ -4,7 +4,7 @@ namespace Erupt;
 
 use Erupt\Attribute\Field;
 
-/** A compiled #[Field]: builds its erupt field JSON and coerces browser values. */
+/** A compiled #[Field]: builds its erupt field JSON and converts values to the types the repository stores. */
 final class FieldSpec
 {
     public const REFERENCES = ['REFERENCE_TABLE', 'REFERENCE_TREE'];
@@ -24,6 +24,15 @@ final class FieldSpec
         'COLOR' => 'string', 'ICON' => 'string', 'SIGNATURE' => 'string', 'MAP' => 'string', 'HIDDEN' => 'string',
         'RATE' => 'number', 'SLIDER' => 'number',
     ];
+
+    /** the edit types a field may take: the simple ones above, references, collections, MULTI_CHOICE and BUTTON */
+    public const SUPPORTED = ['INPUT', 'TEXTAREA', 'CHOICE', 'NUMBER', 'BOOLEAN', 'DATE', 'DATE_TIME', 'TAGS', 'AUTO_COMPLETE',
+        'ATTACHMENT', 'HTML_EDITOR', 'MARKDOWN', 'CODE_EDITOR', 'COLOR', 'ICON', 'SIGNATURE', 'MAP', 'HIDDEN', 'RATE', 'SLIDER',
+        ...self::REFERENCES, ...self::COLLECTIONS, 'MULTI_CHOICE', 'BUTTON'];
+
+    /** fieldReturnName by edit type (PROTOCOL.md §7.1); a reference names its target, the rest are "String" */
+    private const RETURN_NAMES = ['NUMBER' => 'number', 'RATE' => 'number', 'SLIDER' => 'number', 'BOOLEAN' => 'Boolean',
+        'DATE' => 'Date', 'DATE_TIME' => 'Date'];
 
     /** what a JSON field holds: an `array` property a list, an `object` property an object */
     public const JSON_ARRAY = 'array';
@@ -59,78 +68,79 @@ final class FieldSpec
         return Model::of($this->decl->ref);
     }
 
+    /** The field as declared (PROTOCOL.md §12.3): the server completes the rest from Java's defaults. */
     public function build(): array
     {
         $d = $this->decl;
-        $tpl = Schema::defaults()['fields'][$d->pk ? 'id' : $this->type];
-        $tpl['fieldName'] = $this->name;
-        $tpl['componentValue'] = null;
         if ($d->pk) {
-            return $tpl;
+            return ['fieldName' => $this->name, 'fieldReturnName' => 'number', 'componentValue' => null,
+                'eruptFieldJson' => ['edit' => ['title' => '', 'type' => 'NUMBER']]];
         }
-        $edit = $tpl['eruptFieldJson']['edit'];
-        // a BUTTON is a form element only: its template has no table column
-        $view = $tpl['eruptFieldJson']['views'][0] ?? [];
-        $edit['title'] = $d->title;
-        $edit['notNull'] = $d->notNull;
-        $edit['show'] = $d->form;
-        $edit['search']['value'] = $d->search;
-        $view['title'] = $d->title;
-        $view['sortable'] = $d->sortable;
-        if ($this->type === 'DATE') {
-            $view['type'] = 'DATE';
-        } elseif ($this->isReference()) {
-            $target = $this->target();
-            $tpl['fieldReturnName'] = $target->name;
-            $key = $this->type === 'REFERENCE_TABLE' ? 'referenceTableType' : 'referenceTreeType';
-            $edit[$key]['id'] = $target->pk;
-            $edit[$key]['label'] = $d->label;
-            if ($this->type === 'REFERENCE_TREE') {
-                $edit[$key]['pid'] = $d->tree;
-            }
-            $view['column'] = $d->label;
-        } elseif ($this->isCollection()) {
+        // a DATE_TIME is a DATE whose dateType says so; a DATE says it too, as AUTO is the node's to resolve
+        $edit = ['title' => $d->title, 'type' => $this->type === 'DATE_TIME' ? 'DATE' : $this->type];
+        if ($this->type === 'DATE' || $this->type === 'DATE_TIME') {
+            $edit['dateType'] = ['type' => $this->type];
+        }
+        if ($d->notNull) {
+            $edit['notNull'] = true;
+        }
+        if (!$d->form) {
+            $edit['show'] = false;
+        }
+        if ($d->search) {
+            $edit['search'] = ['value' => true];
+        }
+        $view = ['title' => $d->title];
+        if ($d->sortable) {
+            $view['sortable'] = true;
+        }
+        $returnName = self::RETURN_NAMES[$this->type] ?? 'String';
+        if ($this->type === 'REFERENCE_TABLE') {
+            $edit['referenceTableType'] = ['id' => $this->target()->pk, 'label' => $d->label];
+        } elseif ($this->type === 'REFERENCE_TREE') {
+            $edit['referenceTreeType'] = ['id' => $this->target()->pk, 'label' => $d->label, 'pid' => $d->tree];
+        }
+        if ($this->isReference() || $this->isCollection()) {
             // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
-            $tpl['fieldReturnName'] = $this->target()->name;
+            $returnName = $this->target()->name;
             $view['column'] = $d->label;
         }
         if (isset($this->code['options'], self::FETCHED[$this->type])) {
-            $edit[self::FETCHED[$this->type]]['fetchHandler'] = ['invoke'];
+            $edit[self::FETCHED[$this->type]] = ['fetchHandler' => ['invoke']];
         }
         if (isset($this->code['onchange'])) {
             $edit['onchange'] = 'invoke';
         }
-        $tpl['eruptFieldJson']['edit'] = Model::merge($edit, $d->edit);
-        $tpl['eruptFieldJson']['views'] = $d->table && $tpl['eruptFieldJson']['views'] ? [Model::merge($view, $d->view)] : [];
+        $options = null;
         if ($d->choices !== null) { // CHOICE, or MULTI_CHOICE over an array
-            $tpl['componentValue'] = [];
-            foreach ($d->choices ?? [] as $value => $label) {
-                $tpl['componentValue'][] = ['value' => (string) $value, 'label' => $label, 'desc' => null, 'color' => null, 'disable' => false];
+            $options = [];
+            foreach ($d->choices as $value => $label) {
+                $options[] = ['value' => (string) $value, 'label' => $label, 'desc' => null, 'color' => null, 'disable' => false];
             }
         }
-        return $tpl;
+        // a BUTTON is a form element only: no table column
+        $views = $d->table && $this->type !== 'BUTTON' ? [Model::merge($view, $d->view)] : [];
+        return ['fieldName' => $this->name, 'fieldReturnName' => $returnName, 'componentValue' => $options,
+            'eruptFieldJson' => ['edit' => Model::merge($edit, $d->edit), 'views' => $views]];
     }
 
     /**
-     * Turn a JSON value from the browser into the value the repository stores; throws
-     * \InvalidArgumentException. Dates are stored as wall-clock strings: DATE `2026-01-05`, DATE_TIME
-     * `2026-01-05T10:30:00.000`.
+     * A JSON value as the server sends it (PROTOCOL.md §12.4), or a column as a driver reads it, to the value the
+     * repository stores; throws \InvalidArgumentException when it cannot be. Dates are stored as wall-clock strings:
+     * DATE `2026-01-05`, DATE_TIME `2026-01-05T10:30:00.000`. The server has checked the value; a key in a path
+     * segment, a delete body or an operation's ids arrives as the browser sent it, so it may fail here.
      */
     public function coerce(mixed $value): mixed
     {
         if ($this->isReference()) {
-            // the browser sends the picked record as {<id>: ..., <label>: ...}
             $target = $this->target();
-            if (is_array($value)) {
-                $value = $value[$target->pk] ?? null;
-            }
             return $target->fields[$target->pk]->coerce($value);
         }
         if ($this->isCollection()) {
-            // picked records arrive as [{id: key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), and are stored as keys
+            // a list of keys; a SQL repository reads it back as its JSON text
             $items = is_string($value) && $value !== '' ? json_decode($value, true, 512, JSON_THROW_ON_ERROR) : ($value ?: []);
             $pk = $this->target()->fields[$this->target()->pk];
-            return array_map(fn($v) => $pk->coerce(is_array($v) ? ($v ? reset($v) : null) : $v), array_values((array) $items));
+            return array_map([$pk, 'coerce'], array_values((array) $items));
         }
         if ($value === null || $value === '') {
             return null;
@@ -151,9 +161,6 @@ final class FieldSpec
             case 'bool':
                 return is_bool($value) ? $value : in_array(strtolower(is_scalar($value) ? (string) $value : ''), ['true', '1'], true);
             case 'number':
-                if (is_bool($value)) {
-                    return (int) $value;
-                }
                 if (!is_int($value) && !is_float($value) && !(is_string($value) && is_numeric(trim($value)))) {
                     throw new \InvalidArgumentException("illegal number '" . self::show($value) . "'");
                 }
@@ -167,31 +174,16 @@ final class FieldSpec
         if (!is_scalar($value)) {
             throw new \InvalidArgumentException('expected text');
         }
-        $text = is_bool($value) ? ($value ? 'True' : 'False') : (string) $value;
-        if ($this->type === 'CHOICE' && $this->decl->choices !== null
-            && !in_array($text, array_map('strval', array_keys($this->decl->choices)), true)) {
-            throw new \InvalidArgumentException("illegal option '$text'");
-        }
-        return $text;
+        return is_bool($value) ? ($value ? 'True' : 'False') : (string) $value;
     }
 
     /** A JSON value: a list as an array, an object as a stdClass (so an empty one stays `{}`). */
-    private function json(mixed $value): array|\stdClass
+    private function json(mixed $value): mixed
     {
         if (is_string($value)) {
             $value = json_decode($value, $this->json === self::JSON_ARRAY, 512, JSON_THROW_ON_ERROR);
         }
-        if ($this->json === self::JSON_OBJECT && (is_array($value) || $value instanceof \stdClass)) {
-            return (object) $value;
-        }
-        if (!is_array($value) || !array_is_list($value)) {
-            throw new \InvalidArgumentException('must be a JSON array');
-        }
-        if ($this->decl->choices !== null
-            && array_diff(array_map('strval', $value), array_map('strval', array_keys($this->decl->choices)))) {
-            throw new \InvalidArgumentException('illegal option in ' . json_encode($value));
-        }
-        return $value;
+        return $this->json === self::JSON_OBJECT && is_array($value) ? (object) $value : $value;
     }
 
     /** A stored value to JSON for the browser. */

@@ -1,7 +1,4 @@
-using System.Net;
-using System.Text;
 using System.Text.Json.Nodes;
-using Microsoft.AspNetCore.Http;
 using Microsoft.Data.Sqlite;
 
 namespace Erupt.Tests;
@@ -9,7 +6,7 @@ namespace Erupt.Tests;
 /// <summary>A virtual field is in the build only; a list or dictionary field round-trips as JSON.</summary>
 public class FieldTests
 {
-    private const string Token = "node-secret";
+    private const string Token = Calls.Token;
 
     [EruptModel("Widget")]
     private sealed class Widget
@@ -28,28 +25,8 @@ public class FieldTests
         [Field("Tags", Search = true)] public List<string>? Tags { get; set; }
     }
 
-    private sealed class PowerServer : HttpMessageHandler
-    {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
-            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent("""{"add":true,"edit":true,"delete":true,"viewDetails":true}"""),
-            });
-    }
-
-    private static async Task<JsonNode?> Call(EruptNode node, string method, string path, object? body = null)
-    {
-        var context = new DefaultHttpContext();
-        context.Request.Method = method;
-        context.Request.Path = path;
-        context.Request.Headers["Access-Token"] = Token;
-        context.Request.Headers["token"] = "t1";
-        context.Request.Headers["erupt"] = "Widget";
-        context.Request.Body = new MemoryStream(body is null ? [] : Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(body)));
-        context.Response.Body = new MemoryStream();
-        await node.HandleAsync(context);
-        return JsonNode.Parse(Encoding.UTF8.GetString(((MemoryStream)context.Response.Body).ToArray()));
-    }
+    private static async Task<JsonNode?> Call(EruptNode node, string method, string path, object? body = null) =>
+        (await Calls.Send(node, method, path, body, "Widget")).Body;
 
     public static TheoryData<string> Stores => ["memory", "sqlite"];
 
@@ -62,10 +39,7 @@ public class FieldTests
         IRepository repo = store == "memory"
             ? new MemoryRepository()
             : new DbRepository(() => new SqliteConnection("Data Source=widget;Mode=Memory;Cache=Shared"), "widget") { AutoCreateSqlite = true };
-        var node = new EruptNode(new NodeOptions { Name = "n", AccessToken = Token, Servers = ["http://server"] })
-        {
-            Http = new HttpClient(new PowerServer()),
-        };
+        var node = new EruptNode(new NodeOptions { Name = "n", AccessToken = Token, Servers = ["http://server"] });
         node.Register(EruptModel.Of<Widget>().Edit(w => w.Note, new Edit { Type = EditType.DIVIDE }), repo);
         var build = await Call(node, "GET", "/erupt-api/build/Widget");
         var fields = build!["eruptModel"]!["eruptFieldModels"]!.AsArray();
@@ -79,8 +53,6 @@ public class FieldTests
         Assert.Equal("""["ADMIN","USER"]""", row["roles"]!.ToJsonString());
         Assert.Equal("""{"env":"prod"}""", row["attrs"]!.ToJsonString());
         Assert.False(row.ContainsKey("note"));
-        var refused = await Call(node, "POST", "/erupt-api/data/modify/Widget", new { name = "B", roles = "ADMIN" });
-        Assert.False(refused!["success"]!.GetValue<bool>());
         keep.Dispose();
     }
 

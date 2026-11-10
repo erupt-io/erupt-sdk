@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,75 +19,10 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------- permissions (PROTOCOL.md §6.1)
-
-func (n *Node) require(q *request, right string) error {
-	if !n.power(q, q.model)[right] {
-		return reply{403}
-	}
-	return nil
-}
-
-// power is the declared power ANDed with the server's verdict for the session token, cached 5s. Without
-// the server's verdict nothing is writable. When a signed call says the server enforced power, the
-// declared power alone.
-func (n *Node) power(q *request, m *Model) map[string]bool {
-	if q.enforced["power"] {
-		// the server checked the user's rights and restricts the build's power itself: the model's own
-		// declaration is all that is left to apply here
-		power := map[string]bool{}
-		for k, v := range m.power {
-			power[k] = v
-		}
-		for k, v := range unsupportedPower {
-			power[k] = v
-		}
-		return power
-	}
-	token := q.r.Header.Get("token")
-	key := [2]string{token, m.name}
-	n.powerMu.Lock()
-	cached, ok := n.powers[key]
-	n.powerMu.Unlock()
-	if ok && time.Now().Before(cached.until) {
-		return cached.power
-	}
-	power := map[string]bool{}
-	for k, v := range m.power {
-		power[k] = v
-	}
-	for k, v := range unsupportedPower {
-		power[k] = v
-	}
-	remote := map[string]any{}
-	if err := n.serverGet(q.ctx, "/erupt-cloud-api/erupt-power", url.Values{"nodeName": {n.cfg.Name}, "eruptName": {m.name}}, token, &remote); err != nil {
-		n.cfg.Logger.Printf("erupt-power unavailable: %v", err)
-	}
-	for _, right := range serverPower {
-		granted, _ := remote[right].(bool)
-		power[right] = power[right] && granted
-	}
-	n.powerMu.Lock()
-	if len(n.powers) > 10000 {
-		n.powers = map[[2]string]cachedPower{}
-	}
-	n.powers[key] = cachedPower{time.Now().Add(5 * time.Second), power}
-	n.powerMu.Unlock()
-	return power
-}
-
 // ---------------------------------------------------------------- server calls
 
 func (n *Node) server() string {
 	return n.cfg.Servers[int((n.next.Add(1)-1)%uint64(len(n.cfg.Servers)))]
-}
-
-func (n *Node) serverGet(ctx context.Context, path string, params url.Values, token string, out any) error {
-	body, err := n.serverText(ctx, path+"?"+params.Encode(), map[string]string{"token": token})
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal([]byte(body), out)
 }
 
 func (n *Node) serverText(ctx context.Context, path string, headers map[string]string) (string, error) {
@@ -137,35 +73,54 @@ func (n *Node) UserInfo(ctx context.Context) (M, error) {
 	return info, json.Unmarshal([]byte(text), &info)
 }
 
-func (n *Node) post(path, contentType string, body string) error {
-	resp, err := n.client.Post(n.server()+path, contentType, strings.NewReader(body))
+// post sends a form or JSON to the next server and answers its body.
+func (n *Node) post(server, path, contentType string, body string) ([]byte, error) {
+	resp, err := n.client.Post(server+path, contentType, strings.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return answer, nil
 }
 
-// register announces the node once; Heartbeat repeats it.
-func (n *Node) register(instanceID string) error {
+// errOlderServer stops the heartbeat: the server would call this node as protocol v1, which it no longer answers.
+var errOlderServer = errors.New("older server")
+
+// register announces the node once; Heartbeat repeats it. A server that does not answer it speaks protocol v2
+// is an older one (PROTOCOL.md §12.2): errOlderServer.
+func (n *Node) register(server, instanceID string) error {
 	n.mu.RLock()
 	erupts := append([]string{}, n.names...)
 	n.mu.RUnlock()
 	info, err := json.Marshal(M{"instanceId": instanceID, "nodeName": n.cfg.Name, "accessToken": n.cfg.AccessToken,
-		"version": "go-" + Version, "nodeAddress": []string{n.cfg.Address}, "eruptModules": []string{},
-		"erupts": erupts, "resources": M{}, "capabilities": []string{"invoke"}})
+		"version": "go-" + Version, "protocolVersion": ProtocolVersion, "nodeAddress": []string{n.cfg.Address},
+		"eruptModules": []string{}, "erupts": erupts, "resources": M{}, "capabilities": []string{"invoke"}})
 	if err != nil {
 		return err
 	}
-	return n.post("/erupt-cloud-api/register-node", "application/json", string(info))
+	answer, err := n.post(server, "/erupt-cloud-api/register-node", "application/json", string(info))
+	if err != nil {
+		return err
+	}
+	var reply struct {
+		ProtocolVersion json.Number `json:"protocolVersion"`
+	}
+	if json.Unmarshal(answer, &reply) != nil || reply.ProtocolVersion.String() != strconv.Itoa(ProtocolVersion) {
+		return errOlderServer
+	}
+	return nil
 }
 
 // Heartbeat registers the node every Config.Heartbeat until ctx is done. Use it when the node is mounted
-// in your own server (Config.Address must then be set); ListenAndServe runs it for you.
+// in your own server (Config.Address must then be set); ListenAndServe runs it for you. It stops for good
+// when a server does not speak this SDK's node protocol: upgrade the erupt server.
 func (n *Node) Heartbeat(ctx context.Context) {
 	id := make([]byte, 3)
 	_, _ = rand.Read(id)
@@ -173,7 +128,12 @@ func (n *Node) Heartbeat(ctx context.Context) {
 	failing := false
 	for {
 		wait := n.cfg.Heartbeat
-		if err := n.register(instanceID); err != nil {
+		server := n.server()
+		if err := n.register(server, instanceID); errors.Is(err, errOlderServer) {
+			n.cfg.Logger.Printf("erupt: %s does not speak node protocol v%d: upgrade the erupt server; registration stopped",
+				server, ProtocolVersion)
+			return
+		} else if err != nil {
 			failing = true
 			n.cfg.Logger.Printf("erupt: register failed: %v", err)
 			wait /= 2
@@ -192,7 +152,8 @@ func (n *Node) Heartbeat(ctx context.Context) {
 // Deregister tells the server to stop routing to this instance at once.
 func (n *Node) Deregister() error {
 	form := url.Values{"nodeName": {n.cfg.Name}, "accessToken": {n.cfg.AccessToken}, "locations": {n.cfg.Address}}
-	return n.post("/erupt-cloud-api/remove-instance-node", "application/x-www-form-urlencoded", form.Encode())
+	_, err := n.post(n.server(), "/erupt-cloud-api/remove-instance-node", "application/x-www-form-urlencoded", form.Encode())
+	return err
 }
 
 // ListenAndServe serves the node on addr (e.g. ":9090"), registers it once the listener is up (the server

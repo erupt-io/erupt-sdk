@@ -1,8 +1,9 @@
-//! Sync the erupt schemas into the crate and generate `src/types.rs` from them.
+//! Generate `src/types.rs` from the erupt annotation schema. The crate embeds no schema: the server completes
+//! and checks every build (erupt-cloud/PROTOCOL.md §12.3).
 //!
 //! ```text
-//! cargo run --bin gen-types -- <erupt repo>/schema          # copy schemas, regenerate types
-//! cargo run --bin gen-types -- <erupt repo>/schema --check  # fail when anything is out of date (CI)
+//! cargo run --bin gen-types -- <erupt repo>/schema          # regenerate types
+//! cargo run --bin gen-types -- <erupt repo>/schema --check  # fail when they are out of date (CI)
 //! ```
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -10,7 +11,7 @@ use std::process::ExitCode;
 #[path = "../../tools/generate.rs"]
 mod generate;
 
-const SCHEMAS: [&str; 2] = ["erupt-annotations.schema.json", "erupt-node-defaults.json"];
+const SCHEMA: &str = "erupt-annotations.schema.json";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -20,24 +21,18 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut expected: Vec<(PathBuf, String)> = Vec::new();
-    for name in SCHEMAS {
-        match std::fs::read_to_string(Path::new(dir).join(name)) {
-            Ok(text) => expected.push((crate_dir.join(name), text)),
-            Err(e) => {
-                eprintln!("cannot read {dir}/{name}: {e}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    let schema: serde_json::Value = match serde_json::from_str(&expected[0].1) {
+    let schema: serde_json::Value = match std::fs::read_to_string(Path::new(dir).join(SCHEMA))
+        .map_err(|e| e.to_string())
+        .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+    {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("{dir}/{}: {e}", SCHEMAS[0]);
+            eprintln!("{dir}/{SCHEMA}: {e}");
             return ExitCode::from(2);
         }
     };
-    expected.push((crate_dir.join("src/types.rs"), generate::generate(&schema)));
+    let expected: Vec<(PathBuf, String)> =
+        vec![(crate_dir.join("src/types.rs"), generate::generate(&schema))];
     let stale: Vec<&(PathBuf, String)> = expected
         .iter()
         .filter(|(path, text)| {

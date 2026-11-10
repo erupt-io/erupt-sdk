@@ -11,7 +11,7 @@ repository = "https://github.com/erupt-io/erupt-sdk"
 readme = "README.md"
 keywords = ["erupt", "admin", "low-code", "crud"]
 categories = ["web-programming"]
-include = ["src/**", "tools/**", "examples/**", "tests/**", "*.json", "README.md", "Cargo.toml"]
+include = ["src/**", "tools/**", "examples/**", "tests/**", "README.md", "Cargo.toml"]
 
 [lib]
 name = "erupt"
@@ -36,7 +36,7 @@ name = "gen-types"
 path = "src/bin/gen-types.rs"
 
 [[example]]
-name = "blog"
+name = "showcase"
 required-features = ["sqlite"]
 
 [[test]]

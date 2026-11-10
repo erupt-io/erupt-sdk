@@ -121,7 +121,7 @@ class MemoryRepository(Repository):
 
 _SQL_OPS = {"EQ": "=", "NEQ": "<>", "GT": ">", "GTE": ">=", "LT": "<", "LTE": "<="}
 
-_SQLITE_TYPES = {"NUMBER": "NUMERIC", "BOOLEAN": "INTEGER", "DATE": "DATE", "DATE_TIME": "TIMESTAMP",
+_SQLITE_TYPES = {"NUMBER": "NUMERIC", "RATE": "NUMERIC", "SLIDER": "NUMERIC", "BOOLEAN": "INTEGER", "DATE": "DATE", "DATE_TIME": "TIMESTAMP",
                  "REFERENCE_TABLE": "INTEGER", "REFERENCE_TREE": "INTEGER"}
 
 # dialect -> (identifier quotes, paging); LIMIT/OFFSET or the SQL:2008 OFFSET ... FETCH form

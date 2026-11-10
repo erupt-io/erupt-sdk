@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,8 +23,29 @@ func Ptr[T any](v T) *T { return &v }
 const (
 	typeReferenceTable = "REFERENCE_TABLE"
 	typeReferenceTree  = "REFERENCE_TREE"
-	typeDateTime       = "DATE_TIME" // a template key, not an EditType: a DATE field holding a time of day
+	typeDateTime       = "DATE_TIME" // not an EditType: a DATE field holding a time of day (dateType DATE_TIME)
 )
+
+// supportedTypes are the edit types this SDK serves; the others (sub-tables, ...) need endpoints it lacks.
+var supportedTypes = map[string]bool{}
+
+// powerKeys are the rights a model may switch off (@Erupt power, PowerObject).
+var powerKeys = map[string]bool{}
+
+// returnNames is the fieldReturnName by edit type (PROTOCOL.md §7.1); a reference names its target, the rest "String".
+var returnNames = map[string]string{"NUMBER": "number", "RATE": "number", "SLIDER": "number", "BOOLEAN": "Boolean",
+	"DATE": "Date", typeDateTime: "Date"}
+
+func init() {
+	for _, t := range strings.Fields("ATTACHMENT AUTO_COMPLETE BOOLEAN BUTTON CHECKBOX CHOICE CODE_EDITOR COLOR DATE " +
+		"DATE_TIME HIDDEN HTML_EDITOR ICON INPUT MAP MARKDOWN MULTI_CHOICE NUMBER RATE REFERENCE_TABLE REFERENCE_TREE " +
+		"SIGNATURE SLIDER TAB_TREE TAGS TEXTAREA TRANSFER") {
+		supportedTypes[t] = true
+	}
+	for _, p := range strings.Fields("add edit delete query viewDetails export importable print copy cellEdit batchEdit ai comment revision") {
+		powerKeys[p] = true
+	}
+}
 
 // fetched names the edit attribute that carries a fetchHandler, by the type that fetches options.
 var fetched = map[string]string{"CHOICE": "choiceType", "MULTI_CHOICE": "multiChoiceType", "TAGS": "tagsType"}
@@ -70,7 +91,6 @@ type field struct {
 	ref, label, tree              string
 	target                        *Model
 	view, edit                    map[string]any
-	dependColumn                  string // edit.referenceTableType.dependColumn, @Transient in Java: written into the build
 	code                          FieldCode
 }
 
@@ -98,7 +118,7 @@ func (m *Model) stored() []*field {
 // Record maps keyed by field name.
 type Model struct {
 	name, title string
-	power       map[string]bool
+	power       map[string]bool // the rights the model switches off; the server enforces them (PROTOCOL.md §12.5)
 	raw         map[string]any
 	fields      []*field
 	byName      map[string]*field
@@ -106,15 +126,9 @@ type Model struct {
 	pk          string
 	orderBy     []Order
 	proxies     []DataProxy
-	vis         map[string]view  // view code -> what the node applies to that view's table queries
-	linkTree    string           // the reference field a @LinkTree beside the table filters
-	dependNode  bool             // a @LinkTree table shows no rows until a tree node is picked
-	drills      map[string]drill // drill code -> its link, of which column and joinColumn stay on the node
+	vis         map[string]view   // view code -> what the node applies to that view's table queries
+	drills      map[string]string // drill code -> its linkCondition, added to a drilled table (PROTOCOL.md §12.4)
 }
-
-// drill is a @Drill's link as the node applies it: the linked model's rows whose join field holds the source
-// row's column, plus condition (linkCondition) as written.
-type drill struct{ erupt, column, join, condition string }
 
 // view is a @Vis view's own filter and order, run on the node and kept out of the build.
 type view struct {
@@ -184,7 +198,7 @@ func WithPower(power map[string]bool) ModelOption {
 // WithOrderBy is the default table order, applied by the node: "views desc, id".
 func WithOrderBy(orderBy string) ModelOption { return func(c *modelConfig) { c.orderBy = orderBy } }
 
-// WithRaw passes raw @Erupt attributes (an M or an Erupt) merged onto the defaults.
+// WithRaw passes raw @Erupt attributes (an M or an Erupt), declared in the build as given.
 func WithRaw(raw any) ModelOption { return func(c *modelConfig) { c.raw = raw } }
 
 // WithFieldEdit passes raw @Edit attributes (an M or an Edit) for one field.
@@ -275,8 +289,8 @@ func hook[T any](ctx context.Context, m *Model, h func(DataProxy, context.Contex
 //
 // A slice or map field (MULTI_CHOICE, KEY_VALUE) holds a JSON value, kept as JSON text by SQL repositories;
 // a slice field with choices (or a FieldCode.Fetch) is a MULTI_CHOICE.
-// The field name is the json tag name, else the Go field name. Every raw attribute is checked against the
-// erupt annotation schema here, so a misspelt key fails at declaration instead of in the browser.
+// The field name is the json tag name, else the Go field name. The build carries only what is declared: the
+// erupt server completes it from Java's defaults and checks every attribute (PROTOCOL.md §12.3).
 func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error) {
 	t := reflect.TypeOf(declaration)
 	for t != nil && t.Kind() == reflect.Pointer {
@@ -304,21 +318,15 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 	if m.drills, err = pullDrills(pulled, "@erupt "+m.name); err != nil {
 		return nil, err
 	}
-	raw, err := rawObject(pulled, "Erupt", "@erupt "+m.name)
-	if err != nil {
+	if m.raw, err = rawObject(pulled, "@erupt "+m.name); err != nil {
 		return nil, err
 	}
-	m.raw = raw
-	m.power = map[string]bool{}
-	for k, v := range defaults.Power {
-		m.power[k] = v
-	}
-	for k, v := range cfg.power {
-		if _, ok := defaults.Power[k]; !ok {
+	for k := range cfg.power {
+		if !powerKeys[k] {
 			return nil, fmt.Errorf("%s: unknown power '%s'", m.name, k)
 		}
-		m.power[k] = v
 	}
+	m.power = cfg.power
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		tag, ok := sf.Tag.Lookup("erupt")
@@ -340,10 +348,7 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 		if f == nil {
 			return nil, fmt.Errorf("%s: WithFieldEdit names no field '%s'", m.name, name)
 		}
-		if v, err := toJSONValue(edit); err == nil {
-			edit, f.dependColumn = v, pullDependColumn(v)
-		}
-		if f.edit, err = rawObject(edit, "Edit", m.name+"."+name+".edit"); err != nil {
+		if f.edit, err = rawObject(edit, m.name+"."+name+".edit"); err != nil {
 			return nil, err
 		}
 	}
@@ -356,7 +361,7 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 		if m.byName[name] == nil {
 			return nil, fmt.Errorf("%s: WithFieldView names no field '%s'", m.name, name)
 		}
-		if m.byName[name].view, err = rawObject(view, "View", m.name+"."+name+".view"); err != nil {
+		if m.byName[name].view, err = rawObject(view, m.name+"."+name+".view"); err != nil {
 			return nil, err
 		}
 	}
@@ -383,10 +388,10 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 	if m.orderBy, err = m.parseOrder(cfg.orderBy); err != nil {
 		return nil, err
 	}
+	// the server filters by the tree beside the table (PROTOCOL.md §12.4); the field it names is checked here
 	if lt, _ := m.raw["linkTree"].(map[string]any); lt != nil && str(lt["field"]) != "" {
-		m.linkTree, m.dependNode = str(lt["field"]), lt["dependNode"] == true
-		if f := m.byName[m.linkTree]; f == nil || !f.isReference() {
-			return nil, fmt.Errorf("%s: linkTree.field '%s' must be a reference field", m.name, m.linkTree)
+		if f := m.byName[str(lt["field"])]; f == nil || !f.isReference() {
+			return nil, fmt.Errorf("%s: linkTree.field '%s' must be a reference field", m.name, str(lt["field"]))
 		}
 	}
 	m.vis = map[string]view{}
@@ -404,8 +409,8 @@ func NewModel(declaration any, title string, opts ...ModelOption) (*Model, error
 	return m, nil
 }
 
-// pullVis takes "filter" and "orderBy" out of every raw vis entry before the schema check, as they run on the
-// node; a view without a code is addressed by its title.
+// pullVis takes "filter" and "orderBy" out of every raw vis entry, as they run on the node and Java keeps them
+// @Transient; a view without a code is addressed by its title.
 func pullVis(raw any, path string) (any, map[string]NodeVis, error) {
 	if raw == nil {
 		return nil, nil, nil
@@ -420,7 +425,7 @@ func pullVis(raw any, path string) (any, map[string]NodeVis, error) {
 	for i, e := range entries {
 		entry, ok := e.(map[string]any)
 		if !ok {
-			continue // the schema check reports it
+			continue // the server reports it
 		}
 		if _, ok := entry["code"]; !ok {
 			entry["code"] = str(entry["title"])
@@ -453,47 +458,28 @@ func pullVis(raw any, path string) (any, map[string]NodeVis, error) {
 	return v, views, nil
 }
 
-// pullDrills takes link.column (id by default) and link.joinColumn (required, its first path segment the field)
-// out of every raw drill entry before the schema check, and fills the Drill and Link defaults so the build
-// validates; a drill without a code is addressed by its title.
-func pullDrills(raw any, path string) (map[string]drill, error) {
+// pullDrills reads the drills of the raw attributes. A drill's link goes to the server whole: it reads the source
+// row and joins on column / joinColumn (PROTOCOL.md §12.4). Its linkCondition is the node's SQL, added to a drilled
+// table. A drill without a code is addressed by its title.
+func pullDrills(raw any, path string) (map[string]string, error) {
 	obj, _ := raw.(map[string]any)
 	entries, _ := obj["drills"].([]any)
-	drills := map[string]drill{}
+	drills := map[string]string{}
 	for i, e := range entries {
 		entry, ok := e.(map[string]any)
 		if !ok {
-			continue // the schema check reports it
+			continue // the server reports it
 		}
 		link, _ := entry["link"].(map[string]any)
-		column, _ := link["column"].(string)
-		join, _ := link["joinColumn"].(string)
-		erupt, _ := link["linkErupt"].(string)
-		if join == "" || erupt == "" {
+		if str(link["joinColumn"]) == "" || str(link["linkErupt"]) == "" {
 			return nil, fmt.Errorf("%s.drills[%d]: needs link.linkErupt and link.joinColumn", path, i)
 		}
-		if column == "" {
-			column = "id"
-		}
-		delete(link, "column")
-		delete(link, "joinColumn")
 		if _, ok := entry["code"]; !ok {
 			entry["code"] = str(entry["title"])
 		}
-		entry["link"] = merge(schemaDefaults("Link"), link)
-		entries[i] = merge(schemaDefaults("Drill"), entry)
-		drills[str(entry["code"])] = drill{erupt, column, strings.Split(join, ".")[0], str(link["linkCondition"])}
+		drills[str(entry["code"])] = str(link["linkCondition"])
 	}
 	return drills, nil
-}
-
-// pullDependColumn takes referenceTableType.dependColumn out of a raw edit before the schema check.
-func pullDependColumn(edit any) string {
-	obj, _ := edit.(map[string]any)
-	table, _ := obj["referenceTableType"].(map[string]any)
-	column, _ := table["dependColumn"].(string)
-	delete(table, "dependColumn")
-	return column
 }
 
 func parseField(model string, sf reflect.StructField, tag string, codes map[string]FieldCode) (*field, error) {
@@ -569,10 +555,12 @@ func parseField(model string, sf reflect.StructField, tag string, codes map[stri
 	if f.virtual && (f.search || f.sortable || f.notNull) {
 		return nil, fmt.Errorf("%s: a virtual field cannot be searched, sorted or required", path)
 	}
-	if f.json && (f.search || f.sortable) {
-		return nil, fmt.Errorf("%s: a JSON field cannot be searched or sorted", path)
+	// a JSON value (MULTI_CHOICE, KEY_VALUE) is searched by its JSON text; its order means nothing, and a
+	// collection's keys are numbers that text search cannot single out
+	if f.json && (f.sortable || (f.search && f.isCollection())) {
+		return nil, fmt.Errorf("%s: a JSON field cannot be sorted, nor a CHECKBOX / TAB_TREE / TRANSFER searched", path)
 	}
-	if _, ok := defaults.Fields[f.typ]; !ok {
+	if !supportedTypes[f.typ] {
 		return nil, fmt.Errorf("%s: edit type %s is not supported yet", path, f.typ)
 	}
 	return f, nil
@@ -613,17 +601,20 @@ func resolveType(f *field, t reflect.Type) string {
 	return "INPUT"
 }
 
+// checkEnum fails a misspelt enum value where the model is declared; every other attribute the server checks.
 func checkEnum[T ~string](values []T, value, name, path string) error {
-	for _, v := range values {
+	names := make([]string, len(values))
+	for i, v := range values {
 		if string(v) == value {
 			return nil
 		}
+		names[i] = string(v)
 	}
-	return checkSchema(name, value, path, true) // the schema produces the same message
+	return fmt.Errorf("%s: '%s' is not a %s, expected one of %s", path, value, name, strings.Join(names, ", "))
 }
 
-// rawObject normalizes a raw override and checks it against a schema definition.
-func rawObject(raw any, def, path string) (map[string]any, error) {
+// rawObject normalizes a raw override (an M or a generated type) into a JSON object.
+func rawObject(raw any, path string) (map[string]any, error) {
 	if raw == nil {
 		return map[string]any{}, nil
 	}
@@ -631,10 +622,11 @@ func rawObject(raw any, def, path string) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if err := checkSchema(def, v, path, true); err != nil {
-		return nil, err
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s: expected an object", path)
 	}
-	return v.(map[string]any), nil
+	return obj, nil
 }
 
 // parseOrder turns "views desc, id" into orders, fields checked against the model.
@@ -690,64 +682,70 @@ func (m *Model) resolve(lookup func(string) *Model) error {
 	return nil
 }
 
+// build declares the field (PROTOCOL.md §12.3): the server completes the rest from Java's defaults.
 func (f *field) build() map[string]any {
-	key := f.typ
 	if f.pk {
-		key = "id"
+		return M{"fieldName": f.name, "fieldReturnName": "number", "componentValue": nil,
+			"eruptFieldJson": M{"edit": M{"title": "", "type": "NUMBER"}}}
 	}
-	tpl := deepCopy(defaults.Fields[key]).(map[string]any)
-	tpl["fieldName"] = f.name
-	tpl["componentValue"] = nil
-	if f.pk {
-		return tpl
-	}
-	efj := tpl["eruptFieldJson"].(map[string]any)
-	edit := efj["edit"].(map[string]any)
-	view := M{} // a BUTTON is a form element only: its template has no table column
-	if views := efj["views"].([]any); len(views) > 0 {
-		view = views[0].(map[string]any)
-	}
-	edit["title"], edit["notNull"], edit["show"] = f.title, f.notNull, f.form
-	edit["search"].(map[string]any)["value"] = f.search
-	view["title"], view["sortable"] = f.title, f.sortable
+	// a DATE_TIME is a DATE whose dateType says so; a DATE says it too, as AUTO is the node's to resolve
+	edit := M{"title": f.title, "type": f.typ}
 	switch f.typ {
+	case typeDateTime:
+		edit["type"], edit["dateType"] = "DATE", M{"type": typeDateTime}
 	case "DATE":
-		view["type"] = "DATE"
+		edit["dateType"] = M{"type": "DATE"}
+	}
+	if f.notNull {
+		edit["notNull"] = true
+	}
+	if !f.form {
+		edit["show"] = false
+	}
+	if f.search {
+		edit["search"] = M{"value": true}
+	}
+	view := M{"title": f.title}
+	if f.sortable {
+		view["sortable"] = true
+	}
+	returnName := returnNames[f.typ]
+	if returnName == "" {
+		returnName = "String"
+	}
+	switch f.typ {
 	case typeReferenceTable:
-		tpl["fieldReturnName"] = f.target.name
-		merge(edit["referenceTableType"].(map[string]any), M{"id": f.target.pk, "label": f.label})
-		view["column"] = f.label
+		edit["referenceTableType"] = M{"id": f.target.pk, "label": f.label}
 	case typeReferenceTree:
-		tpl["fieldReturnName"] = f.target.name
-		merge(edit["referenceTreeType"].(map[string]any), M{"id": f.target.pk, "label": f.label, "pid": f.tree})
-		view["column"] = f.label
-	case "CHECKBOX", "TAB_TREE", "TRANSFER":
+		edit["referenceTreeType"] = M{"id": f.target.pk, "label": f.label, "pid": f.tree}
+	}
+	if f.isReference() || f.isCollection() {
 		// the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
-		tpl["fieldReturnName"] = f.target.name
+		returnName = f.target.name
 		view["column"] = f.label
 	}
 	if attr := fetched[f.typ]; attr != "" && (f.code.Fetch != nil || f.code.Tags != nil) {
-		edit[attr].(map[string]any)["fetchHandler"] = []any{"invoke"}
+		edit[attr] = M{"fetchHandler": []any{"invoke"}}
 	}
 	if f.code.Onchange != nil {
 		edit["onchange"] = "invoke"
 	}
 	merge(edit, f.edit)
-	if table, ok := edit["referenceTableType"].(map[string]any); ok && f.dependColumn != "" {
-		table["dependColumn"] = f.dependColumn
-	}
 	merge(view, f.view)
-	if !f.table {
-		efj["views"] = []any{}
+	views := []any{} // a BUTTON is a form element only: no table column
+	if f.table && f.typ != "BUTTON" {
+		views = []any{view}
 	}
+	var options any
 	if len(f.choices) > 0 { // a CHOICE, or a MULTI_CHOICE by raw edit: the options travel as componentValue
-		options := make([]any, len(f.choices))
+		list := make([]any, len(f.choices))
 		for i, c := range f.choices {
-			options[i] = M{"value": c.value, "label": c.label, "desc": nil, "color": nil, "disable": false}
+			list[i] = M{"value": c.value, "label": c.label, "desc": nil, "color": nil, "disable": false}
 		}
-		tpl["componentValue"] = options
+		options = list
 	}
-	return tpl
+	return M{"fieldName": f.name, "fieldReturnName": returnName, "componentValue": options,
+		"eruptFieldJson": M{"edit": edit, "views": views}}
 }
 
 func (m *Model) buildErupt(ops []*Operation) map[string]any {
@@ -755,13 +753,11 @@ func (m *Model) buildErupt(ops []*Operation) map[string]any {
 	if pk == "" {
 		pk = "id"
 	}
-	erupt := merge(deepCopy(defaults.Erupt).(map[string]any), M{"primaryKeyCol": pk})
 	rows := make([]any, len(ops))
 	for i, op := range ops {
 		rows[i] = op.build()
 	}
-	erupt["rowOperation"] = rows
-	merge(erupt, m.raw)
+	erupt := merge(M{"primaryKeyCol": pk, "rowOperation": rows}, m.raw)
 	fields := make([]any, len(m.fields))
 	for i, f := range m.fields {
 		fields[i] = f.build()
@@ -789,13 +785,11 @@ func (m *Model) buildModel(power map[string]bool, user *User) map[string]any {
 	return build
 }
 
-// coerce turns a JSON value from the browser into the value a repository stores.
+// coerce turns a value as the server sends it (PROTOCOL.md §12.4) into the value a repository stores: a date as a
+// time.Time, a number as int64 / float64, a key as the key type. The server has checked it; a key in a path segment,
+// a delete body or an operation's ids arrives as the browser sent it, so it may fail here.
 func (f *field) coerce(v any) (any, error) {
 	if f.isReference() {
-		// the browser sends the picked record as {<id>: ..., <label>: ...}
-		if obj, ok := v.(map[string]any); ok {
-			v = obj[f.target.pk]
-		}
 		return f.target.byName[f.target.pk].coerce(v)
 	}
 	if f.isCollection() {
@@ -804,14 +798,9 @@ func (f *field) coerce(v any) (any, error) {
 	if v == nil || v == "" {
 		return nil, nil
 	}
-	if f.json {
-		switch v.(type) {
-		case []any, map[string]any:
-			return v, nil
-		}
-		return nil, fmt.Errorf("illegal value '%s'", str(v))
-	}
 	switch {
+	case f.json:
+		return v, nil
 	case f.pk:
 		if s, ok := v.(string); ok {
 			n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
@@ -826,35 +815,20 @@ func (f *field) coerce(v any) (any, error) {
 		}
 		return int64(n), nil
 	case f.isNumber():
-		var n float64
-		switch t := v.(type) {
-		case bool:
-			if t {
-				n = 1
-			}
-		case string:
-			parsed, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
-			if err != nil {
-				return nil, fmt.Errorf("illegal number '%s'", t)
-			}
-			n = parsed
-		default:
-			parsed, ok := toFloat(v)
-			if !ok {
-				return nil, fmt.Errorf("illegal number '%s'", str(v))
-			}
-			n = parsed
+		n, ok := toFloat(v)
+		if !ok {
+			return nil, fmt.Errorf("illegal number '%s'", str(v))
 		}
-		if n == float64(int64(n)) {
+		if n == math.Trunc(n) && math.Abs(n) < 1<<53 {
 			return int64(n), nil
 		}
 		return n, nil
 	case f.typ == "BOOLEAN":
-		if b, ok := v.(bool); ok {
-			return b, nil
+		b, ok := v.(bool)
+		if !ok {
+			return nil, fmt.Errorf("illegal boolean '%s'", str(v))
 		}
-		s := strings.ToLower(str(v))
-		return s == "true" || s == "1", nil
+		return b, nil
 	case f.typ == typeDateTime:
 		return parseDateTime(v)
 	case f.typ == "DATE":
@@ -863,38 +837,22 @@ func (f *field) coerce(v any) (any, error) {
 			return nil, err
 		}
 		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC), nil
-	case f.typ == "CHOICE" && len(f.choices) > 0:
-		s := str(v)
-		for _, c := range f.choices {
-			if c.value == s {
-				return s, nil
-			}
-		}
-		return nil, fmt.Errorf("%s: illegal option '%s'", f.title, s)
 	}
 	return str(v), nil
 }
 
-// coerceKeys turns picked records, [{id: key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), plain keys or their JSON
-// text, into the list of keys stored.
+// coerceKeys turns the picked keys of a CHECKBOX / TAB_TREE / TRANSFER into the list of keys stored.
 func (f *field) coerceKeys(v any) (any, error) {
-	if s, ok := v.(string); ok && s != "" {
-		if err := decode([]byte(s), &v); err != nil {
-			return nil, fmt.Errorf("illegal value '%s'", s)
-		}
+	if v == nil {
+		return []any{}, nil
 	}
 	items, ok := v.([]any)
-	if !ok && v != nil && v != "" {
+	if !ok {
 		return nil, fmt.Errorf("illegal value '%s'", str(v))
 	}
 	pk := f.target.byName[f.target.pk]
 	keys := make([]any, len(items))
 	for i, item := range items {
-		if obj, ok := item.(map[string]any); ok {
-			if item, ok = obj[f.target.pk]; !ok {
-				item = obj["id"]
-			}
-		}
 		key, err := pk.coerce(item)
 		if err != nil {
 			return nil, err
@@ -913,13 +871,4 @@ func (f *field) jsonValue(v any) any {
 		return t.Format(dateTimeLayout)
 	}
 	return v
-}
-
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }

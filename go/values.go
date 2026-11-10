@@ -1,6 +1,7 @@
 package erupt
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -116,4 +117,54 @@ func cmp3(less, greater bool) int {
 func equal(a, b any) bool {
 	c, ok := compare(a, b)
 	return ok && c == 0
+}
+
+// decode unmarshals keeping numbers exact (json.Number), so integers stay integers.
+func decode(data []byte, v any) error {
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.UseNumber()
+	return d.Decode(v)
+}
+
+// toJSONValue normalizes a user value (map, generated struct, ...) into decoded JSON.
+func toJSONValue(v any) (any, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var out any
+	return out, decode(data, &out)
+}
+
+// deepCopy copies decoded JSON so a declaration is never shared between builds.
+func deepCopy(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, x := range t {
+			out[k] = deepCopy(x)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, x := range t {
+			out[i] = deepCopy(x)
+		}
+		return out
+	}
+	return v
+}
+
+// merge overlays override onto target, recursing into objects present on both sides.
+func merge(target, override map[string]any) map[string]any {
+	for k, v := range override {
+		if o, ok := v.(map[string]any); ok {
+			if t, ok := target[k].(map[string]any); ok {
+				merge(t, o)
+				continue
+			}
+		}
+		target[k] = deepCopy(v)
+	}
+	return target
 }

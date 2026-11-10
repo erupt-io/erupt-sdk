@@ -261,9 +261,8 @@ impl SqlRepository {
                     Some(d) => Value::String(d.date_time_string()),
                     None => value,
                 },
-                (_, kind) if kind == "NUMBER" || f.is_pk() || f.is_reference() => {
-                    as_f64(&value).map(number).unwrap_or(value)
-                }
+                (_, "NUMBER" | "RATE" | "SLIDER") => as_f64(&value).map(number).unwrap_or(value),
+                _ if f.is_pk() || f.is_reference() => as_f64(&value).map(number).unwrap_or(value),
                 _ => value,
             };
             record.insert(f.name.clone(), value);
@@ -319,7 +318,7 @@ impl Repository for SqlRepository {
                 .map(|f| {
                     let kind = match f.kind.as_str() {
                         _ if f.is_pk() => "INTEGER PRIMARY KEY AUTOINCREMENT",
-                        "NUMBER" => "NUMERIC",
+                        "NUMBER" | "RATE" | "SLIDER" => "NUMERIC",
                         "BOOLEAN" | "REFERENCE_TABLE" | "REFERENCE_TREE" => "INTEGER",
                         "DATE" => "DATE",
                         "DATE_TIME" => "TIMESTAMP",

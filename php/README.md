@@ -30,14 +30,32 @@ $node = (new Node('blog', getenv('ERUPT_ACCESS_TOKEN'), 'http://erupt-server:808
 3. Serve requests and run the heartbeat (below). The server must reach the node on
    `http://<node ip>:<port>`; pass `address:` to `Node` otherwise.
 
+The node speaks node protocol v2 (erupt-cloud/PROTOCOL.md §12): the server signs every call with the access token
+(an unsigned call, or one whose `Erupt-Enforced` lacks what the endpoint needs, is refused with 403), enforces the
+user's rights and the model's `power`, checks and normalizes queries and records, and completes the build. A server
+that does not answer the registration with protocol v2 is too old: the heartbeat logs an error and stops
+registering; upgrade the erupt server.
+
 ## Running: two processes
 
 Under php-fpm or `php -S` every request is a fresh process, so registration cannot live in the request
 path. A node is a front controller plus one long-running heartbeat process:
 
 ```bash
-php -S 0.0.0.0:9090 examples/blog/router.php     # requests: (require 'app.php')->run();
-PORT=9090 php examples/blog/heartbeat.php        # registration: (require 'app.php')->heartbeat(9090);
+php -S 0.0.0.0:9090 examples/showcase/router.php     # requests: (require 'app.php')->run();
+PORT=9090 php examples/showcase/heartbeat.php        # registration: (require 'app.php')->heartbeat(9090);
+```
+
+`examples/showcase.php` runs both in one command: it seeds the SQLite file, starts `php -S` on `examples/showcase/router.php`
+and registers until Ctrl-C. `examples/showcase/app.php` is the shared showcase (`SHOWCASE.md`): Category, Author, Tag,
+Article, Component, AuditLog and Playground ("Buttons & Forms") with every field type, invoked code, custom buttons,
+views, drills, the link tree, every DataProxy hook, row operations and calls back to the server (`userInfo()`,
+`config()`). It reads `ERUPT_NODE_NAME` (default `showcase`), `ERUPT_ACCESS_TOKEN`, `ERUPT_SERVER`, `PORT` and
+`ERUPT_DB` (default `showcase.db`); check it with `python3 conformance/showcase.py -- php php/examples/showcase.php` from the
+repository root.
+
+```bash
+ERUPT_ACCESS_TOKEN=... ERUPT_SERVER=http://localhost:8080 PORT=9090 php examples/showcase.php
 ```
 
 `heartbeat()` registers every 15 seconds and, with ext-pcntl, deregisters on SIGINT / SIGTERM. Without a
@@ -70,13 +88,15 @@ Run `$node->heartbeat($port)` from an artisan command kept alive by your process
 The edit type follows the property type: `string` INPUT, `int` / `float` NUMBER, `bool` BOOLEAN,
 `DateTimeInterface` DATE_TIME, another #[Erupt] class a reference; `type:` overrides it (`'DATE'`,
 `'TEXTAREA'`), `choices:` makes a CHOICE. Options: `search`, `notNull`, `sortable`, `table` (column),
-`form`, and raw `view:` / `edit:` attributes. #[Erupt] takes `power: ['delete' => false]`,
+`form`, and raw `view:` / `edit:` attributes. #[Erupt] takes `power: ['delete' => false]` (the rights the
+model switches off; the server enforces them together with the user's),
 `orderBy: 'views desc, id'` (applied by the node), `dataProxy:` ([DataProxy](#dataproxy)) and raw `raw:` attributes (`['layout' => ['pageSize' => 30]]`).
 
 Raw attributes are described by the generated array shapes in `Erupt\Types\Annotations` and the enums
-in `Erupt\Types` (`EditType`, `RowOperationMode`, ...), and checked against the erupt annotation schema
-when the model is compiled, so a misspelt key or enum value throws at startup instead of silently doing
-nothing in the browser.
+in `Erupt\Types` (`EditType`, `RowOperationMode`, ...). The build carries only what a model declares: the erupt
+server completes it from the annotation defaults and checks it, so a misspelt attribute fails there, naming the
+model and the attribute. When the model is compiled the node itself checks the edit type, the operation mode,
+`power` keys, `orderBy` fields, `linkTree.field` and drill links.
 
 Records are associative arrays. Dates are stored as wall-clock strings: DATE `2026-01-05`, DATE_TIME
 `2026-01-05T10:30:00.000`.
@@ -197,7 +217,7 @@ Dragging on a board, calendar or gantt view is saved by the erupt server through
 
 `raw: ['tree' => ['id' => 'id', 'label' => 'name', 'pid' => 'parent']]` shows the model as a tree, and
 `raw: ['linkTree' => ['field' => 'category']]` puts the tree of a reference field beside the table: the erupt
-server builds both trees from the node's table, and the node keeps the rows under the picked tree node
+server builds both trees from the node's table and sends the picked tree nodes as an ordinary condition
 (`'dependNode' => true` shows none until one is picked). `linkTree.field` must be a reference field.
 
 ## Field types and field code
@@ -243,8 +263,9 @@ keeps the picked model's rows whose `dependColumn` holds the depend field's valu
 #[Erupt('Author', raw: ['drills' => [['title' => 'Books', 'link' => ['linkErupt' => 'Book', 'joinColumn' => 'author']]]])]
 ```
 
-opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
-`link.linkCondition` adds SQL as written (a SQL repository then). Both models must be on the node.
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default): the
+server reads the author and sends that join as a condition. `link.linkCondition` is added by the node as SQL as
+written (a SQL repository then). Both models must be on the node.
 
 ## Server config and user info
 
@@ -262,7 +283,7 @@ Without Packagist, point Composer at the read-only split repository:
 }
 ```
 
-Or copy `php/` (`autoload.php`, `src/` and `resources/`) into your project and `require` its `autoload.php`.
+Or copy `php/` (`autoload.php` and `src/`) into your project and `require` its `autoload.php`.
 A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `Node::VERSION` untouched so the server shows which release the node runs.
 
 ## Differences from the Python SDK
@@ -275,11 +296,11 @@ A copy does not update itself: when erupt changes the protocol or the annotation
 
 ## Generated code
 
-`src/Types/` (enums and annotation array shapes) and `resources/` (schema and field templates) come
-from the erupt schema:
+`src/Types/` (enums and annotation array shapes) come from the erupt schema; the SDK embeds no schema at run
+time:
 
 ```bash
-php tools/gen-types.php ../schema          # sync, regenerate
+php tools/gen-types.php ../schema          # regenerate
 php tools/gen-types.php ../schema --check  # CI: exit 1 when stale
 ```
 

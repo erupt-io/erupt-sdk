@@ -4,16 +4,28 @@ using System.Text.Json.Nodes;
 
 namespace Erupt;
 
-/// <summary>A declared column: its template key, flags and raw overrides.</summary>
+/// <summary>A declared column: its edit type, flags and raw overrides.</summary>
 internal sealed class FieldDef
 {
-    private static readonly JsonObject Templates = Schema.Defaults["fields"]!.AsObject();
-
     private static readonly Type[] Numbers =
         [typeof(int), typeof(long), typeof(short), typeof(byte), typeof(sbyte), typeof(uint), typeof(ulong), typeof(ushort),
          typeof(float), typeof(double), typeof(decimal)];
 
-    internal const string TemplateDateTime = "DATE_TIME"; // a template key, not an EditType: a DATE with a time of day
+    internal const string DateTimeType = "DATE_TIME"; // not an EditType: a DATE with a time of day
+
+    // the edit types this SDK stores and serves
+    private static readonly HashSet<string> Supported =
+    [
+        "ATTACHMENT", "AUTO_COMPLETE", "BOOLEAN", "BUTTON", "CHECKBOX", "CHOICE", "CODE_EDITOR", "COLOR", "DATE", DateTimeType, "HIDDEN",
+        "HTML_EDITOR", "ICON", "INPUT", "MAP", "MARKDOWN", "MULTI_CHOICE", "NUMBER", "RATE", "REFERENCE_TABLE", "REFERENCE_TREE",
+        "SIGNATURE", "SLIDER", "TAB_TREE", "TAGS", "TEXTAREA", "TRANSFER",
+    ];
+
+    // fieldReturnName by edit type (PROTOCOL.md §7.1); a reference names its target, the rest are "String"
+    private static readonly Dictionary<string, string> ReturnNames = new()
+    {
+        ["NUMBER"] = "number", ["RATE"] = "number", ["SLIDER"] = "number", ["BOOLEAN"] = "Boolean", ["DATE"] = "Date", [DateTimeType] = "Date",
+    };
 
     // many records of another model, stored as the JSON list of their keys
     private static readonly string[] Collections = ["CHECKBOX", "TAB_TREE", "TRANSFER"];
@@ -27,7 +39,7 @@ internal sealed class FieldDef
     internal required string Title { get; init; }
     internal bool IsPk { get; init; }
 
-    /// <summary>The template key: an EditType name, or DATE_TIME; null for the primary key.</summary>
+    /// <summary>An EditType name, or DATE_TIME; null for the primary key.</summary>
     internal string? Type { get; init; }
 
     internal bool Search { get; init; }
@@ -83,6 +95,7 @@ internal sealed class FieldDef
         if (property.GetCustomAttribute<PkAttribute>() is not null)
             return new FieldDef { Model = model, Property = property, Name = name, Title = "", IsPk = true };
         var a = property.GetCustomAttribute<FieldAttribute>()!;
+        if (!Enum.IsDefined(a.Type)) throw new ArgumentException($"{path}.type: '{(int)a.Type}' is not an EditType");
         var clr = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
         var choices = property.GetCustomAttributes<ChoiceAttribute>().Select(c => (c.Value, c.Label)).ToList();
         var reference = a.Ref ?? (clr.GetCustomAttribute<EruptModelAttribute>() is not null ? clr : null);
@@ -94,13 +107,15 @@ internal sealed class FieldDef
         else if (choices.Count > 0) type = json ? "MULTI_CHOICE" : "CHOICE";
         else if (clr == typeof(bool)) type = "BOOLEAN";
         else if (Numbers.Contains(clr)) type = "NUMBER";
-        else if (clr == typeof(DateTime) || clr == typeof(DateTimeOffset)) type = TemplateDateTime;
+        else if (clr == typeof(DateTime) || clr == typeof(DateTimeOffset)) type = DateTimeType;
         else if (clr == typeof(DateOnly)) type = "DATE";
         else type = "INPUT";
-        if (!Templates.ContainsKey(type) || type == "id") throw new ArgumentException($"{path}: edit type {type} is not supported yet");
+        if (!Supported.Contains(type)) throw new ArgumentException($"{path}: edit type {type} is not supported yet");
         var isVirtual = a.Virtual || type == "BUTTON"; // a BUTTON is a form element only
         if (isVirtual && (a.Search || a.Sortable || a.NotNull)) throw new ArgumentException($"{path}: a virtual field cannot be searched, sorted or required");
-        if (json && (a.Search || a.Sortable)) throw new ArgumentException($"{path}: a JSON field cannot be searched or sorted");
+        // a MULTI_CHOICE is searched by the values it holds (EruptNode.Condition); other JSON values are not searched
+        if (json && (a.Sortable || (a.Search && choices.Count == 0)))
+            throw new ArgumentException($"{path}: a JSON field cannot be sorted, and only a MULTI_CHOICE one searched");
         var field = new FieldDef
         {
             Model = model, Property = property, Name = name, Title = a.Title, Type = type,
@@ -124,107 +139,80 @@ internal sealed class FieldDef
             if (!names.Contains(key)) throw new ArgumentException($"{path}: {target.Name} has no field '{key}'");
     }
 
+    /// <summary>The field as declared (PROTOCOL.md §12.3): the server completes the rest from Java's defaults.</summary>
     internal JsonObject Build()
     {
-        var tpl = Templates[IsPk ? "id" : Type!]!.DeepClone().AsObject();
-        tpl["fieldName"] = Name;
-        tpl["componentValue"] = null;
-        if (IsPk) return tpl;
-        var efj = tpl["eruptFieldJson"]!.AsObject();
-        var edit = efj["edit"]!.AsObject();
-        var views = efj["views"]!.AsArray();
-        var view = views.Count > 0 ? views[0]!.AsObject() : []; // a BUTTON's template has no table column
-        edit["title"] = Title;
-        edit["notNull"] = NotNull;
-        edit["show"] = Form;
-        edit["search"]!["value"] = Search;
-        view["title"] = Title;
-        view["sortable"] = Sortable;
-        switch (Type)
+        if (IsPk)
         {
-            case "DATE":
-                view["type"] = "DATE";
-                break;
-            case "REFERENCE_TABLE":
-                tpl["fieldReturnName"] = Target.Name;
-                Json.Merge(edit["referenceTableType"]!.AsObject(), new JsonObject { ["id"] = Target.Pk, ["label"] = Label });
-                if (DependColumn is not null) edit["referenceTableType"]!["dependColumn"] = DependColumn;
-                view["column"] = Label;
-                break;
-            case "REFERENCE_TREE":
-                tpl["fieldReturnName"] = Target.Name;
-                Json.Merge(edit["referenceTreeType"]!.AsObject(), new JsonObject { ["id"] = Target.Pk, ["label"] = Label, ["pid"] = Tree });
-                view["column"] = Label;
-                break;
-            case "CHECKBOX" or "TAB_TREE" or "TRANSFER": // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
-                tpl["fieldReturnName"] = Target.Name;
-                view["column"] = Label;
-                break;
+            return new JsonObject
+            {
+                ["fieldName"] = Name, ["fieldReturnName"] = "number", ["componentValue"] = null,
+                ["eruptFieldJson"] = new JsonObject { ["edit"] = new JsonObject { ["title"] = "", ["type"] = "NUMBER" } },
+            };
         }
-        if (Invoked.ContainsKey("options")) edit[Fetched[Type!]]!["fetchHandler"] = new JsonArray("invoke");
+        // a DATE_TIME is a DATE whose dateType says so; a DATE says it too, as AUTO is the node's to resolve
+        var edit = new JsonObject { ["title"] = Title, ["type"] = Type == DateTimeType ? "DATE" : Type };
+        if (Type is "DATE" or DateTimeType) edit["dateType"] = new JsonObject { ["type"] = Type };
+        if (NotNull) edit["notNull"] = true;
+        if (!Form) edit["show"] = false;
+        if (Search) edit["search"] = new JsonObject { ["value"] = true };
+        var view = new JsonObject { ["title"] = Title };
+        if (Sortable) view["sortable"] = true;
+        var returnName = ReturnNames.GetValueOrDefault(Type!, "String");
+        if (Type == "REFERENCE_TABLE")
+        {
+            edit["referenceTableType"] = new JsonObject { ["id"] = Target.Pk, ["label"] = Label };
+            if (DependColumn is not null) edit["referenceTableType"]!["dependColumn"] = DependColumn;
+        }
+        else if (Type == "REFERENCE_TREE") edit["referenceTreeType"] = new JsonObject { ["id"] = Target.Pk, ["label"] = Label, ["pid"] = Tree };
+        if (IsReference || IsCollection)
+        {
+            // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
+            returnName = Target.Name;
+            view["column"] = Label;
+        }
+        if (Invoked.ContainsKey("options")) edit[Fetched[Type!]] = new JsonObject { ["fetchHandler"] = new JsonArray("invoke") };
         if (Invoked.ContainsKey("onchange")) edit["onchange"] = "invoke";
         Json.Merge(edit, EditRaw);
         Json.Merge(view, ViewRaw);
-        if (!Table) efj["views"] = new JsonArray();
-        if (Choices is not null) // a CHOICE, or a MULTI_CHOICE by raw edit type: the options travel as componentValue
+        // a CHOICE, or a MULTI_CHOICE by raw edit type: the options travel as componentValue
+        var options = Choices is null ? null : new JsonArray(Choices.Select(c => (JsonNode)new JsonObject
         {
-            tpl["componentValue"] = new JsonArray(Choices!.Select(c => (JsonNode)new JsonObject
-            {
-                ["value"] = c.Value, ["label"] = c.Label, ["desc"] = null, ["color"] = null, ["disable"] = false,
-            }).ToArray());
-        }
-        return tpl;
+            ["value"] = c.Value, ["label"] = c.Label, ["desc"] = null, ["color"] = null, ["disable"] = false,
+        }).ToArray());
+        return new JsonObject
+        {
+            ["fieldName"] = Name, ["fieldReturnName"] = returnName, ["componentValue"] = options,
+            // a BUTTON is a form element only: no table column
+            ["eruptFieldJson"] = new JsonObject { ["edit"] = edit, ["views"] = Table && Type != "BUTTON" ? new JsonArray(view) : new JsonArray() },
+        };
     }
 
-    /// <summary>A plain value from the browser to the value the repository stores; throws on an illegal value.</summary>
+    /// <summary>
+    /// A JSON value as the server sends it (PROTOCOL.md §12.4) to the value the repository stores: a date as
+    /// <see cref="DateOnly"/> / <see cref="DateTime"/>, a key as its key type. The server has checked it; a key in a path
+    /// segment, a delete body or an operation's ids arrives as the browser sent it, so it may fail here.
+    /// </summary>
     internal object? Coerce(object? value)
     {
-        if (IsReference)
-        {
-            // the browser sends the picked record as {<id>: ..., <label>: ...}
-            if (value is IDictionary<string, object?> picked) value = picked.TryGetValue(Target.Pk, out var id) ? id : null;
-            return CoercePk(value);
-        }
-        if (IsPk) return CoercePk(value);
-        if (IsCollection)
-        {
-            // picked records arrive as [{id: key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), and are stored as keys
-            if (value is string text) value = text.Length == 0 ? null : ParseList(text);
-            if (value is null) return new List<object?>();
-            if (value is not IList<object?> items) throw new FormatException($"illegal value '{Values.Str(value)}'");
-            return items.Select(v => CoercePk(v is IDictionary<string, object?> picked ? picked.Values.FirstOrDefault() : v)).ToList();
-        }
+        if (IsReference || IsPk) return CoercePk(value);
+        if (IsCollection) return value is IList<object?> items ? items.Select(CoercePk).ToList() : new List<object?>();
         if (value is null || value is "") return null;
-        if (IsJson) return value is IList<object?> or IDictionary<string, object?> ? value : throw new FormatException($"illegal value '{Values.Str(value)}'");
+        if (IsJson) return value;
         switch (Type)
         {
             case "BOOLEAN":
-                return value is bool b ? b : Values.Str(value).ToLowerInvariant() is "true" or "1";
+                return value is bool b ? b : throw new FormatException($"illegal boolean '{Values.Str(value)}'");
             case "NUMBER" or "RATE" or "SLIDER":
-                if (value is bool flag) return flag ? 1L : 0L;
                 if (!double.TryParse(Values.Str(value), NumberStyles.Float, CultureInfo.InvariantCulture, out var number) || !double.IsFinite(number))
                     throw new FormatException($"illegal number '{Values.Str(value)}'");
                 return Values.Number(number);
-            case TemplateDateTime:
+            case DateTimeType:
                 return Values.ParseDateTime(value);
             case "DATE":
                 return DateOnly.FromDateTime(Values.ParseDateTime(value));
-            case "CHOICE" when Choices is not null && Choices.All(c => c.Value != Values.Str(value)):
-                throw new FormatException($"illegal option '{Values.Str(value)}'");
             default:
                 return Values.Str(value);
-        }
-    }
-
-    private static object? ParseList(string text)
-    {
-        try
-        {
-            return Values.Plain(JsonNode.Parse(text));
-        }
-        catch (System.Text.Json.JsonException)
-        {
-            throw new FormatException($"illegal value '{text}'");
         }
     }
 
@@ -259,8 +247,11 @@ public sealed class FieldUpdate
 
     internal JsonObject ToJson(bool button)
     {
-        var json = new JsonObject { ["formData"] = Values.ToJson(FormData ?? new Record()), ["editExpr"] = Values.ToJson(EditExpr ?? new Dictionary<string, string>()) };
-        if (button) json["eval"] = Eval;
+        // only what the code set: an onchange that changes nothing answers {}
+        var json = new JsonObject();
+        if (button && Eval is not null) json["eval"] = Eval;
+        if (FormData is { Count: > 0 }) json["formData"] = Values.ToJson(FormData);
+        if (EditExpr is { Count: > 0 }) json["editExpr"] = Values.ToJson(EditExpr);
         return json;
     }
 }
@@ -292,7 +283,7 @@ public sealed class OperationOptions
     /// <summary>Browser-side JavaScript over <c>item</c> that disables (or hides) the row button.</summary>
     public string IfExpr { get; init; } = "";
 
-    /// <summary>Raw <c>@RowOperation</c> attributes, checked against the schema.</summary>
+    /// <summary>Raw <c>@RowOperation</c> attributes, merged on top; the server checks them.</summary>
     public RowOperation? Raw { get; init; }
 }
 
@@ -324,8 +315,8 @@ internal sealed class OperationDef
         Code = code;
         _options = options;
         Handler = handler;
-        Schema.Check("RowOperationMode", options.Mode.ToString(), $"{path}.mode");
-        _raw = Schema.Override("RowOperation", options.Raw, path);
+        if (!Enum.IsDefined(options.Mode)) throw new ArgumentException($"{path}.mode: '{(int)options.Mode}' is not a RowOperationMode");
+        _raw = Json.Declared(options.Raw);
     }
 
     internal string Code { get; }
@@ -337,14 +328,11 @@ internal sealed class OperationDef
 
     internal JsonObject Build()
     {
-        var tpl = Schema.Defaults["rowOperation"]!.DeepClone().AsObject();
-        tpl["code"] = Code;
-        tpl["title"] = _options.Title;
-        tpl["mode"] = _options.Mode.ToString();
-        tpl["tip"] = _options.Tip;
-        tpl["ifExpr"] = _options.IfExpr;
-        tpl["type"] = "ERUPT";
-        tpl["eruptClass"] = _options.Form?.Name ?? "void";
+        var tpl = new JsonObject
+        {
+            ["code"] = Code, ["title"] = _options.Title, ["mode"] = _options.Mode.ToString(), ["tip"] = _options.Tip,
+            ["ifExpr"] = _options.IfExpr, ["eruptClass"] = _options.Form?.Name ?? "void",
+        };
         if (_options.Icon is not null) tpl["icon"] = _options.Icon;
         if (!_options.Confirm) tpl["callHint"] = ""; // the browser runs it without asking
         else if (_options.ConfirmText is not null) tpl["callHint"] = _options.ConfirmText;

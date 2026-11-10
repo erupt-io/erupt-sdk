@@ -37,12 +37,23 @@ node.register(&article, SqlRepository::new(SqliteExecutor::open("blog.db")?, "ar
 node.serve("0.0.0.0", 9090)?;   // blocks; SIGINT / SIGTERM deregister and exit
 ```
 
-1. On the erupt server create node `blog` (Node Config) and copy its access token.
+1. On the erupt server create node `blog` (Node Config) and copy its access token. The node speaks node
+   protocol v2 (erupt-cloud/PROTOCOL.md §12) and needs a server that does: an older server is logged as an
+   error and the node stops registering. The server signs every call with the access token (the token itself
+   never travels), enforces the user's rights and the model's, checks and normalizes queries and records, and
+   turns drills and link trees into conditions; an unsigned call, or one whose signed `Erupt-Enforced` lacks
+   what its endpoint needs, is refused with 403.
 2. Add menus of type `table` with values `blog.Article`, `blog.Category`.
 3. Run the node. The server must reach it at the detected address (IPv4 preferred); otherwise set
    `.address("http://10.0.0.12:9090")`.
 
-`examples/blog.rs` is the full blog (`cargo run --features sqlite --example blog`).
+`examples/showcase.rs` is the showcase of `../SHOWCASE.md` on SQLite (`cargo run --features sqlite --example showcase`):
+Category (tree, drag sort, drill), Author (drill with a `linkCondition`), Tag, Article (every field type, field
+code, views, link tree, every DataProxy hook, four row operations), Component (layout and JSON-valued
+components), a read-only Audit Log the hooks write, and Playground (custom buttons, cascading and fetched choices,
+dynamic / read-only fields, column statistics, operations that fold, hide themselves or call the server back).
+It reads `ERUPT_NODE_NAME`, `ERUPT_ACCESS_TOKEN`, `ERUPT_SERVER`, `PORT` and `ERUPT_DB`; `python3 ../conformance/showcase.py -- target/release/examples/showcase`
+checks it.
 
 ## Declaring models
 
@@ -50,9 +61,14 @@ node.serve("0.0.0.0", 9090)?;   // blocks; SIGINT / SIGTERM deregister and exit
   `reference(&model, title)` (+ `.tree(pid)` for a tree picker, `.label(field)`), or `Field::of(EditType, title)`.
   Flags: `.search()`, `.not_null()`, `.sortable()`, `.hide_table()`, `.hide_form()`.
 - Raw annotation attributes: `.edit(...)`, `.view(...)` on fields, `.raw(...)` on models and operations take
-  `json!` or the generated types in `erupt::types` (`Edit`, `View`, `Erupt`, `RowOperation`, …). They are
-  validated against the erupt annotation schema when `build()` runs: a misspelt key or enum value is a
-  `Error::Declaration`, not a silent no-op in the browser.
+  `json!` or the generated types in `erupt::types` (`Edit`, `View`, `Erupt`, `RowOperation`, …). The build
+  carries only what a model declares; the erupt server completes it with the annotation defaults and refuses an
+  unknown attribute or value, naming the model and the attribute. `build()` still fails with
+  `Error::Declaration` on what the node itself relies on: an unknown edit type, search operator or operation
+  mode, an `order_by` field, a power key, a `linkTree.field` that is no reference, a drill without
+  `linkErupt` / `joinColumn`.
+- `.power(json!({"delete": false}))` switches rights off for everyone; the erupt server enforces them along with
+  the user's own rights.
 - Operations: `Operation::new(code, title)` with `.mode(RowOperationMode::…)`, `.form(&model)` (a model without
   a primary key), `.no_confirm()` / `.confirm(text)`, `.show(|user| …)`, `.if_expr(js)`, `.handler(|op| …)`.
   A handler gets `op.rows`, `op.param`, `op.repo`, `op.user`; `Ok(Some(script))` is run as JavaScript in the
@@ -132,15 +148,17 @@ Dragging on a board, calendar or gantt view is saved by the erupt server through
 
 `.raw(json!({"tree": {"id": "id", "label": "name", "pid": "parent"}}))` shows the model as a tree, and
 `.raw(json!({"linkTree": {"field": "category"}}))` puts the tree of a reference field beside the table: the
-erupt server builds both trees from the node's table, and the node keeps the rows under the picked tree node
-(`"dependNode": true` shows none until one is picked). `linkTree.field` must be a reference field.
+erupt server builds both trees from the node's table and sends the picked tree keys as a condition on the
+reference field (`"dependNode": true` shows none until one is picked). `linkTree.field` must be a reference field.
 
 ## Field types and field code
 
 Besides the constructors above, `Field::of(EditType::…)` takes `Tags`, `AutoComplete`, `Attachment` (the erupt
 server stores the upload, the node keeps its path), `HtmlEditor`, `Markdown`, `CodeEditor` (all text) and
 `Button` (form only); `Field::multi_choice` is a `MULTI_CHOICE`, and `Field::checkbox` / `Field::tab_tree`
-take another model: the picked records, stored as the JSON list of their keys.
+take another model: the picked records, stored as the JSON list of their keys. A search on a JSON field
+(`MULTI_CHOICE`) for values (`EQ` / `IN`, `NEQ` / `NOT_IN`) keeps the records whose JSON holds every one of them
+(none of them).
 
 A field can run its own code; the erupt server calls it through the node's `invoke` endpoint with the form's
 values:
@@ -176,8 +194,9 @@ Model::new("Author", "Author")
     .raw(json!({"drills": [{"title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author"}}]}))
 ```
 
-opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
-`link.linkCondition` adds SQL as written. Both models must be on the node.
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default): the
+erupt server reads the author and sends that join as a condition. `link.linkCondition` adds SQL as written, applied
+by the node. Both models must be on the node.
 
 ## Server config and user info
 
@@ -223,7 +242,7 @@ let app = Router::new().fallback(move |method: Method, uri: Uri, headers: Header
 
 The built-in server (`Node::serve`) is HTTP/1.1 on std::net with a thread pool, one request per
 connection, 64 KiB header and 16 MiB body limits and 30 s timeouts. Calls back to the erupt server
-(registration, per-user power) are plain `http://`; put a TLS-terminating proxy in front of an https server.
+(registration, config, user info) are plain `http://`; put a TLS-terminating proxy in front of an https server.
 
 ## Without a registry
 
@@ -233,16 +252,16 @@ From the repository, without crates.io (Cargo finds the crate inside the reposit
 erupt-sdk = { git = "https://github.com/erupt-io/erupt-sdk", tag = "rust/v0.1.0", features = ["sqlite"] }
 ```
 
-Or copy `rust/` (`Cargo.toml`, `src/` and the two `.json` files, which are compiled in) into your workspace and
+Or copy `rust/` (`Cargo.toml` and `src/`) into your workspace and
 use `erupt-sdk = { path = "third_party/erupt-sdk", features = ["sqlite"] }`. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `VERSION` in `node.rs` untouched so the server shows which release the node runs.
 
 ## Generated code
 
-`src/types.rs` is generated from the erupt annotation JSON Schema; the schema and the field templates are
-bundled from `erupt-annotations.schema.json` and `erupt-node-defaults.json`.
+`src/types.rs` is generated from the erupt annotation JSON Schema (`../schema/erupt-annotations.schema.json`).
+The crate embeds no schema and no defaults: the server completes and checks every build.
 
 ```bash
-cargo run --bin gen-types -- ../schema          # sync schemas, regenerate src/types.rs
+cargo run --bin gen-types -- ../schema          # regenerate src/types.rs
 cargo run --bin gen-types -- ../schema --check  # CI: fail when stale
 ```
 

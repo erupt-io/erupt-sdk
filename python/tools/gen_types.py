@@ -1,4 +1,4 @@
-"""Sync the erupt schemas into the package and generate ``src/erupt/_types.py`` from them.
+"""Sync the erupt schemas into the repository and generate ``src/erupt/_types.py`` from them.
 
     python tools/gen_types.py <erupt repo>/schema          # copy schemas, regenerate types
     python tools/gen_types.py <erupt repo>/schema --check  # fail when anything is out of date (CI)
@@ -15,10 +15,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "src" / "erupt"
 
-# erupt schema file -> copies kept in sync (package resource first, repository copy second)
+# erupt schema file -> the repository copy kept in sync (the conformance suite reads it); the package embeds none,
+# the server completes and checks builds (PROTOCOL.md §12.3)
 SCHEMAS = {
-    "erupt-annotations.schema.json": [PACKAGE / "_schema.json", ROOT.parent / "schema" / "erupt-annotations.schema.json"],
-    "erupt-node-defaults.json": [PACKAGE / "_defaults.json", ROOT.parent / "schema" / "erupt-node-defaults.json"],
+    "erupt-annotations.schema.json": [ROOT.parent / "schema" / "erupt-annotations.schema.json"],
+    "erupt-node-defaults.json": [ROOT.parent / "schema" / "erupt-node-defaults.json"],
 }
 
 PRIMITIVES = {"string": "str", "integer": "int", "number": "float", "boolean": "bool"}
@@ -96,7 +97,7 @@ def main():
         text = path.read_text("utf-8")
         for target in targets:
             expected[target] = text
-    expected[PACKAGE / "_types.py"] = generate(json.loads(expected[PACKAGE / "_schema.json"]))
+    expected[PACKAGE / "_types.py"] = generate(json.loads(expected[ROOT.parent / "schema" / "erupt-annotations.schema.json"]))
     stale = [p for p, text in expected.items() if not p.is_file() or p.read_text("utf-8") != text]
     if args.check:
         for p in stale:

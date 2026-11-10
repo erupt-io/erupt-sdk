@@ -20,7 +20,6 @@ pub mod http;
 mod model;
 mod node;
 mod repo;
-pub mod schema;
 pub mod signature;
 mod sql;
 #[rustfmt::skip]
@@ -28,7 +27,7 @@ pub mod types;
 pub mod values;
 
 pub use model::{DataProxy, Field, Model, ModelBuilder, OpContext, Operation};
-pub use node::{current_user, Node, VERSION};
+pub use node::{current_user, Node, PROTOCOL_VERSION, VERSION};
 pub use repo::{Cond, Filter, MemoryRepository, Query, Repository};
 #[cfg(feature = "mysql")]
 pub use sql::MysqlExecutor;

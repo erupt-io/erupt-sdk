@@ -14,7 +14,7 @@ let package = Package(
         .systemLibrary(name: "CSQLite", providers: [.apt(["libsqlite3-dev"]), .brew(["sqlite"])]),
         .target(name: "EruptSQLite", dependencies: ["EruptSDK", "CSQLite"]),
         .executableTarget(name: "erupt-gen-types", dependencies: ["EruptSDK"], path: "Sources/GenTypes"),
-        .executableTarget(name: "Blog", dependencies: ["EruptSDK", "EruptSQLite"], path: "Examples/Blog"),
+        .executableTarget(name: "Showcase", dependencies: ["EruptSDK", "EruptSQLite"], path: "Examples/Showcase"),
         .executableTarget(name: "Conformance", dependencies: ["EruptSDK"], path: "Examples/Conformance"),
         .testTarget(name: "EruptSDKTests", dependencies: ["EruptSDK", "EruptSQLite"]),
     ]

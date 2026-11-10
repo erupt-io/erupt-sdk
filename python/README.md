@@ -209,15 +209,15 @@ From the repository, without PyPI:
 pip install "erupt-sdk @ git+https://github.com/erupt-io/erupt-sdk@python/v0.1.0#subdirectory=python"
 ```
 
-Or copy `python/src/erupt/` into your project as the package `erupt`; it has no dependencies, keep the two
-`.json` files next to the code. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `__version__` in `node.py` untouched so the server shows which release the node runs.
+Or copy `python/src/erupt/` into your project as the package `erupt`; it has no dependencies. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `__version__` in `node.py` untouched so the server shows which release the node runs.
 
 ## Generated code
 
 `src/erupt/_types.py` (TypedDicts and Literals for every annotation attribute: `Edit`, `View`, `Erupt`,
-`RowOperation`, `EditType`, …) is generated from the erupt annotation JSON Schema. Raw `view=` / `edit=` /
-`@erupt(...)` / `@operation(...)` attributes are checked against the same schema when a model is declared,
-so a misspelt key or enum value fails at import instead of silently doing nothing in the browser.
+`RowOperation`, `EditType`, …) is generated from the erupt annotation JSON Schema. A misspelt edit type or
+operation mode fails at import; the build carries only what a model declares, and the server completes it
+from the Java defaults and refuses an attribute that does not exist, naming the model and the attribute
+(node protocol v2, erupt-cloud/PROTOCOL.md §12).
 
 After an annotation change in erupt (regenerate there with `-Derupt.node-schema.write=true` /
 `-Derupt.node-defaults.write=true`):

@@ -2,6 +2,7 @@
 
 require_relative "test_helper"
 require "open3"
+require "timeout"
 require "tmpdir"
 
 module NodeFixture
@@ -171,18 +172,11 @@ class NodeTest < Minitest::Test
 
   TOKEN = "node-secret"
 
-  # what the stubbed erupt server answers to erupt-power
-  attr_reader :server
-
   def article_repo = Erupt::MemoryRepository.new
   def widget_repo = Erupt::MemoryRepository.new
 
   def setup
-    @remote = { "add" => true, "edit" => true, "delete" => true, "viewDetails" => true, "export" => true, "importable" => true }
-    test = self
-    @server = -> { @remote.dup }
     @node = Erupt::Node.new("blog", TOKEN, "http://server", logger: Quiet.new)
-    @node.define_singleton_method(:server_call) { |*, **| test.server.call }
     @node.register(Category, Erupt::MemoryRepository.new([{ name: "Tech", parent: nil }, { name: "Python", parent: 1 },
                                                           { name: "Life", parent: nil }]))
     @node.register(Article, article_repo)
@@ -198,15 +192,36 @@ class NodeTest < Minitest::Test
   end
 
   class Quiet
-    %i[debug info warn error].each { |level| define_method(level) { |_msg| nil } }
+    attr_reader :errors
+
+    def initialize = @errors = []
+    def error(msg) = @errors << msg
+    %i[debug info warn].each { |level| define_method(level) { |_msg| nil } }
   end
 
-  def call(method, path, body = nil, erupt: "Article", headers: {}, account: "admin")
-    raw = body.nil? ? "" : JSON.generate(body)
+  # What the server vouches for on each endpoint (PROTOCOL.md §12.2).
+  def self.enforced(method, path)
+    return "" if method == "GET" && path.start_with?("/erupt-api/build/")
+    return "power,query" if path.start_with?("/erupt-api/data/table/")
+    return "power,record" if path.start_with?("/erupt-api/data/modify/") && !path.end_with?("/delete")
+
+    "power"
+  end
+
+  # A call as a v2 server makes it: signed, vouching for what the endpoint needs.
+  def call(method, path, body = nil, erupt: "Article", headers: {}, account: "admin", enforced: nil, signed: true)
+    raw = body.nil? || body.is_a?(String) ? body.to_s : JSON.generate(body)
+    user = [JSON.generate("uid" => 1, "account" => account)].pack("m0")
+    target = path
     path, query = path.split("?", 2)
     env = { "REQUEST_METHOD" => method, "PATH_INFO" => path, "QUERY_STRING" => query.to_s, "rack.input" => StringIO.new(raw),
-            "HTTP_ACCESS_TOKEN" => TOKEN, "HTTP_TOKEN" => "t1",
-            "HTTP_USER" => [JSON.generate("uid" => 1, "account" => account)].pack("m0") }
+            "HTTP_TOKEN" => "t1", "HTTP_USER" => user }
+    if signed
+      enforced ||= NodeTest.enforced(method, path)
+      ts = Time.now.to_i
+      env.merge!("HTTP_ERUPT_TIMESTAMP" => ts.to_s, "HTTP_ERUPT_ENFORCED" => enforced,
+                 "HTTP_ERUPT_SIGNATURE" => Erupt::Signature.sign(TOKEN, method, target, ts, enforced, user, raw))
+    end
     env["HTTP_ERUPT"] = erupt if erupt
     env.merge!(headers).compact!
     status, response_headers, payload = @node.call(env)
@@ -238,8 +253,6 @@ class NodeTest < Minitest::Test
       _, r = call("POST", "/erupt-api/data/modify/Widget", row, erupt: "Widget")
       assert r["success"], r
     end
-    _, r = call("POST", "/erupt-api/data/modify/Widget", { name: "C", roles: ["ROOT"] }, erupt: "Widget")
-    refute r["success"]
     _, page = call("POST", "/erupt-api/data/table/Widget", { pageIndex: 1, pageSize: 10 }, erupt: "Widget")
     a = page["list"].find { |row| row["name"] == "A" }
     assert_equal [%w[ADMIN USER], { "env" => "prod" }], a.values_at("roles", "attrs")
@@ -259,88 +272,102 @@ class NodeTest < Minitest::Test
     assert_equal({ "id" => "NUMBER", "title" => "INPUT", "status" => "CHOICE", "views" => "NUMBER", "featured" => "BOOLEAN",
                    "publish_date" => "DATE", "review_at" => "DATE", "body" => "TEXTAREA", "category" => "REFERENCE_TABLE",
                    "topic" => "REFERENCE_TREE" }, fields.transform_values { |f| f["eruptFieldJson"]["edit"]["type"] })
-    assert_equal "Category", fields["category"]["fieldReturnName"]
-    assert_equal({ "dependField" => "", "id" => "id", "label" => "name" }, fields["category"]["eruptFieldJson"]["edit"]["referenceTableType"])
+    assert_equal({ "id" => "number", "title" => "String", "views" => "number", "featured" => "Boolean", "publish_date" => "Date",
+                   "review_at" => "Date", "category" => "Category" },
+                 fields.slice("id", "title", "views", "featured", "publish_date", "review_at", "category").transform_values { |f| f["fieldReturnName"] })
+    assert_equal({ "id" => "id", "label" => "name" }, fields["category"]["eruptFieldJson"]["edit"]["referenceTableType"])
     assert_equal "name", fields["category"]["eruptFieldJson"]["views"][0]["column"]
-    assert_equal "parent", fields["topic"]["eruptFieldJson"]["edit"]["referenceTreeType"]["pid"]
+    assert_equal({ "id" => "id", "label" => "name", "pid" => "parent" }, fields["topic"]["eruptFieldJson"]["edit"]["referenceTreeType"])
     ops = model["eruptJson"]["rowOperation"].to_h { |o| [o["code"], o] }
     assert_equal %w[publish feature], ops.keys # rebuild is hidden from admin
     assert_equal "PublishForm", ops["publish"]["eruptClass"]
     assert_equal ["void", "", "SINGLE"], ops["feature"].values_at("eruptClass", "callHint", "mode")
+    refute ops["publish"].key?("callHint")
     assert_equal ["publish"], build["operationErupts"].keys
     assert_equal ["note"], build["operationErupts"]["publish"]["eruptFieldModels"].map { |f| f["fieldName"] }
-    assert_equal "DATE_TIME", fields["review_at"]["eruptFieldJson"]["edit"]["dateType"]["type"]
-    assert_equal "DATE", fields["publish_date"]["eruptFieldJson"]["views"][0]["type"]
+    assert_equal({ "type" => "DATE_TIME" }, fields["review_at"]["eruptFieldJson"]["edit"]["dateType"])
+    assert_equal({ "type" => "DATE" }, fields["publish_date"]["eruptFieldJson"]["edit"]["dateType"])
     assert_equal [], fields["body"]["eruptFieldJson"]["views"]
     assert_equal %w[draft published], fields["status"]["componentValue"].map { |v| v["value"] }
-    assert fields["title"]["eruptFieldJson"]["edit"]["notNull"]
-    assert build["power"]["export"] # Excel is done by the server
-    assert build["power"]["cellEdit"] # the server edits the cell
+    assert_equal({ "print" => false, "ai" => false }, build["power"])
   end
 
-  def test_build_matches_schema
-    %w[Article Note Category Author].each do |name|
-      _, build = call("GET", "/erupt-api/build/#{name}", erupt: name, account: "root")
-      [build["eruptModel"], *(build["operationErupts"] || {}).values].each do |m|
-        Erupt::Schema.check("Erupt", m["eruptJson"], m["eruptName"], partial: false)
-        m["eruptJson"]["rowOperation"].each { |op| Erupt::Schema.check("RowOperation", op, op["code"], partial: false) }
-        m["eruptFieldModels"].each { |f| Erupt::Schema.check("EruptField", f["eruptFieldJson"], f["fieldName"], partial: false) }
-      end
-    end
+  def test_build_is_declared_only
+    _, build = call("GET", "/erupt-api/build/Article")
+    model = build["eruptModel"]
+    fields = model["eruptFieldModels"].to_h { |f| [f["fieldName"], f["eruptFieldJson"]] }
+    # what the server completes stays out (§12.3)
+    assert_equal({ "title" => "Title", "type" => "INPUT", "notNull" => true, "search" => { "value" => true } }, fields["title"]["edit"])
+    assert_equal [{ "title" => "Title", "sortable" => true }], fields["title"]["views"]
+    assert_equal({ "title" => "Body", "type" => "TEXTAREA" }, fields["body"]["edit"])
+    assert_equal [{ "title" => "Publish Date" }], fields["publish_date"]["views"], "the server resolves the view type"
+    assert_equal({ "edit" => { "title" => "", "type" => "NUMBER" } }, fields["id"])
+    assert_equal({ "primaryKeyCol" => "id", "rowOperation" => model["eruptJson"]["rowOperation"] }, model["eruptJson"])
+    assert_equal({ "code" => "publish", "title" => "Publish", "mode" => "MULTI", "tip" => "", "ifExpr" => "", "eruptClass" => "PublishForm" },
+                 model["eruptJson"]["rowOperation"][0])
   end
 
-  def test_power_is_declared_and_server
-    @remote["add"] = false
-    assert_equal 403, call("POST", "/erupt-api/data/modify/Article", { title: "x" }).first
+  def test_power_is_declared_for_the_server
     _, build = call("GET", "/erupt-api/build/Note", erupt: "Note")
-    refute build["power"]["delete"]
-    assert_equal 403, call("POST", "/erupt-api/data/modify/Note/delete", [1], erupt: "Note").first
+    assert_equal({ "delete" => false, "print" => false, "ai" => false }, build["power"])
+    # the server enforces it (§12.5): the node no longer checks a right
+    assert_equal 200, call("POST", "/erupt-api/data/modify/Note/delete", [1], erupt: "Note").first
+    error = assert_raises(ArgumentError) { Class.new { extend Erupt::Model; erupt "Bad", name: "Bad", power: { remove: false } } }
+    assert_includes error.message, "no right remove"
   end
 
-  def test_power_fails_closed
-    @server = -> { raise IOError, "server down" }
-    assert_equal 403, call("POST", "/erupt-api/data/modify/Article", { title: "x" }).first
+  def test_every_call_is_signed_and_vouched_for
+    assert_equal 403, call("GET", "/erupt-api/build/Article", signed: false, headers: { "HTTP_ACCESS_TOKEN" => TOKEN }).first
+    assert_equal 403, call("GET", "/erupt-api/build/Article", headers: { "HTTP_ERUPT_SIGNATURE" => "00" * 32 }).first
+    assert_equal 403, call("POST", "/erupt-api/data/table/Article", {}, enforced: "power").first
+    assert_equal 403, call("POST", "/erupt-api/data/modify/Article", { title: "x" }, enforced: "power,query").first
+    assert_equal 403, call("POST", "/erupt-api/data/modify/Article/update", { id: 1 }, enforced: "power").first
+    assert_equal 403, call("POST", "/erupt-api/data/modify/Article/delete", [1], enforced: "").first
+    assert_equal 403, call("GET", "/erupt-api/data/Article/1", enforced: "").first
+    assert_equal 403, call("POST", "/erupt-api/invoke/Article/operation/feature", { ids: [1] }, enforced: "query").first
+    assert_equal 200, call("GET", "/erupt-api/build/Article", enforced: "").first
   end
 
   def test_guards
     assert_equal 403, call("GET", "/erupt-api/build/Article", headers: { "HTTP_ORIGIN" => "http://evil" }).first
-    assert_equal 403, call("GET", "/erupt-api/build/Article", headers: { "HTTP_ACCESS_TOKEN" => "bad" }).first
-    assert_equal 403, call("GET", "/erupt-api/build/Article", headers: { "HTTP_ACCESS_TOKEN" => nil }).first
     assert_equal 404, call("GET", "/erupt-api/build/Missing", erupt: "Missing").first
     assert_equal 404, call("GET", "/erupt-api/build/Article", erupt: "Note").first
     assert_equal 404, call("GET", "/erupt-api/build/Article", headers: { "HTTP_ERUPTPARENT" => "blog.Note" }).first
     assert_equal 200, call("GET", "/erupt-api/build/Article", headers: { "HTTP_ERUPTPARENT" => "blog.Article" }).first
-    assert_equal [200, "blog"], call("GET", "/node-health", erupt: nil, headers: { "HTTP_ACCESS_TOKEN" => nil })
+    assert_equal 404, call("GET", "/erupt-api/nothing/here").first
+    assert_equal [200, "blog"], call("GET", "/node-health", erupt: nil, signed: false)
   end
 
   def test_signature
-    @remote["add"] = false
-    signed = lambda do |path, body: "", ts: Time.now.to_i, enforced: nil, signed_body: body|
-      user = "e30=" # base64 of {}
-      p, q = path.split("?", 2)
-      env = { "REQUEST_METHOD" => "GET", "PATH_INFO" => p, "QUERY_STRING" => q.to_s, "rack.input" => StringIO.new(body),
-              "HTTP_ERUPT" => "Note", "HTTP_USER" => user, "HTTP_ERUPT_TIMESTAMP" => ts.to_s, "HTTP_ERUPT_ENFORCED" => enforced,
-              "HTTP_ERUPT_SIGNATURE" => Erupt::Signature.sign(TOKEN, "GET", path, ts, enforced, user, signed_body) }.compact
-      status, _, payload = @node.call(env)
-      [status, status == 200 ? JSON.parse(payload.join)["power"]["add"] : nil]
+    ts = Time.now.to_i
+    assert_equal 200, call("GET", "/erupt-api/build/Note?_probe=1", erupt: "Note").first
+    assert_equal 403, call("GET", "/erupt-api/build/Note", erupt: "Note", headers: { "HTTP_ERUPT_TIMESTAMP" => (ts - 301).to_s }).first
+    assert_equal 403, call("GET", "/erupt-api/build/Note", erupt: "Note", headers: { "HTTP_ERUPT_ENFORCED" => "power" }).first
+    # the body altered after signing
+    assert_equal 403, call("POST", "/erupt-api/data/table/Note", {}, erupt: "Note", headers: { "rack.input" => StringIO.new("[]") }).first
+  end
+
+  def test_registration_needs_a_v2_server
+    answers = ['{"protocolVersion": 2}', ""]
+    sent = []
+    @node.define_singleton_method(:server_call) do |_method, _path, json: nil, **|
+      sent << json
+      answers[sent.size - 1]
     end
-    # Erupt-Enforced: power skips the erupt-power callback (which denies add here)
-    assert_equal [200, true], signed.call("/erupt-api/build/Note?_probe=1", enforced: "power")
-    assert_equal [200, false], signed.call("/erupt-api/build/Note", enforced: "record")
-    assert_equal [403, nil], signed.call("/erupt-api/build/Note", enforced: "power", ts: Time.now.to_i - 301)
-    assert_equal [403, nil], signed.call("/erupt-api/build/Note", enforced: "power", body: "{}", signed_body: "")
-    # an unsigned Erupt-Enforced is ignored
-    _, build = call("GET", "/erupt-api/build/Note", erupt: "Note", headers: { "HTTP_ERUPT_ENFORCED" => "power" })
-    refute build["power"]["add"]
-    # require_signature refuses the plain access token
-    strict = Erupt::Node.new("blog", TOKEN, "http://server", require_signature: true)
-    assert_equal 403, strict.call({ "REQUEST_METHOD" => "GET", "PATH_INFO" => "/erupt-api/build/X", "HTTP_ACCESS_TOKEN" => TOKEN }).first
+    @node.define_singleton_method(:sleep) { |_s| nil }
+    log = @node.instance_variable_get(:@log)
+    # the second answer names no protocol: an older server, so the heartbeat stops for good
+    Timeout.timeout(5) { @node.send(:heartbeat_loop) }
+    assert_equal [2, 2], sent.map { |info| info["protocolVersion"] }
+    assert_equal 1, log.errors.size
+    assert_includes log.errors.first, "does not speak node protocol v2"
+    assert_includes log.errors.first, "registration stopped"
   end
 
   def test_crud
     add(title: "Hello erupt", status: "published", views: 10, featured: true, publish_date: "2026-01-05",
         review_at: "2026-01-05 10:30:00", body: "...")
-    add(title: "Second", status: "draft", views: "3", featured: false, publish_date: "2026-03-01")
+    add(title: "Second", status: "draft", views: 3, featured: false, publish_date: "2026-03-01")
     page = table
     assert_equal [2, 1], page.values_at("total", "totalPage")
     first = page["list"].find { |r| r["title"] == "Hello erupt" }
@@ -351,10 +378,14 @@ class NodeTest < Minitest::Test
     assert_equal ["Hello erupt"], titles(table([{ key: "featured", expression: "EQ", value: true }]))
     assert_equal ["Second"], titles(table([{ key: "publish_date", expression: "RANGE", value: %w[2026-02-01 2026-12-31] }]))
     assert_equal ["Second", "Hello erupt"], titles(table(sort: [{ field: "views", direction: "ASC" }]))
+    assert_equal ["Second"], titles(table([{ key: "views", expression: "LT", value: 5 }]))
+    assert_equal ["Hello erupt"], titles(table([{ key: "review_at", expression: "RANGE", value: ["2026-01-05 10:00:00", "2026-01-05 11:00:00"] }]))
 
     pk = first["id"]
     _, row = call("GET", "/erupt-api/data/Article/#{pk}")
     assert_equal "Hello erupt", row["title"]
+    # the server sends the stored row patched and normalized: a date time without its fraction (§12.4)
+    row["review_at"] = row["review_at"].tr("T", " ")[0, 19]
     _, r = call("POST", "/erupt-api/data/modify/Article/update", row.merge("title" => "Renamed"))
     assert r["success"], r
     assert_equal "Renamed", call("GET", "/erupt-api/data/Article/#{pk}").last["title"]
@@ -381,10 +412,22 @@ class NodeTest < Minitest::Test
   end
 
   def test_link_tree
-    titles = ->(body) { call("POST", "/erupt-api/data/table/Doc", body, erupt: "Doc")[1]["list"].map { |r| r["title"] } }
-    assert_equal [], titles.({}), "dependNode: nothing until a tree node is picked"
-    assert_equal ["b"], titles.({ "linkTreeVal" => [2] })
-    assert_equal %w[a b], titles.({ "linkTreeVal" => %w[1 2] })
+    # the server turns the picked tree keys into a condition (§12.4); the node checks the field where it is declared
+    titles = ->(*condition) { call("POST", "/erupt-api/data/table/Doc", { condition: condition }, erupt: "Doc")[1]["list"].map { |r| r["title"] } }
+    assert_equal %w[a b c], titles.call
+    assert_equal [], titles.({ key: "id", expression: "NULL" }), "dependNode: nothing until a tree node is picked"
+    assert_equal ["b"], titles.({ key: "topic", expression: "IN", value: [2] })
+    assert_equal %w[a b], titles.({ key: "topic", expression: "IN", value: [1, 2] })
+    error = assert_raises(ArgumentError) do
+      cls = Class.new do
+        extend Erupt::Model
+        erupt "Bad", name: "Bad", linkTree: { field: "title" }
+        field :id, pk: true
+        field :title, "T"
+      end
+      @node.register(cls, Erupt::MemoryRepository.new)
+    end
+    assert_includes error.message, "must be a reference field"
   end
 
   def test_field_types_and_invoke
@@ -407,8 +450,8 @@ class NodeTest < Minitest::Test
     assert_equal 404, invoke.("button", "qty")[0], "a field without that code"
     assert_equal 404, invoke.("options", "missing")[0]
 
-    # picked records arrive as [{id: key}] and are stored as their keys
-    _, r = call("POST", "/erupt-api/data/modify/Order", { cats: [{ id: 1 }, { id: "2" }], sections: [{ id: 3 }], tags: '["red"]' }, erupt: "Order")
+    # picked records arrive as their keys, unwrapped by the server (§12.4)
+    _, r = call("POST", "/erupt-api/data/modify/Order", { cats: [1, 2], sections: [3], tags: "red" }, erupt: "Order")
     assert r["success"], r
     row = call("POST", "/erupt-api/data/table/Order", {}, erupt: "Order")[1]["list"][0]
     assert_equal [[1, 2], [3]], row.values_at("cats", "sections")
@@ -416,14 +459,20 @@ class NodeTest < Minitest::Test
   end
 
   def test_drill
-    drill = { "HTTP_DRILL" => "Books", "HTTP_DRILLSOURCEERUPT" => "Author", "HTTP_DRILLVALUE" => "1" }
-    _, page = call("POST", "/erupt-api/data/table/Book", {}, erupt: "Book", headers: drill)
+    # the server sends the join as a condition and names the drill in the body (§12.4)
+    body = { condition: [{ key: "author", expression: "EQ", value: 1 }], drill: { erupt: "Author", code: "Books" } }
+    _, page = call("POST", "/erupt-api/data/table/Book", body, erupt: "Book")
     assert_equal %w[a c], page["list"].map { |r| r["title"] }
-    assert_equal 403, call("POST", "/erupt-api/data/table/Book", {}, erupt: "Book", headers: drill.merge("HTTP_DRILL" => "x")).first
+    assert_equal 403, call("POST", "/erupt-api/data/table/Book", body.merge(drill: { erupt: "Author", code: "x" }), erupt: "Book").first
+    assert_equal 403, call("POST", "/erupt-api/data/table/Book", body.merge(drill: { erupt: "Nobody", code: "Books" }), erupt: "Book").first
+    assert_equal 403, call("POST", "/erupt-api/data/table/Category", { drill: { erupt: "Author", code: "Books" } }, erupt: "Category").first
+    # the drill headers of v1 mean nothing now
+    _, page = call("POST", "/erupt-api/data/table/Book", {}, erupt: "Book", headers: { "HTTP_DRILL" => "Books", "HTTP_DRILLSOURCEERUPT" => "Author", "HTTP_DRILLVALUE" => "1" })
+    assert_equal 3, page["total"]
+    # the link goes to the server whole: it reads the source row and joins
     _, build = call("GET", "/erupt-api/build/Author", erupt: "Author")
-    drills = build["eruptModel"]["eruptJson"]["drills"]
-    assert_equal [%w[Books Books Book]], drills.map { |d| [d["code"], d["title"], d["link"]["linkErupt"]] }
-    refute drills.first["link"].key?("joinColumn")
+    assert_equal [{ "code" => "Books", "title" => "Books", "link" => { "linkErupt" => "Book", "joinColumn" => "author.id" } }],
+                 build["eruptModel"]["eruptJson"]["drills"]
   end
 
   def test_simple_types_and_depend_column
@@ -431,7 +480,7 @@ class NodeTest < Minitest::Test
     edit = build["eruptModel"]["eruptFieldModels"].to_h { |f| [f["fieldName"], f["eruptFieldJson"]["edit"]] }
     assert_equal %w[COLOR RATE HIDDEN TRANSFER], edit.values_at("colour", "stars", "secret", "readers").map { |e| e["type"] }
     assert_equal "parent", edit["shelf"]["referenceTableType"]["dependColumn"], "the server reads it off the build"
-    assert call("POST", "/erupt-api/data/modify/Book", { title: "d", stars: "4", readers: [{ id: 2 }] }, erupt: "Book").last["success"]
+    assert call("POST", "/erupt-api/data/modify/Book", { title: "d", stars: 4, readers: [2] }, erupt: "Book").last["success"]
     row = call("POST", "/erupt-api/data/table/Book", {}, erupt: "Book").last["list"].last
     assert_equal [4, [2]], row.values_at("stars", "readers")
   end
@@ -448,21 +497,13 @@ class NodeTest < Minitest::Test
                  seen.map(&:first)
   end
 
-  def test_trusted_query
-    # under a signed query, the server's own condition may name any stored field; an operator is still checked
-    signed = lambda do |condition|
-      body, user, ts = JSON.generate(condition: condition), "e30=", Time.now.to_i
-      path = "/erupt-api/data/table/Article"
-      env = { "REQUEST_METHOD" => "POST", "PATH_INFO" => path, "rack.input" => StringIO.new(body), "HTTP_ERUPT" => "Article",
-              "HTTP_USER" => user, "HTTP_ERUPT_TIMESTAMP" => ts.to_s, "HTTP_ERUPT_ENFORCED" => "power,query",
-              "HTTP_ERUPT_SIGNATURE" => Erupt::Signature.sign(TOKEN, "POST", path, ts, "power,query", user, body) }
-      JSON.parse(@node.call(env).last.join)
-    end
+  def test_server_conditions_on_any_stored_field
+    # the server's own conditions may name any stored field, the primary key included (§12.4)
     add(title: "A", views: 1)
     add(title: "B", views: 2)
-    assert_equal ["A"], titles(signed.call([{ key: "views", expression: "EQ", value: 1 }]))
-    refute signed.call([{ key: "views", expression: "DROP", value: 1 }])["success"]
-    refute call("POST", "/erupt-api/data/table/Article", { condition: [{ key: "views", expression: "EQ", value: 1 }] }).last["success"]
+    assert_equal ["A"], titles(table([{ key: "views", expression: "EQ", value: 1 }]))
+    assert_equal 0, table([{ key: "id", expression: "NULL" }])["total"]
+    assert_equal ["B"], titles(table([{ key: "id", expression: "IN", value: [2] }]))
   end
 
   def test_before_fetch_needs_sql
@@ -474,16 +515,14 @@ class NodeTest < Minitest::Test
     # the picker is the server's: it reads the referenced model's own table
     assert_equal 404, call("POST", "/erupt-api/data/Article/reference-table/category", {}).first
 
-    add(title: "Ref", category: { id: "2", name: "Python" }, topic: { id: 1, name: "Tech" })
+    add(title: "Ref", category: 2, topic: 1)
     row = table["list"].first
     # a reference travels as its key; the server resolves labels and flattened columns
     assert_equal [2, 1], row.values_at("category", "topic")
     refute row.key?("category_name")
     assert_equal 2, call("GET", "/erupt-api/data/Article/#{row["id"]}").last["category"]
-    assert_equal 1, table([{ key: "category", expression: "EQ", value: { id: 2, name: "Python" } }])["total"]
-    assert_equal 0, table([{ key: "category", expression: "IN", value: [{ id: 1 }, { id: 3 }] }])["total"]
-    _, r = call("POST", "/erupt-api/data/table/Article", { condition: [{ key: "category", expression: "LIKE", value: "x" }] })
-    refute r["success"]
+    assert_equal 1, table([{ key: "category", expression: "EQ", value: 2 }])["total"]
+    assert_equal 0, table([{ key: "category", expression: "IN", value: [1, 3] }])["total"]
   end
 
   def test_reference_tree_is_the_servers
@@ -495,7 +534,6 @@ class NodeTest < Minitest::Test
     add(title: "B")
     ids = table["list"].map { |r| r["id"] }
     path = "/erupt-api/invoke/Article/operation/"
-    refute call("POST", "#{path}publish", { ids: ids, param: {} }).last["success"] # the form's required note is missing
     _, r = call("POST", "#{path}publish", { ids: ids, param: { note: "go" } })
     assert_equal "Executed successfully", r["message"]
     assert_equal [[:publish, ids.sort, { "note" => "go" }]], CALLS
@@ -521,19 +559,26 @@ class NodeTest < Minitest::Test
   end
 
   def test_rejects_illegal_input
-    _, r = call("POST", "/erupt-api/data/modify/Article", { status: "draft" })
-    refute r["success"]
-    assert_includes r["message"], "Title"
-    [{ title: "x", status: "deleted" }, { title: "x", views: "many" }, { title: "x", publish_date: "2026-02-30" }].each do |row|
-      refute call("POST", "/erupt-api/data/modify/Article", row).last["success"], row
-    end
-    [{ condition: [{ key: "views", expression: "EQ", value: 1 }] }, { condition: [{ key: "title\" OR 1=1 --", value: 1 }] },
-     { sort: [{ field: "body", direction: "ASC" }] }, { condition: [{ key: "title", expression: "DROP", value: 1 }] },
-     { condition: ["title"] }].each do |body|
+    # what the node checks whoever calls it: names it puts into a query, the shape of a body, its keys (§12.6)
+    [{ condition: [{ key: "title\" OR 1=1 --", expression: "EQ", value: 1 }] }, { sort: [{ field: "title\" --", direction: "ASC" }] },
+     { sort: [{ field: "nothing", direction: "ASC" }] }, { condition: ["title"] },
+     { condition: [{ key: "title", expression: "DROP", value: 1 }] }, { condition: [{ key: "title", value: "x" }] }].each do |body|
       refute call("POST", "/erupt-api/data/table/Article", body).last["success"], body
     end
+    refute call("POST", "/erupt-api/data/modify/Article", "{not json").last["success"]
     refute call("POST", "/erupt-api/data/modify/Article/delete", { id: 1 }).last["success"]
     refute call("GET", "/erupt-api/data/Article/abc").last["success"]
+    refute call("POST", "/erupt-api/invoke/Article/operation/feature", { ids: ["x"] }).last["success"]
+  end
+
+  def test_page_size_cap
+    assert_equal Erupt::Node::MAX_PAGE_SIZE, table(size: 100_000)["pageSize"]
+  end
+
+  def test_sort_by_reference_label_orders_by_key
+    add(title: "a", category: 3)
+    add(title: "b", category: 1)
+    assert_equal %w[b a], titles(table(sort: [{ field: "category.name", direction: "ASC" }]))
   end
 
   def test_internal_errors_hide_the_stack
@@ -591,20 +636,17 @@ class DeclarationTest < Minitest::Test
     end
   end
 
-  def test_rejects_unknown_annotation_values
+  def test_rejects_unknown_values_where_declared
+    # a misspelt enum value fails here; an unknown attribute fails in the server's build check (§12.3)
     {
-      -> { declare { field :title, "T", edit: { inputTyp: { length: 9 } } } } => "Edit has no attribute 'inputTyp'",
-      -> { declare { field :title, "T", view: { sortable: "yes" } } } => "expected boolean",
-      -> { declare { field :title, "T", type: "INPUTT" } } => "is not a EditType",
-      -> { declare { field :title, "T", edit: { search: { operator: "ABOUT" } } } } => "is not a QueryExpression",
+      -> { declare { field :title, "T", type: "INPUTT" } } => "'INPUTT' is not a EditType",
       -> { declare { field :title, "T", Object } } => "cannot infer an edit type",
-      -> { declare(orderBy: "id") } => "Erupt has no attribute 'orderBy'",
-      -> { declare(layout: { pageSize: "10" }) } => "expected integer",
       -> { declare { field :id, pk: true } } => "declared twice",
       -> { declare { field :title, "T", click: ->(_form) {} } } => "click belong to",
-      -> { declare { operation(:go, "Go", mode: "ALL") { nil } } } => "is not a RowOperationMode",
-      -> { declare { operation(:go, "Go", colour: "red") { nil } } } => "RowOperation has no attribute 'colour'",
+      -> { declare { operation(:go, "Go", mode: "ALL") { nil } } } => "'ALL' is not a RowOperationMode",
       -> { declare { operation(:go, "Go", form: String) { nil } } } => "form must be a model class",
+      -> { declare(power: { remove: false }) } => "no right remove",
+      -> { declare(drills: [{ title: "D", link: { linkErupt: "X" } }]) } => "needs link.linkErupt and link.joinColumn",
       -> { Erupt::Node.new("n", "t", "http://s").register(declare(order_by: "missing desc"), Erupt::MemoryRepository.new) } => "illegal order_by"
     }.each do |declaration, message|
       error = assert_raises(ArgumentError) { declaration.call }
@@ -613,10 +655,12 @@ class DeclarationTest < Minitest::Test
   end
 
   def test_raw_attributes_pass_through
-    cls = declare(layout: { pageSize: 30 }) { field :title, "T", edit: { inputType: { length: 9 } } }
+    # unknown to this SDK, the server's to refuse
+    cls = declare(layout: { pageSize: 30 }, orderBy: "x") { field :title, "T", edit: { inputType: { length: 9 } } }
     model = cls.erupt_model.build_erupt
     assert_equal 30, model["eruptJson"]["layout"]["pageSize"]
     assert_equal 9, model["eruptFieldModels"][1]["eruptFieldJson"]["edit"]["inputType"]["length"]
+    assert_equal "x", model["eruptJson"]["orderBy"]
   end
 
   def test_coerce

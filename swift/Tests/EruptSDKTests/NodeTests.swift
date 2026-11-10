@@ -91,7 +91,7 @@ func authorAndBook() throws -> (Model, Model) {
     return (author, book)
 }
 
-/// A node whose server is unreachable: every call is signed with power enforced, so it never asks it.
+/// A node whose server is unreachable: every call is signed, so it never needs it.
 func node() throws -> Node {
     let (category, article) = try articleModel()
     let node = try Node(name: "test", accessToken: token, servers: ["http://127.0.0.1:9"], log: { _, _ in })
@@ -100,17 +100,30 @@ func node() throws -> Node {
     return node
 }
 
+/// What a v2 node requires in Erupt-Enforced for an endpoint (PROTOCOL.md §12.2).
+func requiredEnforced(_ method: String, _ target: String) -> String {
+    let path = target.split(separator: "?").first.map(String.init) ?? target
+    if method == "GET", path.hasPrefix("/erupt-api/build/") { return "" }
+    if path.hasPrefix("/erupt-api/data/table/") { return "power,query" }
+    if path.hasPrefix("/erupt-api/data/modify/"), !path.hasSuffix("/delete") { return "power,record" }
+    return "power"
+}
+
+/// A call as the server sends it: signed with the Erupt-Enforced its endpoint needs, unless `enforced` says
+/// otherwise; `signed: false` sends the plain Access-Token, which a v2 node refuses.
 func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Article", body: JSON? = nil,
-          signed: Bool = true, account: String = "admin", headers extra: [String: String] = [:]) -> (Int, JSON?) {
+          signed: Bool = true, enforced: String? = nil, account: String = "admin", headers extra: [String: String] = [:]) -> (Int, JSON?) {
     let raw = body.map { Array($0.serialized().utf8) } ?? []
     let user = Data("{\"account\":\"\(account)\"}".utf8).base64EncodedString()
     var headers = ["erupt": erupt, "user": user, "token": "t"]
     if signed {
         let now = Int64(Date().timeIntervalSince1970)
+        let enforced = enforced ?? requiredEnforced(method, target)
         headers["Erupt-Timestamp"] = String(now)
-        headers["Erupt-Enforced"] = "power"
+        if !enforced.isEmpty { headers["Erupt-Enforced"] = enforced }
         headers["Erupt-Signature"] = Signature.sign(
-            accessToken: token, method: method, pathAndQuery: target, timestamp: now, enforced: "power", user: user, body: raw)
+            accessToken: token, method: method, pathAndQuery: target, timestamp: now, enforced: enforced.isEmpty ? nil : enforced,
+            user: user, body: raw)
     } else {
         headers["Access-Token"] = token
     }
@@ -128,47 +141,129 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
     @Test func guards() throws {
         let n = try node()
         #expect(n.handle(NodeRequest(method: "GET", target: "/erupt-api/build/Article", headers: ["erupt": "Article"])).status == 403)
-        let wrong = ["erupt": "Article", "Access-Token": "nope"]
-        #expect(n.handle(NodeRequest(method: "GET", target: "/erupt-api/build/Article", headers: wrong)).status == 403)
+        #expect(call(n, "GET", "/erupt-api/build/Article", signed: false).0 == 403, "a plain Access-Token is not enough")
+        #expect(call(n, "GET", "/erupt-api/build/Article", headers: ["Origin": "http://evil"]).0 == 403)
         #expect(call(n, "GET", "/erupt-api/build/Article", erupt: "Category").0 == 404)
         #expect(call(n, "GET", "/erupt-api/nothing").0 == 404)
+        #expect(call(n, "GET", "/erupt-api/build/Article").0 == 200, "a build needs nothing in Erupt-Enforced")
     }
 
-    @Test func buildMatchesTheSchema() throws {
+    @Test func requiresEnforced() throws {
+        let n = try node()
+        // each endpoint refuses a call whose Erupt-Enforced lacks what it needs (§12.2)
+        #expect(call(n, "POST", "/erupt-api/data/table/Article", body: [:], enforced: "power").0 == 403)
+        #expect(call(n, "POST", "/erupt-api/data/table/Article", body: [:], enforced: "query").0 == 403)
+        #expect(call(n, "POST", "/erupt-api/data/modify/Article", body: ["title": "x"], enforced: "power").0 == 403)
+        #expect(call(n, "POST", "/erupt-api/data/modify/Article/update", body: ["id": 1], enforced: "power,query").0 == 403)
+        #expect(call(n, "POST", "/erupt-api/data/modify/Article/delete", body: [1], enforced: "").0 == 403)
+        #expect(call(n, "GET", "/erupt-api/data/Article/1", enforced: "").0 == 403)
+        #expect(call(n, "GET", "/erupt-api/data/init-value/Article", enforced: "").0 == 403)
+        #expect(call(n, "POST", "/erupt-api/invoke/Article/operation/hello", body: [:], enforced: "").0 == 403)
+        #expect(call(n, "POST", "/erupt-api/data/table/Article", body: [:], enforced: "record,query,power").0 == 200)
+    }
+
+    @Test func buildIsDeclaredOnly() throws {
         let (status, build) = call(try node(), "GET", "/erupt-api/build/Article")
         #expect(status == 200)
         let model = try #require(build?["eruptModel"])
-        try Schema.check("Erupt", model["eruptJson"]!, partial: false)
         let fields = model["eruptFieldModels"]!.array!
         #expect(fields.map { $0["fieldName"]!.text } == ["id", "title", "status", "views", "publish_date", "category", "tags", "divider"])
-        for f in fields { try Schema.check("EruptField", f["eruptFieldJson"]!, partial: false) }
-        #expect(fields[6]["eruptFieldJson"]!["edit"]!["type"] == "MULTI_CHOICE")
-        #expect(build?["power"]?["cellEdit"] == true) // the server edits the cell
+        let byName = Dictionary(uniqueKeysWithValues: fields.map { ($0["fieldName"]!.text, $0) })
+        #expect(byName["id"] == [
+            "fieldName": "id", "fieldReturnName": "number", "componentValue": nil,
+            "eruptFieldJson": ["edit": ["title": "", "type": "NUMBER"]],
+        ])
+        #expect(byName["title"]?["eruptFieldJson"] == [
+            "edit": ["title": "Title", "type": "INPUT", "notNull": true, "search": ["value": true]],
+            "views": [["title": "Title", "sortable": true]],
+        ])
+        #expect(byName["views"]?["fieldReturnName"] == "number")
+        #expect(byName["views"]?["eruptFieldJson"] == ["edit": ["title": "Views", "type": "NUMBER"], "views": [["title": "Views", "sortable": true]]])
+        #expect(byName["publish_date"]?["fieldReturnName"] == "Date")
+        #expect(byName["publish_date"]?["eruptFieldJson"]?["edit"] == [
+            "title": "Publish Date", "type": "DATE", "dateType": ["type": "DATE"], "search": ["value": true],
+        ])
+        #expect(byName["category"]?["fieldReturnName"] == "Category")
+        #expect(byName["category"]?["eruptFieldJson"] == [
+            "edit": ["title": "Category", "type": "REFERENCE_TABLE", "search": ["value": true], "referenceTableType": ["id": "id", "label": "name"]],
+            "views": [["title": "Category", "column": "name"]],
+        ])
+        #expect(byName["status"]?["componentValue"]?.array?.count == 2)
+        #expect(byName["tags"]?["eruptFieldJson"]?["edit"]?["type"] == "MULTI_CHOICE")
+        #expect(byName["divider"]?["eruptFieldJson"]?["edit"]?["type"] == "DIVIDE")
+        #expect(model["eruptJson"] == [
+            "primaryKeyCol": "id",
+            "rowOperation": [
+                ["code": "hello", "title": "Hello", "mode": "BUTTON", "tip": "", "ifExpr": "", "eruptClass": "void"],
+                ["code": "note", "title": "Note", "mode": "BUTTON", "tip": "", "ifExpr": "", "eruptClass": "NoteForm"],
+            ],
+        ])
+        // the rights switched off: none declared, and the features this SDK does not serve
+        #expect(build?["power"] == ["print": false, "ai": false])
+        #expect(build?["operationErupts"]?["note"]?["eruptName"] == "NoteForm")
+    }
+
+    @Test func dateTimeBuildAndStorage() throws {
+        let n = try node()
+        let event = try Model("Event", power: ["delete": false]) {
+            Field("id", pk: true)
+            Field("at", "At", .dateTime, search: true, form: false)
+            Field("hidden", "Hidden", table: false)
+        }
+        try n.register(event, MemoryRepository([["at": "2026-01-05 10:30:00"], ["at": "2026-01-06 08:00:00"]]))
+        let build = call(n, "GET", "/erupt-api/build/Event", erupt: "Event").1
+        #expect(build?["power"] == ["delete": false, "print": false, "ai": false])
+        let fields = build?["eruptModel"]?["eruptFieldModels"]?.array ?? []
+        #expect(fields[1]["fieldReturnName"] == "Date")
+        #expect(fields[1]["eruptFieldJson"]?["edit"] == [
+            "title": "At", "type": "DATE", "dateType": ["type": "DATE_TIME"], "show": false, "search": ["value": true],
+        ])
+        #expect(fields[2]["eruptFieldJson"]?["views"] == [])
+        // the server's `yyyy-MM-dd HH:mm:ss` is compared in the stored form
+        let page = call(n, "POST", "/erupt-api/data/table/Event", erupt: "Event", body: [
+            "condition": [["key": "at", "expression": "RANGE", "value": ["2026-01-05 10:00:00", "2026-01-05 11:00:00"]]],
+        ]).1
+        #expect(page?["list"]?.array?.map { $0["at"]! } == ["2026-01-05T10:30:00.000"])
     }
 
     @Test func crudAndSearch() throws {
         let n = try node()
         let add: (JSON) -> JSON? = { call(n, "POST", "/erupt-api/data/modify/Article", body: $0).1 }
-        #expect(add(["title": "A", "status": "draft", "views": "3", "publish_date": "2026-01-05", "category": ["id": "2"], "tags": ["a"]])?["success"] == true)
+        #expect(add(["title": "A", "status": "draft", "views": 3, "publish_date": "2026-01-05", "category": 2, "tags": ["a"]])?["success"] == true)
         #expect(add(["title": "B", "status": "published", "views": 10, "tags": ["a", "b"]])?["success"] == true)
-        #expect(add(["status": "draft"])?["message"] == "Title cannot be empty")
-        #expect(add(["title": "C", "status": "gone"])?["success"] == false)
-        #expect(add(["title": "C", "tags": ["z"]])?["success"] == false)
+        // the server checked the record: the node no longer validates it
+        #expect(add(["status": "draft"])?["success"] == true)
+        #expect(add(["title": "C", "views": "many"])?["success"] == false, "a value that is not its storage type")
 
         let table: (JSON) -> JSON = { call(n, "POST", "/erupt-api/data/table/Article", body: $0).1! }
+        #expect(table([:])["total"] == 3)
+        let last = table([:])["list"]![0]!["id"]!
+        #expect(call(n, "POST", "/erupt-api/data/modify/Article/delete", body: [last]).1?["success"] == true)
         let all = table([:])
         #expect(all["list"]!.array!.map { $0["title"]!.text } == ["B", "A"])
         #expect(all["list"]![1]!["category"] == 2)
         #expect(all["list"]![1]!["views"] == 3)
         #expect(table(["condition": [["key": "tags", "expression": "IN", "value": ["b"]]]])["total"] == 1)
         #expect(table(["condition": [["key": "title", "expression": "LIKE", "value": "a"]]])["total"] == 1)
-        #expect(table(["condition": [["key": "category", "expression": "EQ", "value": ["id": 2]]]])["total"] == 1)
+        #expect(table(["condition": [["key": "category", "expression": "EQ", "value": 2]]])["total"] == 1)
+        #expect(table(["condition": [["key": "views", "expression": "GT", "value": 5]]])["total"] == 1, "any stored field")
+        #expect(table(["condition": [["key": "id", "expression": "NULL"]]])["total"] == 0, "the primary key too")
+        #expect(table(["condition": [["key": "nope", "expression": "EQ", "value": 1]]])["success"] == false)
+        // an unknown or missing operator fails rather than being left out of the query
+        #expect(table(["condition": [["key": "title", "expression": "DROP", "value": "A"]]])["success"] == false)
+        #expect(table(["condition": [["key": "title", "value": "A"]]])["success"] == false)
         #expect(table(["sort": [["field": "views", "direction": "ASC"]]])["list"]![0]!["title"] == "A")
-        #expect(table(["sort": [["field": "status", "direction": "ASC"]]])["success"] == false)
+        #expect(table(["sort": [["field": "status", "direction": "DESC"]]])["list"]![0]!["title"] == "B", "any stored field")
+        #expect(table(["sort": [["field": "category.name", "direction": "ASC"]]])["list"]![0]!["title"] == "A")
+        #expect(table(["sort": [["field": "title\" --", "direction": "ASC"]]])["success"] == false)
 
         let pk = all["list"]![0]!["id"]!
         #expect(call(n, "GET", "/erupt-api/data/Article/\(pk.text)").1?["title"] == "B")
+        #expect(call(n, "GET", "/erupt-api/data/Article/abc").1?["success"] == false)
+        #expect(call(n, "POST", "/erupt-api/data/modify/Article/update", body: ["id": pk, "title": "B2", "views": 11]).1?["success"] == true)
+        #expect(call(n, "GET", "/erupt-api/data/Article/\(pk.text)").1?["title"] == "B2")
         #expect(call(n, "POST", "/erupt-api/data/modify/Article/delete", body: [pk]).1?["success"] == true)
+        #expect(call(n, "POST", "/erupt-api/data/modify/Article/delete", body: ["id": 1]).1?["success"] == false)
         #expect(table([:])["total"] == 1)
         let op = "/erupt-api/invoke/Article/operation/", form = "/erupt-api/invoke/Article/operation-form/"
         #expect(call(n, "POST", op + "hello", body: ["ids": [], "param": [:]]).1?["data"] == "alert('hi')")
@@ -182,6 +277,12 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(call(n, "POST", "/erupt-api/data/Article/operator/hello", body: [:]).0 == 404)
         #expect(call(n, "POST", "/erupt-api/data/Article/operator/note/form-value", body: [:]).0 == 404)
         #expect(call(n, "POST", "/erupt-api/data/Article/reference-table/category", body: [:]).0 == 404)
+    }
+
+    @Test func pageSizeCap() throws {
+        let n = try node()
+        let page = call(n, "POST", "/erupt-api/data/table/Article", body: ["pageIndex": 1, "pageSize": 100_000]).1
+        #expect(page?["pageSize"] == .int(Int64(Node.maxPageSize)))
     }
 
     @Test func dataProxy() throws {
@@ -243,9 +344,12 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         let titles: (JSON) -> [String]? = { body in
             call(n, "POST", "/erupt-api/data/table/Doc", erupt: "Doc", body: body).1?["list"]?.array?.map { $0["title"]!.text }
         }
-        #expect(titles([:]) == [], "dependNode: nothing until a tree node is picked")
-        #expect(titles(["linkTreeVal": [2]]) == ["b"])
-        #expect(titles(["linkTreeVal": ["1", "2"]]) == ["a", "b"])
+        // the server turns the picked tree keys into IN on the tree field, nothing picked under dependNode into NULL on the pk
+        #expect(titles(["condition": [["key": "id", "expression": "NULL"]]]) == [])
+        #expect(titles(["condition": [["key": "topic", "expression": "IN", "value": [2]]]]) == ["b"])
+        #expect(titles(["condition": [["key": "topic", "expression": "IN", "value": [1, 2]]]]) == ["a", "b"])
+        #expect(titles(["linkTreeVal": [2]]) == ["a", "b", "c"], "linkTreeVal is not read any more")
+        #expect(call(n, "GET", "/erupt-api/build/Doc", erupt: "Doc").1?["eruptModel"]?["eruptJson"]?["linkTree"] == ["dependNode": true, "field": "topic"])
         #expect(throws: DeclarationError.self) {
             try Model("Doc", erupt: Erupt(linkTree: LinkTree(field: "title"))) { Field("id", pk: true); Field("title", "Title") }
         }
@@ -272,7 +376,6 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         let build = call(n, "GET", "/erupt-api/build/Order", erupt: "Order").1?["eruptModel"]?["eruptFieldModels"]?.array ?? []
         let fields = Dictionary(uniqueKeysWithValues: build.map { ($0["fieldName"]!.text, $0) })
         let edit = fields.mapValues { $0["eruptFieldJson"]!["edit"]! }
-        for f in build { try Schema.check("EruptField", f["eruptFieldJson"]!, partial: false) }
         #expect(edit["status"]?["choiceType"]?["fetchHandler"] == ["invoke"])
         #expect(edit["tags"]?["tagsType"]?["fetchHandler"] == ["invoke"])
         #expect(edit["qty"]?["onchange"] == "invoke")
@@ -286,6 +389,7 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(invoke("options", "status", ["note": "n"], nil).1?["data"] == [["value": "new", "label": "New"], ["value": "n", "label": "From form"]])
         #expect(invoke("options", "tags", [:], nil).1?["data"] == ["red", "blue"])
         #expect(invoke("onchange", "qty", ["qty": 3], nil).1?["data"]?["formData"] == ["note": "3 items"])
+        #expect(FormChange().json == [:], "nothing to change answers an empty object")
         #expect(invoke("autocomplete", "city", [:], "pa").1?["data"] == ["Paris"])
         #expect(invoke("button", "calc", [:], nil).1?["data"]?["eval"] == "alert(1)")
         let stop = invoke("button", "stop", [:], nil).1
@@ -293,9 +397,9 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(invoke("button", "qty", [:], nil).0 == 404, "a field without that code")
         #expect(invoke("options", "missing", [:], nil).0 == 404)
 
-        // picked records arrive as [{id: key}] and are stored as their keys
+        // picked records arrive as their keys (§12.4) and are stored so
         let add = call(n, "POST", "/erupt-api/data/modify/Order", erupt: "Order",
-                       body: ["cats": [["id": 1], ["id": "2"]], "sections": [["id": 3]], "tags": "[\"red\"]"]).1
+                       body: ["cats": [1, 2], "sections": [3], "tags": "[\"red\"]"]).1
         #expect(add?["success"] == true)
         let row = call(n, "POST", "/erupt-api/data/table/Order", erupt: "Order", body: [:]).1?["list"]?[0]
         #expect(row?["cats"] == [1, 2] && row?["sections"] == [3])
@@ -311,18 +415,48 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         let (author, book) = try authorAndBook()
         try n.register(author, MemoryRepository([["name": "Ann"], ["name": "Bob"]]))
         try n.register(book, MemoryRepository([["title": "a", "author": 1], ["title": "b", "author": 2], ["title": "c", "author": 1]]))
-        let drill = ["Drill": "Books", "DrillSourceErupt": "Author", "DrillValue": "1"]
-        let page = call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: [:], headers: drill).1
-        #expect(page?["list"]?.array?.map { $0["title"]!.text } == ["a", "c"])
-        #expect(call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: [:], headers: drill.merging(["Drill": "x"]) { $1 }).0 == 403)
+        // the server sends the join as a condition and names the drill in the body (§12.4)
+        let drilled: (JSON) -> (Int, JSON?) = { drill in
+            call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: [
+                "condition": [["key": "author", "expression": "EQ", "value": 1]], "drill": drill,
+            ])
+        }
+        #expect(drilled(["erupt": "Author", "code": "Books"]).1?["list"]?.array?.map { $0["title"]!.text } == ["a", "c"])
+        #expect(drilled(["erupt": "Author", "code": "x"]).0 == 403, "a drill the source does not declare")
+        #expect(drilled(["erupt": "Nobody", "code": "Books"]).0 == 403, "a source not on this node")
+        // the headers of protocol v1 are not read any more
+        let headers = ["Drill": "x", "DrillSourceErupt": "Author", "DrillValue": "1"]
+        #expect(call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: [:], headers: headers).1?["total"] == 3)
         let eruptJson = call(n, "GET", "/erupt-api/build/Author", erupt: "Author").1?["eruptModel"]?["eruptJson"]
-        try Schema.check("Erupt", eruptJson!, partial: false)
-        let drills = eruptJson?["drills"]?.array ?? []
-        #expect(drills.map { [$0["code"], $0["title"], $0["link"]?["linkErupt"]] } == [["Books", "Books", "Book"]])
-        #expect(drills[0]["link"]?["joinColumn"] == nil)
+        // the link goes to the server whole, the columns it joins on included
+        #expect(eruptJson?["drills"] == [
+            ["code": "Books", "title": "Books", "link": ["linkErupt": "Book", "column": "id", "joinColumn": "author.id"]],
+        ])
         #expect(throws: DeclarationError.self) {
             try Model("A", erupt: Erupt(drills: [Drill(link: Link(linkErupt: "Book"), title: "Books")])) { Field("id", pk: true) }
         }
+        #expect(throws: DeclarationError.self) {
+            try Model("A", erupt: Erupt(drills: [Drill(link: Link(), title: "Books")]), drillJoin: ["Books": DrillJoin(joinColumn: "a")]) {
+                Field("id", pk: true)
+            }
+        }
+    }
+
+    @Test func drillCondition() throws {
+        let n = try node()
+        let (_, book) = try authorAndBook()
+        let author = try Model(
+            "Author", erupt: Erupt(drills: [Drill(code: "open", link: Link(linkCondition: "done = 0", linkErupt: "Book"), title: "Open")]),
+            drillJoin: ["open": DrillJoin(joinColumn: "author")]
+        ) {
+            Field("id", pk: true)
+            Field("name", "Name")
+        }
+        try n.register(author, MemoryRepository())
+        try n.register(book, MemoryRepository())
+        // the linkCondition is the node's query language: a memory repository refuses SQL rather than ignore it
+        let body: JSON = ["drill": ["erupt": "Author", "code": "open"]]
+        #expect(call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: body).0 == 500)
     }
 
     @Test func simpleTypesAndDependColumn() throws {
@@ -331,12 +465,10 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         try n.register(author, MemoryRepository())
         try n.register(book, MemoryRepository())
         let build = call(n, "GET", "/erupt-api/build/Book", erupt: "Book").1?["eruptModel"]?["eruptFieldModels"]?.array ?? []
-        // dependColumn is @Transient in Java, so the schema does not know it
-        for f in build where f["fieldName"] != "shelf" { try Schema.check("EruptField", f["eruptFieldJson"]!, partial: false) }
         let edit = Dictionary(uniqueKeysWithValues: build.map { ($0["fieldName"]!.text, $0["eruptFieldJson"]!["edit"]!) })
         #expect(["colour", "stars", "secret", "readers"].map { edit[$0]?["type"] } == ["COLOR", "RATE", "HIDDEN", "TRANSFER"])
         #expect(edit["shelf"]?["referenceTableType"]?["dependColumn"] == "parent", "the server reads it off the build")
-        let add = call(n, "POST", "/erupt-api/data/modify/Book", erupt: "Book", body: ["title": "d", "stars": "4", "readers": [["id": 2]]]).1
+        let add = call(n, "POST", "/erupt-api/data/modify/Book", erupt: "Book", body: ["title": "d", "stars": 4, "readers": [2]]).1
         #expect(add?["success"] == true)
         let row = call(n, "POST", "/erupt-api/data/table/Book", erupt: "Book", body: [:]).1?["list"]?[0]
         #expect(row?["stars"] == 4 && row?["readers"] == [2])
@@ -372,11 +504,35 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         #expect(call(n, "POST", "/erupt-api/data/table/Task", erupt: "Task", body: [:]).0 == 500)
     }
 
-    @Test func plainAccessToken() throws {
-        // without a signature the node asks the server for the user's power and, unreachable, fails closed
-        let n = try node()
-        #expect(call(n, "GET", "/erupt-api/build/Article", signed: false).1?["power"]?["add"] == false)
-        #expect(call(n, "POST", "/erupt-api/data/modify/Article", body: ["title": "x"], signed: false).0 == 403)
+    @Test func registersWithAV2Server() throws {
+        let answers: [String: String] = ["v2": "{\"protocolVersion\":2}", "v1": "", "text": "ok", "v3": "{\"protocolVersion\":3}"]
+        for (name, answer) in answers {
+            let registered = Counter()
+            let server = try HTTPServer(host: "127.0.0.1", port: 0) { req in
+                if req.path == "/erupt-cloud-api/register-node" {
+                    let info = try? JSON.parse(req.body)
+                    #expect(info?["protocolVersion"] == 2)
+                    registered.increment()
+                }
+                return NodeResponse(status: 200, contentType: "application/json", body: Array(answer.utf8))
+            }
+            server.start()
+            defer { server.close() }
+            let logged = Counter()
+            let n = try Node(name: "n", accessToken: token, servers: ["http://127.0.0.1:\(server.port)"], address: "http://127.0.0.1:1",
+                             heartbeat: 0.05, log: { level, message in if level == .error, message.contains("does not speak node protocol v2") { logged.increment() } })
+            n.start(port: 1)
+            Thread.sleep(forTimeInterval: 0.6)
+            n.stop()
+            if name == "v2" {
+                #expect(registered.value > 2, "the heartbeat goes on")
+                #expect(logged.value == 0)
+            } else {
+                // an older server: registration stops for good, no retry and no fallback to v1
+                #expect(registered.value == 1, "\(name)")
+                #expect(logged.value == 1, "\(name)")
+            }
+        }
     }
 
     @Test func servesOverHTTP() throws {
@@ -387,6 +543,13 @@ func call(_ node: Node, _ method: String, _ target: String, erupt: String = "Art
         let body = try String(contentsOf: URL(string: "http://127.0.0.1:\(server.port)/node-health")!, encoding: .utf8)
         #expect(body == "test")
     }
+}
+
+final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func increment() { lock.lock(); count += 1; lock.unlock() }
 }
 
 @Suite struct DeclarationTests {

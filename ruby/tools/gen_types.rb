@@ -1,23 +1,17 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# Sync the erupt schemas into the gem and generate lib/erupt/types.rb (enum constants) and
-# sig/erupt/types.rbs (RBS types of every annotation attribute) from them.
+# Generate lib/erupt/types.rb (enum constants) and sig/erupt/types.rbs (RBS types of every annotation
+# attribute) from the erupt annotation JSON Schema. The gem embeds no schema: the server completes and checks
+# builds (erupt-cloud/PROTOCOL.md §12.3).
 #
-#   ruby tools/gen_types.rb ../schema          # copy schemas, regenerate types
+#   ruby tools/gen_types.rb ../schema          # regenerate types
 #   ruby tools/gen_types.rb ../schema --check  # fail when anything is out of date (CI)
 #
-# Inputs are generated in the erupt repository by erupt-test NodeSchemaTest (annotation JSON Schema) and
-# NodeDefaultsTest (resolved field templates).
+# The input is generated in the erupt repository by erupt-test NodeSchemaTest.
 require "json"
 
 ROOT = File.expand_path("..", __dir__)
-
-# erupt schema file -> copy shipped inside the gem
-COPIES = {
-  "erupt-annotations.schema.json" => "lib/erupt/schema.json",
-  "erupt-node-defaults.json" => "lib/erupt/defaults.json"
-}.freeze
 
 RBS_PRIMITIVES = { "string" => "String", "integer" => "Integer", "number" => "Numeric", "boolean" => "bool" }.freeze
 
@@ -59,8 +53,8 @@ def generate_ruby(defs)
 end
 
 def generate_rbs(defs)
-  out = ["# #{HEADER}", "# Annotation attributes as RBS records: every key is optional, a declaration only overrides the",
-         "# defaults the Java proxies emit.", "module Erupt"]
+  out = ["# #{HEADER}", "# Annotation attributes as RBS records: every key is optional, the erupt server completes what a",
+         "# declaration leaves out from the defaults the Java proxies emit.", "module Erupt"]
   defs.each do |name, d|
     if d["enum"]
       out << "  type #{snake(name)} = #{d["enum"].map { |v| JSON.generate(v) }.join(" | ")}"
@@ -76,14 +70,10 @@ end
 
 source_dir, *flags = ARGV
 abort "usage: ruby tools/gen_types.rb <schema dir> [--check]" if source_dir.nil?
-expected = COPIES.to_h do |source, target|
-  path = File.join(File.expand_path(source_dir), source)
-  abort "missing #{path}" unless File.file?(path)
-  [target, File.read(path, encoding: "UTF-8")]
-end
-defs = JSON.parse(expected["lib/erupt/schema.json"])["$defs"]
-expected["lib/erupt/types.rb"] = generate_ruby(defs)
-expected["sig/erupt/types.rbs"] = generate_rbs(defs)
+schema = File.join(File.expand_path(source_dir), "erupt-annotations.schema.json")
+abort "missing #{schema}" unless File.file?(schema)
+defs = JSON.parse(File.read(schema, encoding: "UTF-8"))["$defs"]
+expected = { "lib/erupt/types.rb" => generate_ruby(defs), "sig/erupt/types.rbs" => generate_rbs(defs) }
 
 stale = expected.reject { |path, text| File.file?(File.join(ROOT, path)) && File.read(File.join(ROOT, path), encoding: "UTF-8") == text }
 if flags.include?("--check")

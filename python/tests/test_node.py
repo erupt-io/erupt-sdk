@@ -1,12 +1,23 @@
 import base64
 import datetime
+import importlib.util
 import io
 import json
 import os
+import pathlib
 import tempfile
+import time
 import unittest
+from unittest import mock
 
-from erupt import DataProxy, Fail, Field, current_user, MemoryRepository, Node, SqliteRepository, _schema, erupt, operation
+from erupt import DataProxy, Fail, Field, current_user, MemoryRepository, Node, SqliteRepository, erupt, operation
+from erupt import _signature, node as node_module
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+# the server's view of a build: the schema check and its completion (conformance/annotations.py)
+_spec = importlib.util.spec_from_file_location("annotations", ROOT / "conformance" / "annotations.py")
+annotations = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(annotations)
 
 TOKEN = "node-secret"
 
@@ -191,8 +202,6 @@ class NodeTest(unittest.TestCase):
 
     def setUp(self):
         self.node = Node("blog", TOKEN, "http://server")
-        self.remote = {"add": True, "edit": True, "delete": True, "viewDetails": True, "export": True, "importable": True}
-        self.node._server_get = lambda path, params, headers: dict(self.remote)
         self.node.register(Category, MemoryRepository([
             {"name": "Tech", "parent": None}, {"name": "Python", "parent": 1}, {"name": "Life", "parent": None}]))
         self.node.register(Article, self.repo_factory())
@@ -206,11 +215,28 @@ class NodeTest(unittest.TestCase):
         CALLS.clear()
         MemoProxy.calls.clear()
 
-    def call(self, method, path, body=None, erupt="Article", headers=None, account="admin"):
-        raw = b"" if body is None else json.dumps(body).encode()
+    @staticmethod
+    def enforced(method, path):
+        """What the server vouches for on each endpoint (PROTOCOL.md §12.2)."""
+        if method == "GET" and path.startswith("/erupt-api/build/"):
+            return ""
+        if path.startswith("/erupt-api/data/table/"):
+            return "power,query"
+        if path.startswith("/erupt-api/data/modify/") and not path.endswith("/delete"):
+            return "power,record"
+        return "power"
+
+    def call(self, method, path, body=None, erupt="Article", headers=None, account="admin", enforced=None, signed=True):
+        """A call as a v2 server makes it: signed, vouching for what the endpoint needs."""
+        raw = b"" if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
+        user = base64.b64encode(json.dumps({"uid": 1, "account": account}).encode()).decode()
         environ = {"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": "", "CONTENT_LENGTH": str(len(raw)),
-                   "wsgi.input": io.BytesIO(raw), "HTTP_ACCESS_TOKEN": TOKEN, "HTTP_TOKEN": "t1",
-                   "HTTP_USER": base64.b64encode(json.dumps({"uid": 1, "account": account}).encode()).decode()}
+                   "wsgi.input": io.BytesIO(raw), "HTTP_TOKEN": "t1", "HTTP_USER": user}
+        if signed:
+            enforced = self.enforced(method, path) if enforced is None else enforced
+            ts = int(time.time())
+            environ.update(HTTP_ERUPT_TIMESTAMP=str(ts), HTTP_ERUPT_ENFORCED=enforced,
+                           HTTP_ERUPT_SIGNATURE=_signature.sign(TOKEN, method, path, ts, enforced, user, raw))
         if erupt:
             environ["HTTP_ERUPT"] = erupt
         environ.update(headers or {})
@@ -230,9 +256,15 @@ class NodeTest(unittest.TestCase):
         self.assertEqual(200, status, page)
         return page
 
-    def test_build(self):
-        status, build = self.call("GET", "/erupt-api/build/Article")
+    def build(self, erupt="Article", account="admin"):
+        """The build as the browser reads it: the declaration checked and completed as the server does (§12.3)."""
+        status, build = self.call("GET", f"/erupt-api/build/{erupt}", erupt=erupt, account=account)
         self.assertEqual(200, status)
+        annotations.check_declared(build, "declared")
+        return annotations.complete(build)
+
+    def test_build(self):
+        build = self.build()
         model = build["eruptModel"]
         self.assertEqual("Article", model["eruptName"])
         fields = {f["fieldName"]: f for f in model["eruptFieldModels"]}
@@ -259,24 +291,28 @@ class NodeTest(unittest.TestCase):
         self.assertTrue(fields["title"]["eruptFieldJson"]["edit"]["notNull"])
         self.assertTrue(build["power"]["export"])  # Excel is done by the server
         self.assertTrue(build["power"]["cellEdit"])  # the server edits the cell
+        # the declaration alone: what the server completes stays out (§12.3)
+        _, declared = self.call("GET", "/erupt-api/build/Article")
+        title = next(f for f in declared["eruptModel"]["eruptFieldModels"] if f["fieldName"] == "title")["eruptFieldJson"]
+        self.assertEqual({"title": "Title", "type": "INPUT", "notNull": True, "search": {"value": True}}, title["edit"])
+        self.assertNotIn("layout", declared["eruptModel"]["eruptJson"])
 
-    def test_power_is_declared_and_server(self):
-        self.remote["add"] = False
-        self.assertEqual(403, self.call("POST", "/erupt-api/data/modify/Article", {"title": "x"})[0])
+    def test_power_is_declared_for_the_server(self):
         _, build = self.call("GET", "/erupt-api/build/Note", erupt="Note")
-        self.assertFalse(build["power"]["delete"])
-        self.assertEqual(403, self.call("POST", "/erupt-api/data/modify/Note/delete", [1], erupt="Note")[0])
+        self.assertEqual({"delete": False, "print": False, "ai": False}, build["power"])
+        with self.assertRaisesRegex(ValueError, "no right remove"):
+            erupt("Bad", power={"remove": False})(type("Bad", (), {"id": Field(pk=True)}))
 
-    def test_power_fails_closed(self):
-        def down(*args):
-            raise OSError("server down")
-        self.node._server_get = down
-        self.assertEqual(403, self.call("POST", "/erupt-api/data/modify/Article", {"title": "x"})[0])
+    def test_every_call_is_signed_and_vouched_for(self):
+        self.assertEqual(403, self.call("GET", "/erupt-api/build/Article", signed=False, headers={"HTTP_ACCESS_TOKEN": TOKEN})[0])
+        self.assertEqual(403, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ERUPT_SIGNATURE": "00" * 32})[0])
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/table/Article", {}, enforced="power")[0])
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/modify/Article", {"title": "x"}, enforced="power,query")[0])
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/modify/Article/delete", [1], enforced="")[0])
+        self.assertEqual(200, self.call("GET", "/erupt-api/build/Article", enforced="")[0])
 
     def test_guards(self):
         self.assertEqual(403, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ORIGIN": "http://evil"})[0])
-        self.assertEqual(403, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ACCESS_TOKEN": "bad"})[0])
-        self.assertEqual(403, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ACCESS_TOKEN": ""})[0])
         self.assertEqual(404, self.call("GET", "/erupt-api/build/Missing", erupt="Missing")[0])
         self.assertEqual(404, self.call("GET", "/erupt-api/build/Article", erupt="Note")[0])
         self.assertEqual(404, self.call("GET", "/erupt-api/build/Article", headers={"HTTP_ERUPTPARENT": "blog.Note"})[0])
@@ -286,7 +322,7 @@ class NodeTest(unittest.TestCase):
     def test_crud(self):
         self.add(title="Hello erupt", status="published", views=10, featured=True, publish_date="2026-01-05",
                  review_at="2026-01-05 10:30:00", body="...")
-        self.add(title="Second", status="draft", views="3", featured=False, publish_date="2026-03-01")
+        self.add(title="Second", status="draft", views=3, featured=False, publish_date="2026-03-01")
         page = self.table()
         self.assertEqual(2, page["total"])
         self.assertEqual(1, page["totalPage"])
@@ -305,6 +341,8 @@ class NodeTest(unittest.TestCase):
         pk = first["id"]
         status, row = self.call("GET", f"/erupt-api/data/Article/{pk}")
         self.assertEqual("Hello erupt", row["title"])
+        # the server sends the stored row patched and normalized: a date time without its fraction (§12.4)
+        row = {**row, "review_at": row["review_at"].replace("T", " ")[:19]}
         _, r = self.call("POST", "/erupt-api/data/modify/Article/update", {**row, "title": "Renamed"})
         self.assertTrue(r["success"], r)
         self.assertEqual("Renamed", self.call("GET", f"/erupt-api/data/Article/{pk}")[1]["title"])
@@ -324,8 +362,6 @@ class NodeTest(unittest.TestCase):
         a = next(r for r in page["list"] if r["name"] == "A")
         self.assertEqual((["ADMIN", "USER"], {"env": "prod"}), (a["roles"], a["attrs"]))
         self.assertNotIn("basic", a)
-        _, r = self.call("POST", "/erupt-api/data/modify/Widget", {"name": "C", "roles": ["ROOT"]}, erupt="Widget")
-        self.assertFalse(r["success"])
         self.assertEqual(["Admin", "User", "Guest"], [o["label"] for o in next(
             f for f in build["eruptModel"]["eruptFieldModels"] if f["fieldName"] == "roles")["componentValue"]])
         _, page = self.call("POST", "/erupt-api/data/table/Widget", {"condition": [{"key": "roles", "expression": "IN", "value": ["GUEST"]}]},
@@ -351,11 +387,14 @@ class NodeTest(unittest.TestCase):
                           ("before_delete", "b"), ("after_delete", "b")], MemoProxy.calls)
 
     def test_link_tree(self):
-        def titles(body):
-            return [r["title"] for r in self.call("POST", "/erupt-api/data/table/Doc", body, erupt="Doc")[1]["list"]]
-        self.assertEqual([], titles({}), "dependNode: nothing until a tree node is picked")
-        self.assertEqual(["b"], titles({"linkTreeVal": [2]}))
-        self.assertEqual(["a", "b"], titles({"linkTreeVal": ["1", "2"]}))
+        # the server turns the picked tree keys into a condition (§12.4); the node checks the field where it is declared
+        def titles(*condition):
+            return [r["title"] for r in self.call("POST", "/erupt-api/data/table/Doc", {"condition": list(condition)}, erupt="Doc")[1]["list"]]
+        self.assertEqual([], titles({"key": "id", "expression": "NULL"}), "dependNode: nothing until a tree node is picked")
+        self.assertEqual(["b"], titles({"key": "topic", "expression": "IN", "value": [2]}))
+        self.assertEqual(["a", "b"], titles({"key": "topic", "expression": "IN", "value": [1, 2]}))
+        with self.assertRaisesRegex(ValueError, "must be a reference field"):
+            erupt("Bad", linkTree={"field": "title"})(type("Bad", (), {"id": Field(pk=True), "title": Field("T")}))
 
     def test_field_types_and_invoke(self):
         _, build = self.call("GET", "/erupt-api/build/Order", erupt="Order")
@@ -380,30 +419,30 @@ class NodeTest(unittest.TestCase):
         self.assertEqual(404, invoke("button", "qty")[0], "a field without that code")
         self.assertEqual(404, invoke("options", "missing")[0])
 
-        # picked records arrive as [{id: key}] and are stored as their keys
+        # picked records arrive as their keys, unwrapped by the server (§12.4)
         self.assertTrue(self.call("POST", "/erupt-api/data/modify/Order",
-                                  {"cats": [{"id": 1}, {"id": "2"}], "sections": [{"id": 3}], "tags": "[\"red\"]"}, erupt="Order")[1]["success"])
+                                  {"cats": [1, 2], "sections": [3], "tags": "red"}, erupt="Order")[1]["success"])
         row = self.call("POST", "/erupt-api/data/table/Order", {}, erupt="Order")[1]["list"][0]
         self.assertEqual(([1, 2], [3]), (row["cats"], row["sections"]))
         self.assertNotIn("calc", row)
 
     def test_drill(self):
-        drill = {"HTTP_DRILL": "Books", "HTTP_DRILLSOURCEERUPT": "Author", "HTTP_DRILLVALUE": "1"}
-        _, page = self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book", headers=drill)
+        # the server sends the join as a condition and names the drill (§12.4)
+        body = {"condition": [{"key": "author", "expression": "EQ", "value": 1}], "drill": {"erupt": "Author", "code": "Books"}}
+        _, page = self.call("POST", "/erupt-api/data/table/Book", body, erupt="Book")
         self.assertEqual(["a", "c"], [r["title"] for r in page["list"]])
-        self.assertEqual(403, self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book", headers={**drill, "HTTP_DRILL": "x"})[0])
+        self.assertEqual(403, self.call("POST", "/erupt-api/data/table/Book", {**body, "drill": {"erupt": "Author", "code": "x"}}, erupt="Book")[0])
+        # the link goes to the server whole: it reads the source row and joins
         _, build = self.call("GET", "/erupt-api/build/Author", erupt="Author")
-        self.assertEqual([{"code": "Books", "title": "Books", "link": {"linkErupt": "Book"}}],
-                         [{k: d[k] for k in ("code", "title")} | {"link": {"linkErupt": d["link"]["linkErupt"]}}
-                          for d in build["eruptModel"]["eruptJson"]["drills"]])
-        self.assertNotIn("joinColumn", build["eruptModel"]["eruptJson"]["drills"][0]["link"])
+        self.assertEqual([{"code": "Books", "title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author.id"}}],
+                         build["eruptModel"]["eruptJson"]["drills"])
 
     def test_simple_types_and_depend_column(self):
         _, build = self.call("GET", "/erupt-api/build/Book", erupt="Book")
         edit = {f["fieldName"]: f["eruptFieldJson"]["edit"] for f in build["eruptModel"]["eruptFieldModels"]}
         self.assertEqual(("COLOR", "RATE", "HIDDEN", "TRANSFER"), tuple(edit[n]["type"] for n in ("colour", "stars", "secret", "readers")))
         self.assertEqual("parent", edit["shelf"]["referenceTableType"]["dependColumn"], "the server reads it off the build")
-        self.assertTrue(self.call("POST", "/erupt-api/data/modify/Book", {"title": "d", "stars": "4", "readers": [{"id": 2}]}, erupt="Book")[1]["success"])
+        self.assertTrue(self.call("POST", "/erupt-api/data/modify/Book", {"title": "d", "stars": 4, "readers": [2]}, erupt="Book")[1]["success"])
         row = self.call("POST", "/erupt-api/data/table/Book", {}, erupt="Book")[1]["list"][-1]
         self.assertEqual((4, [2]), (row["stars"], row["readers"]))
 
@@ -419,6 +458,32 @@ class NodeTest(unittest.TestCase):
         self.assertEqual(["/erupt-cloud-api/node-config/blog", "/erupt-cloud-api/node-group-config/blog",
                           "/erupt-cloud-api/userinfo/blog"], [p for p, _ in seen])
 
+    def test_registration_needs_a_v2_server(self):
+        self.node._instance_id, self.node.address = "i1", "http://node"
+        answers = [b'{"protocolVersion": 2}', b""]
+        sent = []
+
+        class Answer(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                pass
+
+        def urlopen(req, timeout):
+            sent.append(json.loads(req.data))
+            if len(sent) == 2:
+                self.node._stop.wait = lambda _: None
+            return Answer(answers[len(sent) - 1])
+
+        self.node._stop.wait = lambda _: None
+        with mock.patch.object(node_module.urllib.request, "urlopen", urlopen):
+            # the second answer names no protocol: an older server, so the heartbeat stops
+            with self.assertLogs("erupt", "ERROR") as logs:
+                self.node._heartbeat_loop()
+        self.assertEqual([2, 2], [info["protocolVersion"] for info in sent])
+        self.assertIn("does not speak node protocol v2", logs.output[0])
+
     def test_before_fetch_needs_sql(self):
         self.node.register(Task, MemoryRepository())
         self.assertEqual(500, self.call("POST", "/erupt-api/data/table/Task", {}, erupt="Task")[0])
@@ -427,19 +492,17 @@ class NodeTest(unittest.TestCase):
         # the picker is the server's: it reads the referenced model's own table
         self.assertEqual(404, self.call("POST", "/erupt-api/data/Article/reference-table/category", {})[0])
 
-        self.add(title="Ref", category={"id": "2", "name": "Python"}, topic={"id": 1, "name": "Tech"})
+        self.add(title="Ref", category=2, topic=1)
         row = self.table()["list"][0]
         # a reference travels as its key; the server resolves labels and flattened columns
         self.assertEqual((2, 1), (row["category"], row["topic"]))
         self.assertNotIn("category_name", row)
         _, got = self.call("GET", f"/erupt-api/data/Article/{row['id']}")
         self.assertEqual(2, got["category"])
-        hit = self.table([{"key": "category", "expression": "EQ", "value": {"id": 2, "name": "Python"}}])
+        hit = self.table([{"key": "category", "expression": "EQ", "value": 2}])
         self.assertEqual(1, hit["total"])
-        miss = self.table([{"key": "category", "expression": "IN", "value": [{"id": 1}, {"id": 3}]}])
+        miss = self.table([{"key": "category", "expression": "IN", "value": [1, 3]}])
         self.assertEqual(0, miss["total"])
-        _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "category", "expression": "LIKE", "value": "x"}]})
-        self.assertFalse(r["success"])
 
     def test_reference_tree_is_the_servers(self):
         self.assertEqual(404, self.call("GET", "/erupt-api/data/Article/reference-tree/topic")[0])
@@ -449,8 +512,6 @@ class NodeTest(unittest.TestCase):
         self.add(title="B")
         ids = [r["id"] for r in self.table()["list"]]
         path = "/erupt-api/invoke/Article/operation/"
-        _, r = self.call("POST", path + "publish", {"ids": ids, "param": {}})
-        self.assertFalse(r["success"])  # the form's required note is missing
         _, r = self.call("POST", path + "publish", {"ids": ids, "param": {"note": "go"}})
         self.assertTrue(r["success"], r)
         self.assertEqual("Executed successfully", r["message"])
@@ -479,30 +540,28 @@ class NodeTest(unittest.TestCase):
         self.assertEqual(["first", "second"], [r["title"] for r in self.table(sort=[{"field": "title", "direction": "ASC"}])["list"]])
 
     def test_build_matches_schema(self):
-        for name in ("Article", "Note"):
-            _, build = self.call("GET", f"/erupt-api/build/{name}", erupt=name)
-            models = [build["eruptModel"], *(build["operationErupts"] or {}).values()]
-            for model in models:
-                _schema.check("Erupt", model["eruptJson"], model["eruptName"], partial=False)
+        for name in ("Article", "Note", "Order", "Book", "Widget", "Author"):
+            build = self.build(name, account="root")
+            for model in annotations.models(build):
+                annotations.check("Erupt", model["eruptJson"], model["eruptName"], partial=False)
                 for op in model["eruptJson"]["rowOperation"]:
-                    _schema.check("RowOperation", op, f"{model['eruptName']}.{op['code']}", partial=False)
+                    annotations.check("RowOperation", op, f"{model['eruptName']}.{op['code']}", partial=False)
                 for f in model["eruptFieldModels"]:
-                    _schema.check("EruptField", f["eruptFieldJson"], f"{model['eruptName']}.{f['fieldName']}", partial=False)
+                    annotations.check("EruptField", f["eruptFieldJson"], f"{model['eruptName']}.{f['fieldName']}", partial=False)
 
     def test_rejects_illegal_input(self):
-        _, r = self.call("POST", "/erupt-api/data/modify/Article", {"status": "draft"})
-        self.assertFalse(r["success"])
-        self.assertIn("Title", r["message"])
-        _, r = self.call("POST", "/erupt-api/data/modify/Article", {"title": "x", "status": "deleted"})
-        self.assertFalse(r["success"])
-        _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "views", "expression": "EQ", "value": 1}]})
-        self.assertFalse(r["success"])
-        _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title\" OR 1=1 --", "value": 1}]})
-        self.assertFalse(r["success"])
-        _, r = self.call("POST", "/erupt-api/data/table/Article", {"sort": [{"field": "body", "direction": "ASC"}]})
+        # what the node checks whoever calls it: names it puts into a query, its page size, its keys (§12.6)
+        _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title\" OR 1=1 --", "expression": "EQ", "value": 1}]})
         self.assertFalse(r["success"])
         _, r = self.call("POST", "/erupt-api/data/table/Article", {"condition": [{"key": "title", "expression": "DROP", "value": 1}]})
+        self.assertFalse(r["success"], "an unknown operator fails instead of matching every row")
+        _, r = self.call("POST", "/erupt-api/data/table/Article", {"sort": [{"field": "nothing", "direction": "ASC"}]})
         self.assertFalse(r["success"])
+        _, r = self.call("POST", "/erupt-api/data/modify/Article", b"{not json")
+        self.assertFalse(r["success"])
+        _, r = self.call("GET", "/erupt-api/data/Article/abc")
+        self.assertFalse(r["success"])
+        self.assertEqual(1000, self.table(size=100000)["pageSize"])
 
 
 class SqliteNodeTest(NodeTest):
@@ -546,23 +605,19 @@ class DeclarationTest(unittest.TestCase):
     def declare(self, **attrs):
         return type("Bad", (), {"id": Field(pk=True), **attrs})
 
-    def test_rejects_unknown_annotation_values(self):
+    def test_rejects_unknown_values_where_declared(self):
+        # a misspelt enum value fails here; an unknown attribute fails in the server's build check (§12.3)
         cases = [
-            ({"title": Field("T", edit={"inputTyp": {"length": 9}})}, {}, "Edit has no attribute 'inputTyp'"),
-            ({"title": Field("T", view={"sortable": "yes"})}, {}, "expected boolean"),
-            ({"title": Field("T", type="INPUTT")}, {}, "is not a EditType"),
-            ({"title": Field("T", edit={"search": {"operator": "ABOUT"}})}, {}, "is not a QueryExpression"),
-            ({}, {"orderBy": "id"}, "Erupt has no attribute 'orderBy'"),
-            ({}, {"layout": {"pageSize": "10"}}, "expected integer"),
+            ({"title": Field("T", type="INPUTT")}, {}, "'INPUTT' is not one of"),
             ({}, {"order_by": "missing desc"}, "illegal order_by"),
+            ({"tags": Field("T", type="CHECKBOX", ref=Category, search=True)}, {}, "holds keys and cannot be searched"),
+            ({}, {"drills": [{"title": "D", "link": {"linkErupt": "X"}}]}, "needs link.linkErupt and link.joinColumn"),
         ]
         for attrs, kwargs, message in cases:
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 erupt("Bad", **kwargs)(self.declare(**attrs))
-        with self.assertRaisesRegex(ValueError, "is not a RowOperationMode"):
+        with self.assertRaisesRegex(ValueError, "'ALL' is not one of"):
             operation("Go", mode="ALL")(lambda op: None)
-        with self.assertRaisesRegex(ValueError, "RowOperation has no attribute 'colour'"):
-            operation("Go", colour="red")(lambda op: None)
 
     def test_raw_attributes_pass_through(self):
         cls = erupt("Ok", layout={"pageSize": 30})(self.declare(title=Field("T", edit={"inputType": {"length": 9}})))
@@ -576,7 +631,7 @@ class DeclarationTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("gen_types", root / "tools" / "gen_types.py")
         gen = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(gen)
-        schema = json.loads((root / "src" / "erupt" / "_schema.json").read_text("utf-8"))
+        schema = json.loads((root.parent / "schema" / "erupt-annotations.schema.json").read_text("utf-8"))
         self.assertEqual(gen.generate(schema), (root / "src" / "erupt" / "_types.py").read_text("utf-8"))
 
 

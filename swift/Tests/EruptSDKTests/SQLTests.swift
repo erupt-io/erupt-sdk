@@ -39,6 +39,21 @@ func sqlModel() throws -> Model {
         #expect(rows[2]["price"] == .null)
     }
 
+    @Test func rateAndSliderAreNumbers() throws {
+        let repo = try SQLRepository(try SQLiteExecutor(path: ":memory:"), table: "review", autoCreate: true)
+        try repo.bind(try Model("Review") {
+            Field("id", pk: true)
+            Field("rating", "Rating", .number, type: .rate)
+            Field("progress", "Progress", .number, type: .slider)
+        })
+        try repo.add(["rating": 4.5, "progress": 60])
+        try repo.add(["rating": 3, "progress": 100])
+        let rows = try repo.page(Query(sort: [(field: "progress", descending: true)])).records
+        // stored in NUMERIC columns and read back as numbers, sorted as numbers
+        #expect(rows.map { $0["rating"] } == [3, 4.5])
+        #expect(rows.map { $0["progress"] } == [100, 60])
+    }
+
     @Test func conditions() throws {
         let repo = try repository()
         for (i, name) in ["100%_off!", "100 off", "a_b", "AXB"].enumerated() {

@@ -1,6 +1,7 @@
 package erupt
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -77,7 +78,7 @@ func TestDeclaration(t *testing.T) {
 			t.Errorf("%s: type %q, want %q", name, got, typ)
 		}
 	}
-	build := article.buildModel(defaults.Power, nil)
+	build := article.buildModel(nil, nil)
 	model := build["eruptModel"].(M)
 	erupt := model["eruptJson"].(map[string]any)
 	if v := erupt["layout"].(map[string]any)["pageSize"]; str(v) != "30" {
@@ -89,41 +90,6 @@ func TestDeclaration(t *testing.T) {
 	title := model["eruptFieldModels"].([]any)[1].(map[string]any)["eruptFieldJson"].(map[string]any)["edit"].(map[string]any)
 	if str(title["inputType"].(map[string]any)["length"]) != "64" {
 		t.Errorf("typed edit override: %v", title["inputType"])
-	}
-}
-
-func TestBuildMatchesSchema(t *testing.T) {
-	category, article := testModels(t)
-	for _, m := range []*Model{category, article} {
-		build := m.buildModel(defaults.Power, nil)
-		models := []any{build["eruptModel"]}
-		if forms, ok := build["operationErupts"].(M); ok {
-			for _, f := range forms {
-				models = append(models, f)
-			}
-		}
-		for _, x := range models {
-			v, err := toJSONValue(x)
-			if err != nil {
-				t.Fatal(err)
-			}
-			em := v.(map[string]any)
-			name := em["eruptName"].(string)
-			if err := checkSchema("Erupt", em["eruptJson"], name, false); err != nil {
-				t.Error(err)
-			}
-			for _, op := range em["eruptJson"].(map[string]any)["rowOperation"].([]any) {
-				if err := checkSchema("RowOperation", op, name+".op", false); err != nil {
-					t.Error(err)
-				}
-			}
-			for _, f := range em["eruptFieldModels"].([]any) {
-				fm := f.(map[string]any)
-				if err := checkSchema("EruptField", fm["eruptFieldJson"], name+"."+fm["fieldName"].(string), false); err != nil {
-					t.Error(err)
-				}
-			}
-		}
 	}
 }
 
@@ -139,16 +105,13 @@ func TestDeclarationErrors(t *testing.T) {
 		opts []ModelOption
 		want string
 	}{
-		{bad{}, []ModelOption{WithFieldEdit("title", M{"inputTyp": M{"length": 9}})}, "Edit has no attribute 'inputTyp'"},
-		{bad{}, []ModelOption{WithFieldView("title", M{"sortable": "yes"})}, "expected boolean"},
-		{bad{}, []ModelOption{WithFieldEdit("title", M{"search": M{"operator": "ABOUT"}})}, "is not a QueryExpression"},
 		{bad{}, []ModelOption{WithFieldEdit("missing", M{})}, "names no field 'missing'"},
-		{bad{}, []ModelOption{WithRaw(M{"orderBy": "id"})}, "Erupt has no attribute 'orderBy'"},
-		{bad{}, []ModelOption{WithRaw(M{"layout": M{"pageSize": "10"}})}, "expected integer"},
+		{bad{}, []ModelOption{WithFieldEdit("title", "TEXTAREA")}, "expected an object"},
+		{bad{}, []ModelOption{WithRaw(M{"linkTree": M{"field": "title"}})}, "must be a reference field"},
+		{bad{}, []ModelOption{WithRaw(M{"drills": []M{{"title": "x", "link": M{"linkErupt": "Book"}}}})}, "needs link.linkErupt and link.joinColumn"},
 		{bad{}, []ModelOption{WithOrderBy("missing desc")}, "illegal order_by"},
 		{bad{}, []ModelOption{WithPower(map[string]bool{"fly": false})}, "unknown power 'fly'"},
 		{bad{}, []ModelOption{WithOperations(Operation{Code: "go", Mode: "ALL", Handler: noop})}, "is not a RowOperationMode"},
-		{bad{}, []ModelOption{WithOperations(Operation{Code: "go", Raw: M{"colour": "red"}, Handler: noop})}, "RowOperation has no attribute 'colour'"},
 		{bad{}, []ModelOption{WithOperations(Operation{Code: "go"})}, "needs a Code and a Handler"},
 		{bad{}, []ModelOption{WithOperations(Operation{Code: "go", Handler: noop}, Operation{Code: "go", Handler: noop})}, "declared twice"},
 		{struct {
@@ -210,11 +173,12 @@ func TestCoerce(t *testing.T) {
 		in    any
 		want  any
 	}{
-		{"views", "3", int64(3)}, {"views", 2.5, 2.5}, {"featured", "1", true}, {"featured", "no", false},
+		{"views", json.Number("3"), int64(3)}, {"views", 2.5, 2.5}, {"views", json.Number("2.5"), 2.5}, {"featured", true, true},
 		{"publish_date", "2026-01-05T10:30:00Z", time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)},
 		{"review_at", "2026-01-05 10:30:00.123456", time.Date(2026, 1, 5, 10, 30, 0, 123456000, time.UTC)},
 		{"review_at", "2026-01-05 10:30", time.Date(2026, 1, 5, 10, 30, 0, 0, time.UTC)},
-		{"category", M{"id": "2", "name": "x"}, int64(2)}, {"title", "", nil}, {"status", "draft", "draft"},
+		{"category", json.Number("2"), int64(2)}, {"category", "2", int64(2)}, {"title", "", nil},
+		{"status", "deleted", "deleted"}, // no choice check: the server checked the record
 	}
 	for _, c := range cases {
 		got, err := f[c.field].coerce(c.in)
@@ -225,7 +189,7 @@ func TestCoerce(t *testing.T) {
 	for _, in := range []struct {
 		field string
 		v     any
-	}{{"views", "many"}, {"publish_date", "someday"}, {"status", "deleted"}, {"id", "abc"}} {
+	}{{"views", "many"}, {"featured", "yes"}, {"publish_date", "someday"}, {"id", "abc"}, {"category", M{"id": 2}}} {
 		if _, err := f[in.field].coerce(in.v); err == nil {
 			t.Errorf("%s(%v) accepted", in.field, in.v)
 		}
@@ -243,7 +207,11 @@ func equalOrNil(a, b any) bool {
 }
 
 func TestGeneratedTypesAreCurrent(t *testing.T) {
-	want, err := gentypes.Generate(annotationSchema)
+	schema, err := os.ReadFile("../schema/" + gentypes.Schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := gentypes.Generate(schema)
 	if err != nil {
 		t.Fatal(err)
 	}

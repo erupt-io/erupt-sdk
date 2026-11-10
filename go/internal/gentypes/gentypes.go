@@ -11,9 +11,9 @@ import (
 	"unicode"
 )
 
-// Files the erupt repository generates (erupt-test NodeSchemaTest / NodeDefaultsTest) and the package
-// embeds; //go:embed cannot reach ../schema, so they are copied next to the package.
-var Files = []string{"erupt-annotations.schema.json", "erupt-node-defaults.json"}
+// Schema is the file the erupt repository generates (erupt-test NodeSchemaTest) that types.go is generated from.
+// The package embeds no schema: the erupt server completes and checks every build (PROTOCOL.md §12.3).
+const Schema = "erupt-annotations.schema.json"
 
 type schema struct {
 	Type                 string             `json:"type"`

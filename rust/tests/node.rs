@@ -1,5 +1,6 @@
 use erupt::http::{Request, Response};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use erupt::types::EditType;
 use erupt::{
@@ -8,7 +9,8 @@ use erupt::{
 };
 use serde_json::{json, Map, Value};
 
-const TOKEN: &str = "node-secret";
+mod common;
+use common::{sign_with, signed, TOKEN};
 
 fn node() -> Node {
     let form = Model::new("PublishForm", "Publish")
@@ -29,29 +31,13 @@ fn node() -> Node {
         )
         .build()
         .unwrap();
-    let mut node =
-        Node::new("n", TOKEN, ["http://127.0.0.1:1"]).power_source(|token, _| match token {
-            "t1" => Ok(
-                json!({"add": true, "edit": true, "delete": true, "viewDetails": true})
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-            ),
-            _ => Err(Error::Other("server down".into())),
-        });
+    let mut node = Node::new("n", TOKEN, ["http://127.0.0.1:1"]);
     node.register(&post, MemoryRepository::new()).unwrap();
     node
 }
 
-fn call(
-    node: &Node,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-    headers: &[(&str, &str)],
-) -> (u16, Value) {
+fn request(method: &str, path: &str, body: Option<Value>, headers: &[(&str, &str)]) -> Request {
     let mut request = Request::new(method, path)
-        .header("Access-Token", TOKEN)
         .header("token", "t1")
         .header("erupt", "Post");
     for (name, value) in headers {
@@ -60,12 +46,27 @@ fn call(
     if let Some(body) = body {
         request = request.body(body.to_string());
     }
-    let Response { status, body, .. } = node.handle(&request);
+    request
+}
+
+fn answer(node: &Node, request: &Request) -> (u16, Value) {
+    let Response { status, body, .. } = node.handle(request);
     (
         status,
         serde_json::from_slice(&body)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned())),
     )
+}
+
+/// A call as the server makes it: signed, with the endpoint's Erupt-Enforced.
+fn call(
+    node: &Node,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> (u16, Value) {
+    answer(node, &signed(request(method, path, body, headers)))
 }
 
 #[test]
@@ -82,17 +83,54 @@ fn guards() {
         )
         .0
     );
-    assert_eq!(
-        403,
-        call(
-            &n,
-            "GET",
-            "/erupt-api/build/Post",
-            None,
-            &[("Access-Token", "bad")]
-        )
-        .0
+    // unsigned: the access token alone no longer passes (PROTOCOL.md §12.2)
+    let plain = request(
+        "GET",
+        "/erupt-api/build/Post",
+        None,
+        &[("Access-Token", TOKEN)],
     );
+    assert_eq!(403, answer(&n, &plain).0);
+    // signed, but without what the endpoint needs in Erupt-Enforced
+    let table = |enforced: Option<&str>| {
+        let r = request("POST", "/erupt-api/data/table/Post", Some(json!({})), &[]);
+        answer(&n, &sign_with(r, enforced)).0
+    };
+    assert_eq!(403, table(None));
+    assert_eq!(403, table(Some("power")));
+    assert_eq!(403, table(Some("query")));
+    assert_eq!(200, table(Some("power,query")));
+    let add = |enforced: Option<&str>| {
+        let r = request(
+            "POST",
+            "/erupt-api/data/modify/Post",
+            Some(json!({"title": "a"})),
+            &[],
+        );
+        answer(&n, &sign_with(r, enforced)).0
+    };
+    assert_eq!(403, add(Some("power,query")));
+    assert_eq!(200, add(Some("power,record")));
+    let get = request("GET", "/erupt-api/data/Post/1", None, &[]);
+    assert_eq!(403, answer(&n, &sign_with(get.clone(), None)).0);
+    assert_eq!(200, answer(&n, &sign_with(get, Some("power"))).0);
+    let delete = request(
+        "POST",
+        "/erupt-api/data/modify/Post/delete",
+        Some(json!([1])),
+        &[],
+    );
+    assert_eq!(403, answer(&n, &sign_with(delete, Some("record"))).0);
+    let ping = request(
+        "POST",
+        "/erupt-api/invoke/Post/operation/ping",
+        Some(json!({"ids": [1]})),
+        &[],
+    );
+    assert_eq!(403, answer(&n, &sign_with(ping, None)).0);
+    // a build needs nothing: the server reads it on its own account
+    let build = request("GET", "/erupt-api/build/Post", None, &[]);
+    assert_eq!(200, answer(&n, &sign_with(build, None)).0);
     assert_eq!(
         404,
         call(
@@ -129,7 +167,7 @@ fn guards() {
     assert_eq!(404, call(&n, "GET", "/erupt-api/nothing", None, &[]).0);
     assert_eq!(
         (200, json!("n")),
-        call(&n, "GET", "/node-health", None, &[("Access-Token", "")])
+        answer(&n, &Request::new("GET", "/node-health"))
     );
 }
 
@@ -144,14 +182,6 @@ fn crud_and_operations() {
         &[],
     );
     assert_eq!(json!(true), r["success"]);
-    let (_, r) = call(
-        &n,
-        "POST",
-        "/erupt-api/data/modify/Post",
-        Some(json!({})),
-        &[],
-    );
-    assert_eq!(json!("Title cannot be empty"), r["message"]);
     let (_, page) = call(
         &n,
         "POST",
@@ -193,16 +223,15 @@ fn crud_and_operations() {
         &n,
         "POST",
         "/erupt-api/data/table/Post",
-        Some(json!({"condition": [{"key": "title\" OR 1=1", "value": 1}]})),
+        Some(json!({"condition": [{"key": "title\" OR 1=1", "expression": "EQ", "value": 1}]})),
         &[],
     );
     assert_eq!(json!(false), r["success"]);
     let raw = Request::new("POST", "/erupt-api/data/modify/Post")
-        .header("Access-Token", TOKEN)
         .header("token", "t1")
         .header("erupt", "Post")
         .body("{not json");
-    let r: Value = serde_json::from_slice(&n.handle(&raw).body).unwrap();
+    let r: Value = serde_json::from_slice(&n.handle(&signed(raw)).body).unwrap();
     assert_eq!(
         (json!(false), json!("malformed JSON body")),
         (r["success"].clone(), r["message"].clone())
@@ -210,30 +239,152 @@ fn crud_and_operations() {
 }
 
 #[test]
-fn power_fails_closed() {
-    let n = node();
-    assert_eq!(
-        403,
-        call(
-            &n,
-            "POST",
-            "/erupt-api/data/modify/Post",
-            Some(json!({"title": "a"})),
-            &[("token", "t-down")]
-        )
-        .0
-    );
+fn build_power_is_declared_only() {
+    let note = Model::new("Note", "Note")
+        .power(json!({"delete": false}))
+        .field("id", Field::pk())
+        .build()
+        .unwrap();
+    let mut n = node();
+    n.register(&note, MemoryRepository::new()).unwrap();
+    // the rights the model switches off and the features this SDK does not serve; the server enforces the rest
+    let (_, build) = call(&n, "GET", "/erupt-api/build/Post", None, &[]);
+    assert_eq!(json!({"print": false, "ai": false}), build["power"]);
     let (_, build) = call(
         &n,
         "GET",
-        "/erupt-api/build/Post",
+        "/erupt-api/build/Note",
         None,
-        &[("token", "t-down")],
+        &[("erupt", "Note")],
     );
-    let power: &Map<String, Value> = build["power"].as_object().unwrap();
-    assert_eq!(Some(&json!(false)), power.get("add"));
-    assert_eq!(Some(&json!(false)), power.get("export"));
-    assert_eq!(Some(&json!(true)), power.get("cellEdit")); // the server edits the cell
+    assert_eq!(
+        json!({"delete": false, "print": false, "ai": false}),
+        build["power"]
+    );
+    // the server refuses the delete; a call it vouches for runs
+    let (_, r) = call(
+        &n,
+        "POST",
+        "/erupt-api/data/modify/Note/delete",
+        Some(json!([1])),
+        &[("erupt", "Note")],
+    );
+    assert_eq!(json!(true), r["success"]);
+}
+
+#[test]
+fn build_is_declared_only() {
+    let category = Model::new("Category", "Category")
+        .field("id", Field::pk())
+        .field("name", Field::input("Name"))
+        .build()
+        .unwrap();
+    let event = Model::new("Event", "Event")
+        .field("id", Field::pk())
+        .field(
+            "title",
+            Field::input("Title").search().not_null().sortable(),
+        )
+        .field("at", Field::date_time("At").hide_form())
+        .field("day", Field::date("Day").hide_table())
+        .field(
+            "count",
+            Field::number("Count").view(json!({"type": "TEXT"})),
+        )
+        .field("done", Field::boolean("Done"))
+        .field("category", Field::reference(&category, "Category"))
+        .operation(
+            Operation::new("go", "Go")
+                .no_confirm()
+                .handler(|_| Ok(None)),
+        )
+        .build()
+        .unwrap();
+    let mut n = node();
+    n.register(&event, MemoryRepository::new()).unwrap();
+    let (_, build) = call(
+        &n,
+        "GET",
+        "/erupt-api/build/Event",
+        None,
+        &[("erupt", "Event")],
+    );
+    let model = &build["eruptModel"];
+    assert_eq!(
+        json!({"primaryKeyCol": "id", "rowOperation": [{"code": "go", "title": "Go", "mode": "MULTI", "tip": "",
+               "ifExpr": "", "eruptClass": "void", "callHint": ""}]}),
+        model["eruptJson"]
+    );
+    let fields: Map<String, Value> = model["eruptFieldModels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["fieldName"].as_str().unwrap().to_string(), f.clone()))
+        .collect();
+    assert_eq!(
+        json!({"fieldName": "id", "fieldReturnName": "number", "componentValue": null,
+               "eruptFieldJson": {"edit": {"title": "", "type": "NUMBER"}}}),
+        fields["id"]
+    );
+    assert_eq!(
+        json!({"fieldName": "title", "fieldReturnName": "String", "componentValue": null,
+               "eruptFieldJson": {
+                   "edit": {"title": "Title", "type": "INPUT", "notNull": true, "search": {"value": true}},
+                   "views": [{"title": "Title", "sortable": true}]}}),
+        fields["title"]
+    );
+    assert_eq!(
+        (
+            json!("Date"),
+            json!({"title": "At", "type": "DATE", "dateType": {"type": "DATE_TIME"}, "show": false}),
+            json!([{"title": "At"}])
+        ),
+        (
+            fields["at"]["fieldReturnName"].clone(),
+            fields["at"]["eruptFieldJson"]["edit"].clone(),
+            fields["at"]["eruptFieldJson"]["views"].clone()
+        )
+    );
+    assert_eq!(
+        (
+            json!({"title": "Day", "type": "DATE", "dateType": {"type": "DATE"}}),
+            json!([])
+        ),
+        (
+            fields["day"]["eruptFieldJson"]["edit"].clone(),
+            fields["day"]["eruptFieldJson"]["views"].clone()
+        )
+    );
+    // a view type only when the declaration sets one: the server resolves AUTO
+    assert_eq!(
+        (json!("number"), json!([{"title": "Count", "type": "TEXT"}])),
+        (
+            fields["count"]["fieldReturnName"].clone(),
+            fields["count"]["eruptFieldJson"]["views"].clone()
+        )
+    );
+    assert_eq!(json!("Boolean"), fields["done"]["fieldReturnName"]);
+    assert_eq!(
+        json!({"fieldName": "category", "fieldReturnName": "Category", "componentValue": null,
+               "eruptFieldJson": {
+                   "edit": {"title": "Category", "type": "REFERENCE_TABLE",
+                            "referenceTableType": {"id": "id", "label": "name"}},
+                   "views": [{"title": "Category", "column": "name"}]}}),
+        fields["category"]
+    );
+}
+
+#[test]
+fn page_size_is_capped() {
+    let n = node();
+    let (_, page) = call(
+        &n,
+        "POST",
+        "/erupt-api/data/table/Post",
+        Some(json!({"pageIndex": 1, "pageSize": 100000})),
+        &[],
+    );
+    assert_eq!(json!(1000), page["pageSize"]);
 }
 
 /// Every hook; the write hooks only record that they ran, with the text they saw.
@@ -525,13 +676,16 @@ fn link_tree() {
             .map(|r| r["title"].clone())
             .collect::<Vec<_>>()
     };
-    // dependNode: nothing until a tree node is picked
-    assert_eq!(Vec::<Value>::new(), titles(json!({})));
-    assert_eq!(vec![json!("b")], titles(json!({"linkTreeVal": [2]})));
-    assert_eq!(
-        vec![json!("a"), json!("b")],
-        titles(json!({"linkTreeVal": ["1", "2"]}))
-    );
+    // the server turns the picked tree keys into IN on the tree field ...
+    let picked =
+        |keys: Value| json!({"condition": [{"key": "topic", "expression": "IN", "value": keys}]});
+    assert_eq!(vec![json!("b")], titles(picked(json!([2]))));
+    assert_eq!(vec![json!("a"), json!("b")], titles(picked(json!([1, 2]))));
+    // ... and, under dependNode with nothing picked, NULL on the primary key, which no row matches
+    let none = json!({"condition": [{"key": "id", "expression": "NULL"}]});
+    assert_eq!(Vec::<Value>::new(), titles(none));
+    // the node no longer reads linkTreeVal: every row
+    assert_eq!(3, titles(json!({"linkTreeVal": [2]})).len());
 }
 
 #[test]
@@ -670,11 +824,11 @@ fn field_types_and_invoke() {
     assert_eq!(404, invoke("button", "qty", json!({}), Value::Null).0);
     assert_eq!(404, invoke("options", "missing", json!({}), Value::Null).0);
 
-    // picked records arrive as [{id: key}] and are stored as their keys
+    // picked records arrive as their keys and are stored typed like the target's key
     let (_, added) = call(
         "POST",
         "/erupt-api/data/modify/Order",
-        json!({"cats": [{"id": 1}, {"id": "2"}], "sections": "[{\"id\": 3}]", "tags": "red"}),
+        json!({"cats": [1, "2"], "sections": [3], "tags": "red"}),
     );
     assert_eq!(json!(true), added["success"]);
     let (_, page) = call("POST", "/erupt-api/data/table/Order", json!({}));
@@ -747,22 +901,18 @@ fn library() -> Node {
 #[test]
 fn drill() {
     let n = library();
-    let drill = [
-        ("erupt", "Book"),
-        ("Drill", "Books"),
-        ("DrillSourceErupt", "Author"),
-        ("DrillValue", "1"),
-    ];
-    let table = |headers: &[(&str, &str)]| {
+    // the server reads the source row and sends the join as a condition; the body names the drill
+    let table = |drill: Value| {
+        let body = json!({"condition": [{"key": "author", "expression": "EQ", "value": 1}], "drill": drill});
         call(
             &n,
             "POST",
             "/erupt-api/data/table/Book",
-            Some(json!({})),
-            headers,
+            Some(body),
+            &[("erupt", "Book")],
         )
     };
-    let (_, page) = table(&drill);
+    let (_, page) = table(json!({"erupt": "Author", "code": "Books"}));
     let titles: Vec<&Value> = page["list"]
         .as_array()
         .unwrap()
@@ -770,9 +920,8 @@ fn drill() {
         .map(|r| &r["title"])
         .collect();
     assert_eq!(vec![&json!("a"), &json!("c")], titles);
-    let mut undeclared = drill;
-    undeclared[1] = ("Drill", "x");
-    assert_eq!(403, table(&undeclared).0);
+    assert_eq!(403, table(json!({"erupt": "Author", "code": "x"})).0);
+    assert_eq!(403, table(json!({"erupt": "Nobody", "code": "Books"})).0);
 
     let (_, build) = call(
         &n,
@@ -781,12 +930,37 @@ fn drill() {
         None,
         &[("erupt", "Author")],
     );
-    let drills = &build["eruptModel"]["eruptJson"]["drills"];
+    // the link goes to the server whole: it joins on column / joinColumn
     assert_eq!(
-        json!([{"code": "Books", "fold": false, "icon": "fa fa-sitemap", "title": "Books",
-                "link": {"linkCondition": "", "linkErupt": "Book"}}]),
-        *drills
+        json!([{"code": "Books", "title": "Books", "link": {"linkErupt": "Book", "joinColumn": "author.id"}}]),
+        build["eruptModel"]["eruptJson"]["drills"]
     );
+}
+
+#[test]
+fn drill_condition() {
+    let author = Model::new("Author", "Author")
+        .raw(
+            json!({"drills": [{"code": "recent", "title": "Recent", "link": {
+            "linkErupt": "Book", "joinColumn": "author", "linkCondition": "title <> 'b'"}}]}),
+        )
+        .field("id", Field::pk())
+        .build()
+        .unwrap();
+    let mut n = node();
+    n.register(&author, MemoryRepository::new()).unwrap();
+    n.register(&author_and_book().1, MemoryRepository::new())
+        .unwrap();
+    // a linkCondition is SQL: a memory repository refuses it, which shows the node applied it
+    let body = json!({"drill": {"erupt": "Author", "code": "recent"}});
+    let (status, _) = call(
+        &n,
+        "POST",
+        "/erupt-api/data/table/Book",
+        Some(body),
+        &[("erupt", "Book")],
+    );
+    assert_eq!(500, status);
 }
 
 #[test]
@@ -819,7 +993,7 @@ fn simple_types_and_depend_column() {
     let (_, added) = call(
         "POST",
         "/erupt-api/data/modify/Book",
-        Some(json!({"title": "d", "stars": "4", "readers": [{"id": 2}]})),
+        Some(json!({"title": "d", "stars": 4, "readers": [2]})),
     );
     assert_eq!(json!(true), added["success"]);
     let (_, page) = call("POST", "/erupt-api/data/table/Book", Some(json!({})));
@@ -875,4 +1049,88 @@ fn node_config_and_user_info() {
             })
             .collect::<Vec<_>>()
     );
+}
+
+/// A fake erupt server answering every register call with `answer`; counts the calls and keeps the last body.
+fn register_server(answer: &'static str) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        erupt::http::serve_listener(
+            listener,
+            2,
+            Arc::new(move |req: &Request| {
+                if req.path == "/erupt-cloud-api/register-node" {
+                    log.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&req.body).unwrap_or(Value::Null));
+                }
+                Response::text(200, answer)
+            }),
+        )
+    });
+    (server, seen)
+}
+
+fn heartbeats(answer: &'static str) -> (Arc<Node>, Arc<Mutex<Vec<Value>>>) {
+    let (server, seen) = register_server(answer);
+    let node = Arc::new(
+        Node::new("n", TOKEN, [server])
+            .address("http://127.0.0.1:1")
+            .heartbeat_interval(Duration::from_millis(30)),
+    );
+    node.start_heartbeat();
+    std::thread::sleep(Duration::from_millis(400));
+    (node, seen)
+}
+
+#[test]
+fn registers_with_a_v2_server() {
+    let (node, seen) = heartbeats(r#"{"protocolVersion": 2}"#);
+    let calls = seen.lock().unwrap().clone();
+    assert!(
+        calls.len() > 1,
+        "the heartbeat goes on: {} calls",
+        calls.len()
+    );
+    assert_eq!(json!(2), calls[0]["protocolVersion"]);
+    assert!(node.register_once().is_ok());
+}
+
+#[test]
+fn an_older_server_stops_the_heartbeat() {
+    for answer in ["", "{}", r#"{"protocolVersion": 1}"#] {
+        let (node, seen) = heartbeats(answer);
+        // no retry, no v1 fallback
+        assert_eq!(1, seen.lock().unwrap().len(), "answer {answer:?}");
+        let error = node.register_once().unwrap_err().to_string();
+        assert!(
+            error.contains("does not speak node protocol v2: upgrade the erupt server"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn unknown_operators_fail() {
+    let n = node();
+    call(
+        &n,
+        "POST",
+        "/erupt-api/data/modify/Post",
+        Some(json!({"title": "a"})),
+        &[],
+    );
+    // an operator the node does not know never turns into "no condition" (every row)
+    for expression in [json!("DROP"), json!("AUTO"), json!(""), Value::Null] {
+        let body = json!({"condition": [{"key": "title", "expression": expression, "value": "x"}]});
+        let (status, r) = call(&n, "POST", "/erupt-api/data/table/Post", Some(body), &[]);
+        assert_eq!(
+            (200, json!(false)),
+            (status, r["success"].clone()),
+            "{expression}"
+        );
+    }
 }

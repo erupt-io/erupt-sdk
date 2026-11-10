@@ -1,21 +1,82 @@
-//! Model declaration, compiled into erupt build JSON. Nothing here re-implements annotation semantics: every
-//! field and operation starts from the template the Java proxies emit (`erupt-node-defaults.json`, generated
-//! by erupt-test `NodeDefaultsTest`); a declaration only overrides values on top of it.
+//! Model declaration, compiled into erupt build JSON. Nothing here re-implements annotation semantics: the build
+//! carries only what a model declares, and the server completes every annotation from its Java defaults and
+//! checks it (erupt-cloud/PROTOCOL.md §12.3, protocol v2).
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::repo::{Cond, Filter, Repository};
-use crate::schema::{annotation_defaults, check, defaults};
-use crate::types::{EditType, RowOperationMode};
+use crate::types::{EditType, QueryExpression, RowOperationMode};
 use crate::values::{as_f64, number, parse_date_time, text};
 use crate::{Error, Record, Result};
 
 pub(crate) const REFERENCES: [&str; 2] = ["REFERENCE_TABLE", "REFERENCE_TREE"];
 /// many records of another model, stored as the JSON list of their keys
 const COLLECTIONS: [&str; 3] = ["CHECKBOX", "TAB_TREE", "TRANSFER"];
+/// The edit types this SDK serves (a date with a time is declared as `DATE_TIME`)
+const SUPPORTED: [&str; 27] = [
+    "ATTACHMENT",
+    "AUTO_COMPLETE",
+    "BOOLEAN",
+    "BUTTON",
+    "CHECKBOX",
+    "CHOICE",
+    "CODE_EDITOR",
+    "COLOR",
+    "DATE",
+    "DATE_TIME",
+    "HIDDEN",
+    "HTML_EDITOR",
+    "ICON",
+    "INPUT",
+    "MAP",
+    "MARKDOWN",
+    "MULTI_CHOICE",
+    "NUMBER",
+    "RATE",
+    "REFERENCE_TABLE",
+    "REFERENCE_TREE",
+    "SIGNATURE",
+    "SLIDER",
+    "TAB_TREE",
+    "TAGS",
+    "TEXTAREA",
+    "TRANSFER",
+];
+/// Rights a model may switch off (`@Erupt(power)`, `PowerObject`)
+const POWERS: [&str; 14] = [
+    "add",
+    "edit",
+    "delete",
+    "query",
+    "viewDetails",
+    "export",
+    "importable",
+    "print",
+    "copy",
+    "cellEdit",
+    "batchEdit",
+    "ai",
+    "comment",
+    "revision",
+];
+
+/// A misspelt enum value fails where the model is declared; every other attribute is the server's to check
+/// (PROTOCOL.md §12.3).
+fn check_enum<T: FromStr>(value: Option<&Value>, path: &str, values: &[&str]) -> Result<()> {
+    match value {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) if T::from_str(s).is_ok() => Ok(()),
+        Some(other) => Err(Error::Declaration(format!(
+            "{path}: '{}' is not one of {}",
+            text(other),
+            values.join(", ")
+        ))),
+    }
+}
 
 /// A field's own code, run when the server invokes it (erupt-cloud/PROTOCOL.md §5.5): the form's values and
 /// the call's `value` to the answer's `data`.
@@ -67,9 +128,6 @@ pub struct Field {
     pub(crate) target: Option<Arc<Model>>,
     pub(crate) label: String,
     pub(crate) tree: Option<String>,
-    /// `edit.referenceTableType.dependColumn`, `@Transient` in Java: kept out of the schema check, written into
-    /// the build
-    depend_column: Option<String>,
     view: Value,
     edit: Value,
     fetch: Option<FieldCode>,
@@ -98,7 +156,6 @@ impl Field {
             target: None,
             label: "name".to_string(),
             tree: None,
-            depend_column: None,
             view: json!({}),
             edit: json!({}),
             fetch: None,
@@ -147,7 +204,7 @@ impl Field {
         f.json = true;
         f
     }
-    /// Any edit type the SDK has a template for, by its schema name.
+    /// Any edit type the SDK supports, by its schema name.
     pub fn of(edit_type: EditType, title: &str) -> Self {
         Field::new(edit_type.as_str(), title)
     }
@@ -206,7 +263,8 @@ impl Field {
         self
     }
     /// The value is a JSON array or object (KEY_VALUE via a raw edit type), kept as JSON text
-    /// by SQL repositories and returned as JSON.
+    /// by SQL repositories and returned as JSON. A search for values (EQ / IN, NEQ / NOT_IN) matches the
+    /// records whose JSON holds every one of them (does not hold any), as the quoted text `"value"`.
     pub fn json(mut self) -> Self {
         self.json = true;
         self
@@ -272,12 +330,12 @@ impl Field {
         self.click = Some(Arc::new(move |form, _| click(form)));
         self
     }
-    /// Raw `@View` attributes, validated against the schema when the model is built.
+    /// Raw `@View` attributes, merged onto what the field declares; the server checks them.
     pub fn view(mut self, view: impl Serialize) -> Self {
         merge(&mut self.view, &to_json(view, "view"));
         self
     }
-    /// Raw `@Edit` attributes, validated against the schema when the model is built.
+    /// Raw `@Edit` attributes, merged onto what the field declares; the server checks them.
     pub fn edit(mut self, edit: impl Serialize) -> Self {
         merge(&mut self.edit, &to_json(edit, "edit"));
         self
@@ -311,129 +369,114 @@ impl Field {
         self.target.as_deref().expect("reference target")
     }
 
+    /// The field as declared (PROTOCOL.md §12.3): the server completes the rest from Java's defaults.
     fn build(&self) -> Value {
-        let fields = &defaults()["fields"];
-        let mut tpl = fields[if self.is_pk() { "id" } else { &self.kind }].clone();
-        tpl["fieldName"] = json!(self.name);
-        tpl["componentValue"] = Value::Null;
         if self.is_pk() {
-            return tpl;
+            return json!({"fieldName": self.name, "fieldReturnName": "number", "componentValue": null,
+                          "eruptFieldJson": {"edit": {"title": "", "type": "NUMBER"}}});
         }
-        {
-            let efj = &mut tpl["eruptFieldJson"];
-            let edit = &mut efj["edit"];
-            edit["title"] = json!(self.title);
-            edit["notNull"] = json!(self.not_null);
-            edit["show"] = json!(self.form);
-            edit["search"]["value"] = json!(self.search);
-            if self.fetch.is_some() {
-                let attr = match self.kind.as_str() {
-                    "CHOICE" => "choiceType",
-                    "MULTI_CHOICE" => "multiChoiceType",
-                    _ => "tagsType",
-                };
-                edit[attr]["fetchHandler"] = json!(["invoke"]);
-            }
-            if self.onchange.is_some() {
-                edit["onchange"] = json!("invoke");
-            }
-            // a BUTTON's template has no table column
-            if let Some(view) = efj["views"].get_mut(0) {
-                view["title"] = json!(self.title);
-                view["sortable"] = json!(self.sortable);
-            }
+        let kind = self.kind.as_str();
+        // a DATE_TIME is a DATE whose dateType says so; a DATE says it too, as AUTO is the node's to resolve
+        let mut edit =
+            json!({"title": self.title, "type": if kind == "DATE_TIME" { "DATE" } else { kind }});
+        if matches!(kind, "DATE" | "DATE_TIME") {
+            edit["dateType"] = json!({"type": kind});
         }
-        match self.kind.as_str() {
-            "DATE" => tpl["eruptFieldJson"]["views"][0]["type"] = json!("DATE"),
-            "REFERENCE_TABLE" | "REFERENCE_TREE" => {
-                let target = self.target();
-                tpl["fieldReturnName"] = json!(target.name);
-                let efj = &mut tpl["eruptFieldJson"];
-                if let Some(pid) = &self.tree {
-                    let t = &mut efj["edit"]["referenceTreeType"];
-                    t["id"] = json!(target.pk.as_deref().unwrap_or("id"));
-                    t["label"] = json!(self.label);
-                    t["pid"] = json!(pid);
-                } else {
-                    let t = &mut efj["edit"]["referenceTableType"];
-                    t["id"] = json!(target.pk.as_deref().unwrap_or("id"));
-                    t["label"] = json!(self.label);
+        if self.not_null {
+            edit["notNull"] = json!(true);
+        }
+        if !self.form {
+            edit["show"] = json!(false);
+        }
+        if self.search {
+            edit["search"] = json!({"value": true});
+        }
+        let mut view = json!({"title": self.title});
+        if self.sortable {
+            view["sortable"] = json!(true);
+        }
+        let mut return_name = match kind {
+            "NUMBER" | "RATE" | "SLIDER" => "number",
+            "BOOLEAN" => "Boolean",
+            "DATE" | "DATE_TIME" => "Date",
+            _ => "String",
+        };
+        if let Some(target) = &self.target {
+            let id = target.pk.as_deref().unwrap_or("id");
+            match &self.tree {
+                Some(pid) if self.is_reference() => {
+                    edit["referenceTreeType"] = json!({"id": id, "label": self.label, "pid": pid})
                 }
-                efj["views"][0]["column"] = json!(self.label);
+                _ if self.is_reference() => {
+                    edit["referenceTableType"] = json!({"id": id, "label": self.label})
+                }
+                _ => {}
             }
             // the server lists a CHECKBOX by the view column, a TAB_TREE by the target's own tree
-            "CHECKBOX" | "TAB_TREE" | "TRANSFER" => {
-                tpl["fieldReturnName"] = json!(self.target().name);
-                tpl["eruptFieldJson"]["views"][0]["column"] = json!(self.label);
-            }
-            _ => {}
+            return_name = &target.name;
+            view["column"] = json!(self.label);
         }
-        let efj = &mut tpl["eruptFieldJson"];
-        merge(&mut efj["edit"], &self.edit);
-        if let Some(column) = &self.depend_column {
-            efj["edit"]["referenceTableType"]["dependColumn"] = json!(column);
+        if self.fetch.is_some() {
+            let attr = match kind {
+                "CHOICE" => "choiceType",
+                "MULTI_CHOICE" => "multiChoiceType",
+                _ => "tagsType",
+            };
+            edit[attr] = json!({"fetchHandler": ["invoke"]});
         }
-        if let Some(view) = efj["views"].get_mut(0) {
-            merge(view, &self.view);
+        if self.onchange.is_some() {
+            edit["onchange"] = json!("invoke");
         }
-        if !self.table {
-            efj["views"] = json!([]);
-        }
+        merge(&mut edit, &self.edit);
+        merge(&mut view, &self.view);
+        // a BUTTON is a form element only: no table column
+        let views = if self.table && kind != "BUTTON" {
+            json!([view])
+        } else {
+            json!([])
+        };
         // a CHOICE or MULTI_CHOICE: the options travel as componentValue
-        if !self.choices.is_empty() {
-            tpl["componentValue"] = Value::Array(
-                self.choices
-                    .iter()
-                    .map(|(v, l)| json!({"value": v, "label": l, "desc": null, "color": null, "disable": false}))
-                    .collect(),
-            );
-        }
-        tpl
+        let options = if self.choices.is_empty() {
+            Value::Null
+        } else {
+            self.choices
+                .iter()
+                .map(|(v, l)| json!({"value": v, "label": l, "desc": null, "color": null, "disable": false}))
+                .collect()
+        };
+        json!({"fieldName": self.name, "fieldReturnName": return_name, "componentValue": options,
+               "eruptFieldJson": {"edit": edit, "views": views}})
     }
 
-    /// Turn a JSON value from the browser into the value stored by the repository.
+    /// A JSON value as the server sends it (PROTOCOL.md §12.4) to the value the repository stores: a date in the
+    /// repository's representation, a number, a key as its key type. The server has checked it; a key in a path
+    /// segment, a delete body or an operation's ids arrives as the browser sent it, so it may fail here.
     pub(crate) fn coerce(&self, value: &Value) -> std::result::Result<Value, String> {
         if self.is_reference() {
             let target = self.target();
             let pk = target.pk.as_deref().unwrap_or("id");
-            // the browser sends the picked record as {<id>: ..., <label>: ...}
-            let id = match value {
-                Value::Object(o) => o.get(pk).cloned().unwrap_or(Value::Null),
-                other => other.clone(),
-            };
-            return target.field(pk).expect("target pk").coerce(&id);
+            return target.field(pk).expect("target pk").coerce(value);
         }
         if self.is_collection() {
-            // picked records arrive as [{"id": key}] (CHECKBOX) or [{<pk>: key}] (TAB_TREE), stored as keys
             let target = self.target();
-            let pk = target.pk.as_deref().unwrap_or("id");
-            let items = match value {
-                Value::Null => json!([]),
-                Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
-                other => other.clone(),
+            let key = target
+                .field(target.pk.as_deref().unwrap_or("id"))
+                .expect("target pk");
+            return match value {
+                Value::Null => Ok(json!([])),
+                Value::Array(items) => items
+                    .iter()
+                    .map(|item| key.coerce(item))
+                    .collect::<std::result::Result<_, _>>()
+                    .map(Value::Array),
+                other => Err(format!("illegal value '{}'", text(other))),
             };
-            let Value::Array(items) = items else {
-                return Err(format!("illegal value '{}'", text(value)));
-            };
-            let key = target.field(pk).expect("target pk");
-            return items
-                .iter()
-                .map(|item| match item {
-                    Value::Object(o) => key.coerce(o.get(pk).or(o.values().next()).unwrap_or(item)),
-                    other => key.coerce(other),
-                })
-                .collect::<std::result::Result<_, _>>()
-                .map(Value::Array);
         }
         if value.is_null() || value.as_str() == Some("") {
             return Ok(Value::Null);
         }
         if self.json {
-            return if value.is_array() || value.is_object() {
-                Ok(value.clone())
-            } else {
-                Err(format!("illegal value '{}'", text(value)))
-            };
+            return Ok(value.clone());
         }
         if self.is_pk() {
             return match value {
@@ -443,18 +486,10 @@ impl Field {
                 Value::String(s) if s.trim().parse::<i64>().is_ok() => {
                     Ok(Value::from(s.trim().parse::<i64>().unwrap_or(0)))
                 }
-                Value::Bool(b) => Ok(Value::from(*b as i64)),
                 other => Err(format!("illegal integer '{}'", text(other))),
             };
         }
         match self.kind.as_str() {
-            "BOOLEAN" => Ok(match value {
-                Value::Bool(b) => Value::Bool(*b),
-                other => Value::Bool(matches!(
-                    text(other).to_ascii_lowercase().as_str(),
-                    "true" | "1"
-                )),
-            }),
             "NUMBER" | "RATE" | "SLIDER" => as_f64(value)
                 .map(number)
                 .ok_or_else(|| format!("illegal number '{}'", text(value))),
@@ -469,19 +504,7 @@ impl Field {
                     parsed.date_time_string()
                 }))
             }
-            _ => {
-                if value.is_array() || value.is_object() {
-                    return Err(format!("illegal text {value}"));
-                }
-                let s = text(value);
-                if self.kind == "CHOICE"
-                    && !self.choices.is_empty()
-                    && !self.choices.iter().any(|(v, _)| *v == s)
-                {
-                    return Err(format!("illegal option '{s}'"));
-                }
-                Ok(Value::String(s))
-            }
+            _ => Ok(value.clone()),
         }
     }
 }
@@ -579,7 +602,7 @@ impl Operation {
         self.show = Some(Arc::new(show));
         self
     }
-    /// Raw `@RowOperation` attributes, validated against the schema when the model is built.
+    /// Raw `@RowOperation` attributes, merged onto what the operation declares; the server checks them.
     pub fn raw(mut self, raw: impl Serialize) -> Self {
         merge(&mut self.raw, &to_json(raw, "operation"));
         self
@@ -597,28 +620,21 @@ impl Operation {
     }
 
     fn build(&self) -> Value {
-        let mut tpl = defaults()["rowOperation"].clone();
-        tpl["code"] = json!(self.code);
-        tpl["title"] = json!(self.title);
-        tpl["mode"] = json!(self.mode.as_str());
-        tpl["tip"] = json!(self.tip);
-        tpl["ifExpr"] = json!(self.if_expr);
-        tpl["type"] = json!("ERUPT");
-        tpl["eruptClass"] = json!(self
-            .form
-            .as_ref()
-            .map(|f| f.name.as_str())
-            .unwrap_or("void"));
+        let mut op = json!({
+            "code": self.code, "title": self.title, "mode": self.mode.as_str(), "tip": self.tip,
+            "ifExpr": self.if_expr,
+            "eruptClass": self.form.as_ref().map(|f| f.name.as_str()).unwrap_or("void"),
+        });
         if let Some(icon) = &self.icon {
-            tpl["icon"] = json!(icon);
+            op["icon"] = json!(icon);
         }
         match &self.confirm {
             Confirm::Default => {}
-            Confirm::Skip => tpl["callHint"] = json!(""),
-            Confirm::Text(t) => tpl["callHint"] = json!(t),
+            Confirm::Skip => op["callHint"] = json!(""),
+            Confirm::Text(t) => op["callHint"] = json!(t),
         }
-        merge(&mut tpl, &self.raw);
-        tpl
+        merge(&mut op, &self.raw);
+        op
     }
 }
 
@@ -677,14 +693,13 @@ pub struct Model {
     title: String,
     pub(crate) pk: Option<String>,
     pub(crate) fields: Vec<Field>,
+    /// the rights the model switches off; the server enforces them and the user's (PROTOCOL.md §12.5)
     pub(crate) power: Map<String, Value>,
     pub(crate) order_by: Vec<(String, bool)>,
     /// view code -> the filters and order the node applies to that view's table pages
     pub(crate) vis: HashMap<String, (Vec<Filter>, Order)>,
-    /// (field, dependNode) of a @LinkTree: the reference the tree beside the table filters
-    pub(crate) link_tree: Option<(String, bool)>,
-    /// drill code -> its link, of which `column` and `joinColumn` stay here (`@Transient` in Java)
-    pub(crate) drills: HashMap<String, Drill>,
+    /// drill code -> its `linkCondition` (SQL as written), which the node adds to a drilled table
+    pub(crate) drills: HashMap<String, String>,
     raw: Value,
     pub(crate) operations: Vec<Operation>,
     pub(crate) proxies: Vec<Arc<dyn DataProxy>>,
@@ -750,12 +765,10 @@ impl Model {
     }
 
     pub(crate) fn build_erupt(&self, operations: &[&Operation]) -> Value {
-        let mut erupt = defaults()["erupt"].clone();
-        merge(
-            &mut erupt,
-            &json!({"primaryKeyCol": self.pk.as_deref().unwrap_or("id")}),
-        );
-        erupt["rowOperation"] = Value::Array(operations.iter().map(|o| o.build()).collect());
+        let mut erupt = json!({
+            "primaryKeyCol": self.pk.as_deref().unwrap_or("id"),
+            "rowOperation": operations.iter().map(|o| o.build()).collect::<Vec<_>>(),
+        });
         merge(&mut erupt, &self.raw);
         let mut condition = Record::new();
         for p in &self.proxies {
@@ -807,7 +820,7 @@ impl ModelBuilder {
         self.order_by = order_by.to_string();
         self
     }
-    /// Raw `@Erupt` attributes merged onto the defaults, e.g. `json!({"layout": {"pageSize": 30}})`. A `vis`
+    /// Raw `@Erupt` attributes, sent as declared and checked by the server, e.g. `json!({"layout": {"pageSize": 30}})`. A `vis`
     /// entry may also carry `filter` (one SQL string or a list, ANDed as written) and `orderBy` (as
     /// [`order_by`](Self::order_by)): the node applies them to that view's table pages, and they stay out of
     /// the build, as Java keeps them `@Transient`. A view without a `code` is addressed by its title.
@@ -835,14 +848,14 @@ impl ModelBuilder {
             pull_vis(self.raw).map_err(|m| Error::Declaration(format!("{name}: {m}")))?;
         let (raw, drills) =
             pull_drills(raw).map_err(|m| Error::Declaration(format!("{name}: {m}")))?;
-        check("Erupt", &raw, &format!("model {name}"), true).map_err(Error::Declaration)?;
-        let default_power = defaults()["power"].as_object().expect("power");
-        let mut power = default_power.clone();
-        for (key, value) in self.power.as_object().into_iter().flatten() {
-            if !default_power.contains_key(key) || !value.is_boolean() {
-                return fail(format!("{name}: illegal power '{key}'"));
+        let power = self.power.as_object().cloned().unwrap_or_default();
+        for (key, value) in &power {
+            if !POWERS.contains(&key.as_str()) || !value.is_boolean() {
+                return fail(format!(
+                    "{name}: illegal power '{key}', expected some of {}",
+                    POWERS.join(", ")
+                ));
             }
-            power.insert(key.clone(), value.clone());
         }
         let mut fields = Vec::new();
         let mut seen = HashSet::new();
@@ -851,12 +864,7 @@ impl ModelBuilder {
             if !identifier(&field_name) || !seen.insert(field_name.clone()) {
                 return fail(format!("{path}: field names must be unique identifiers"));
             }
-            if !f.is_pk()
-                && !defaults()["fields"]
-                    .as_object()
-                    .expect("fields")
-                    .contains_key(&f.kind)
-            {
+            if !f.is_pk() && !SUPPORTED.contains(&f.kind.as_str()) {
                 return fail(format!("{path}: edit type {} is not supported yet", f.kind));
             }
             if f.transient && (f.search || f.sortable || f.not_null) {
@@ -864,8 +872,15 @@ impl ModelBuilder {
                     "{path}: a transient field cannot be searched, sorted or required"
                 ));
             }
-            if f.json && (f.search || f.sortable) {
-                return fail(format!("{path}: a JSON field cannot be searched or sorted"));
+            if f.json && f.sortable {
+                return fail(format!("{path}: a JSON field cannot be sorted"));
+            }
+            // a list of keys matched as text never finds a number: refused instead of searching for nothing
+            if f.search && COLLECTIONS.contains(&f.kind.as_str()) {
+                return fail(format!(
+                    "{path}: a {} holds keys and cannot be searched",
+                    f.kind
+                ));
             }
             let fetched = match f.kind.as_str() {
                 "CHOICE" | "MULTI_CHOICE" => !f.fetch_tags,
@@ -881,17 +896,16 @@ impl ModelBuilder {
                      AUTO_COMPLETE and BUTTON"
                 ));
             }
-            let table_type = f
-                .edit
-                .get_mut("referenceTableType")
-                .and_then(Value::as_object_mut);
-            match table_type.and_then(|t| t.remove("dependColumn")) {
-                None => {}
-                Some(Value::String(column)) => f.depend_column = Some(column),
-                Some(_) => return fail(format!("{path}: dependColumn must be text")),
-            }
-            check("View", &f.view, &format!("{path}.view"), true).map_err(Error::Declaration)?;
-            check("Edit", &f.edit, &format!("{path}.edit"), true).map_err(Error::Declaration)?;
+            check_enum::<EditType>(
+                f.edit.get("type"),
+                &format!("{path}.edit.type"),
+                EditType::VALUES,
+            )?;
+            check_enum::<QueryExpression>(
+                f.edit.get("search").and_then(|s| s.get("operator")),
+                &format!("{path}.edit.search.operator"),
+                QueryExpression::VALUES,
+            )?;
             if (f.is_reference() || f.is_collection()) && f.target.is_none() {
                 return fail(format!("{path}: {} needs a target model", f.kind));
             }
@@ -920,15 +934,15 @@ impl ModelBuilder {
             .into_iter()
             .map(|(code, filters, sort)| Ok((code, (filters, parse_order(name, &fields, &sort)?))))
             .collect::<Result<_>>()?;
-        let link_tree = raw.get("linkTree").and_then(|t| {
-            let field = t.get("field")?.as_str().filter(|f| !f.is_empty())?;
-            Some((
-                field.to_string(),
-                t.get("dependNode") == Some(&Value::Bool(true)),
-            ))
-        });
-        if let Some((field, _)) = &link_tree {
-            if !fields.iter().any(|f| &f.name == field && f.is_reference()) {
+        // the server filters by the tree beside the table (§12.4); the field it names is checked here, where it
+        // is written
+        let tree_field = raw
+            .get("linkTree")
+            .and_then(|t| t.get("field"))
+            .and_then(Value::as_str)
+            .filter(|f| !f.is_empty());
+        if let Some(field) = tree_field {
+            if !fields.iter().any(|f| f.name == field && f.is_reference()) {
                 return fail(format!(
                     "{name}: linkTree.field '{field}' must be a reference field"
                 ));
@@ -945,8 +959,11 @@ impl ModelBuilder {
             if op.handler.is_none() {
                 return fail(format!("{path}: operation without a handler"));
             }
-            check("RowOperation", &op.raw, &format!("operation {path}"), true)
-                .map_err(Error::Declaration)?;
+            check_enum::<RowOperationMode>(
+                op.raw.get("mode"),
+                &format!("{path}.mode"),
+                RowOperationMode::VALUES,
+            )?;
         }
         Ok(Arc::new(Model {
             name: self.name,
@@ -956,7 +973,6 @@ impl ModelBuilder {
             power,
             order_by,
             vis,
-            link_tree,
             drills,
             raw,
             operations: self.operations,
@@ -991,7 +1007,7 @@ fn parse_order(name: &str, fields: &[Field], order: &str) -> Result<Order> {
 }
 
 /// `filter` and `orderBy` of a `vis` entry run on the node, as Java keeps them off the build (`@Transient`):
-/// taken out before the schema check. A view without a `code` gets its title.
+/// taken out of what is sent. A view without a `code` gets its title.
 fn pull_vis(mut raw: Value) -> std::result::Result<(Value, Vec<RawView>), String> {
     let mut vis = Vec::new();
     for entry in raw
@@ -1001,7 +1017,7 @@ fn pull_vis(mut raw: Value) -> std::result::Result<(Value, Vec<RawView>), String
         .flatten()
     {
         let Some(entry) = entry.as_object_mut() else {
-            continue; // the schema check reports it
+            continue; // the server reports it
         };
         if !entry.contains_key("code") {
             let title = entry.get("title").cloned().unwrap_or(json!(""));
@@ -1027,22 +1043,10 @@ fn pull_vis(mut raw: Value) -> std::result::Result<(Value, Vec<RawView>), String
     Ok((raw, vis))
 }
 
-/// A drill's link as the node applies it.
-pub(crate) struct Drill {
-    /// the linked model
-    pub(crate) erupt: String,
-    /// the source row's column
-    pub(crate) column: String,
-    /// the linked model's field holding it
-    pub(crate) join: String,
-    /// `linkCondition`, SQL as written
-    pub(crate) condition: String,
-}
-
-/// `link.column` / `link.joinColumn` of a drill: the source row's column (`id` by default) and the linked
-/// model's field holding it, applied by the node and kept out of the build. A drill without a `code` is
-/// addressed by its title.
-fn pull_drills(mut raw: Value) -> std::result::Result<(Value, HashMap<String, Drill>), String> {
+/// A drill's `link` goes to the server whole: it reads the source row and joins on `column` / `joinColumn`
+/// (PROTOCOL.md §12.4). Its `linkCondition` is the node's query language: kept here, applied to a drilled table.
+/// A drill without a `code` is addressed by its title.
+fn pull_drills(mut raw: Value) -> std::result::Result<(Value, HashMap<String, String>), String> {
     let mut drills = HashMap::new();
     for entry in raw
         .get_mut("drills")
@@ -1050,38 +1054,31 @@ fn pull_drills(mut raw: Value) -> std::result::Result<(Value, HashMap<String, Dr
         .into_iter()
         .flatten()
     {
-        let Some(declared) = entry.as_object() else {
-            continue; // the schema check reports it
+        let Some(entry) = entry.as_object_mut() else {
+            continue; // the server reports it
         };
-        let mut link = declared.get("link").cloned().unwrap_or(json!({}));
-        let Some(fields) = link.as_object_mut() else {
-            continue;
+        let link = entry.get("link").cloned().unwrap_or(Value::Null);
+        let filled = |key: &str| {
+            link.get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.is_empty())
         };
-        let column = fields.remove("column").unwrap_or(json!("id"));
-        let join = fields.remove("joinColumn").unwrap_or(Value::Null);
-        let (Some(column), Some(join), Some(erupt)) = (
-            column.as_str(),
-            join.as_str().filter(|j| !j.is_empty()),
-            fields.get("linkErupt").and_then(Value::as_str),
-        ) else {
+        if !filled("linkErupt") || !filled("joinColumn") {
             return Err(format!(
                 "drill '{}' needs link.linkErupt and link.joinColumn",
-                text(declared.get("title").unwrap_or(&Value::Null))
+                text(entry.get("title").unwrap_or(&Value::Null))
             ));
-        };
-        let drill = Drill {
-            erupt: erupt.to_string(),
-            column: column.to_string(),
-            join: join.split('.').next().unwrap_or(join).to_string(),
-            condition: fields.get("linkCondition").map(text).unwrap_or_default(),
-        };
-        let mut filled = Value::Object(annotation_defaults("Drill"));
-        filled["code"] = declared.get("title").cloned().unwrap_or(json!(""));
-        merge(&mut filled, entry);
-        filled["link"] = Value::Object(annotation_defaults("Link"));
-        merge(&mut filled["link"], &link);
-        drills.insert(text(&filled["code"]), drill);
-        *entry = filled;
+        }
+        if !entry.contains_key("code") {
+            let title = entry.get("title").cloned().unwrap_or(json!(""));
+            entry.insert("code".to_string(), title);
+        }
+        let condition = link
+            .get("linkCondition")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        drills.insert(text(&entry["code"]), condition);
     }
     Ok((raw, drills))
 }

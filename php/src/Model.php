@@ -8,13 +8,17 @@ use Erupt\Attribute\Operation;
 use Erupt\Types\EditType;
 
 /**
- * An #[Erupt] class compiled into erupt build JSON. Nothing re-implements annotation semantics: every
- * field and operation starts from the template the Java proxies emit (resources/erupt-node-defaults.json)
- * and a declaration only overrides values on top of it.
+ * An #[Erupt] class compiled into erupt build JSON. Nothing re-implements annotation semantics: the build carries
+ * only what a model declares, and the server completes every annotation from its Java defaults and checks it
+ * (erupt-cloud/PROTOCOL.md §12.3, protocol v2).
  */
 final class Model
 {
     private const IDENTIFIER = '/^[A-Za-z_][A-Za-z0-9_]*$/';
+
+    /** Rights a model may switch off (@Erupt power, PowerObject). */
+    public const POWERS = ['add', 'edit', 'delete', 'query', 'viewDetails', 'export', 'importable', 'print', 'copy', 'cellEdit',
+        'batchEdit', 'ai', 'comment', 'revision'];
 
     /** @var array<class-string, Model> */
     private static array $compiled = [];
@@ -25,6 +29,7 @@ final class Model
     public readonly string $title;
     /** Primary key field, or null for a model that only serves as an operation form. */
     public readonly ?string $pk;
+    /** @var array<string, bool> the rights the model switches off; the server enforces them and the user's (§12.5) */
     public readonly array $power;
     /** @var list<array{0: string, 1: bool}> default sort, [field, descending] */
     public readonly array $orderBy;
@@ -38,9 +43,7 @@ final class Model
     public readonly array $proxies;
     /** @var array<string, array{0: list<array{0: string, 1: list<mixed>}>, 1: list<array{0: string, 1: bool}>}> view code -> [filters, sort] */
     public readonly array $vis;
-    /** @var array{0: string, 1: bool}|null [field, dependNode] of a @LinkTree: the reference the tree beside the table filters */
-    public readonly ?array $linkTree;
-    /** @var array<string, array{erupt: string, column: string, join: string, condition: string}> drill code -> its link, applied by the node */
+    /** @var array<string, string> drill code -> its linkCondition, which the node adds to a drilled table (§12.4) */
     public readonly array $drills;
     private readonly array $raw;
 
@@ -84,13 +87,11 @@ final class Model
         $this->proxies = $proxies;
         [$raw, $vis] = self::pullVis($decl->raw);
         [$raw, $this->drills] = self::pullDrills($raw);
-        Schema::check('Erupt', $raw, "#[Erupt] $this->name");
         $this->raw = $raw;
-        $defaults = Schema::defaults()['power'];
-        if ($unknown = array_diff_key($decl->power, $defaults)) {
-            throw new \InvalidArgumentException("$this->name: unknown power " . implode(', ', array_keys($unknown)));
+        if ($unknown = array_diff(array_keys($decl->power), self::POWERS)) {
+            throw new \InvalidArgumentException("$this->name: unknown power " . implode(', ', $unknown) . ', expected some of ' . implode(', ', self::POWERS));
         }
-        $this->power = array_merge($defaults, $decl->power);
+        $this->power = $decl->power;
 
         $fields = $declared = [];
         foreach ($class->getProperties() as $property) {
@@ -110,10 +111,10 @@ final class Model
         }
         $this->pk = $pks[0] ?? null;
         $this->orderBy = $this->parseOrder($decl->orderBy);
-        $link = $raw['linkTree'] ?? [];
-        $this->linkTree = isset($link['field']) ? [$link['field'], (bool) ($link['dependNode'] ?? false)] : null;
-        if ($this->linkTree && !($fields[$this->linkTree[0]] ?? null)?->isReference()) {
-            throw new \InvalidArgumentException("$this->name: linkTree.field '{$this->linkTree[0]}' must be a reference field");
+        // the server filters by the tree beside the table (§12.4); the field it names is checked here, where it is written
+        $treeField = $raw['linkTree']['field'] ?? null;
+        if ($treeField !== null && !(is_string($treeField) && ($fields[$treeField] ?? null)?->isReference())) {
+            throw new \InvalidArgumentException("$this->name: linkTree.field '" . (is_scalar($treeField) ? $treeField : '') . "' must be a reference field");
         }
         // view code -> [filters, sort] the node applies to that view's table queries
         $this->vis = array_map(fn($v) => [array_map(fn($f) => [$f, []], $v[0]), $this->parseOrder($v[1])], $vis);
@@ -148,17 +149,11 @@ final class Model
     {
         $name = $property->getName();
         $path = "$this->name.$name";
-        if ($decl->type !== null && EditType::tryFrom($decl->type) === null) {
+        // a DATE_TIME is the node's name for a DATE whose dateType says so
+        if ($decl->type !== null && $decl->type !== 'DATE_TIME' && EditType::tryFrom($decl->type) === null) {
             throw new \InvalidArgumentException("$path.type: '$decl->type' is not a EditType, expected one of "
                 . implode(', ', array_column(EditType::cases(), 'value')));
         }
-        Schema::check('View', $decl->view, "$path.view");
-        // referenceTableType.dependColumn is @Transient in Java: kept out of the schema check, the build carries it
-        $edit = $decl->edit;
-        if (is_array($edit['referenceTableType'] ?? null)) {
-            unset($edit['referenceTableType']['dependColumn']);
-        }
-        Schema::check('Edit', $edit, "$path.edit");
         if ($decl->pk) {
             return new FieldSpec($name, $decl, null);
         }
@@ -177,8 +172,12 @@ final class Model
             $hint !== null && is_a($hint, \DateTimeInterface::class, true) => 'DATE_TIME',
             default => 'INPUT',
         };
-        if (!isset(Schema::defaults()['fields'][$type])) {
+        if (!in_array($type, FieldSpec::SUPPORTED, true)) {
             throw new \InvalidArgumentException("$path: edit type $type is not supported yet");
+        }
+        if ($collection && $decl->search) {
+            // a list of keys matched as text never finds a number: refused instead of searching for nothing
+            throw new \InvalidArgumentException("$path: a $type holds keys and cannot be searched");
         }
         if ($collection && $decl->ref === null) {
             throw new \InvalidArgumentException("$path: $type needs ref");
@@ -220,14 +219,14 @@ final class Model
 
     /**
      * `filter` and `orderBy` of a `vis` entry run on the node, as Java keeps them off the build (`@Transient`):
-     * taken out before the schema check. A view without a `code` is addressed by its title.
+     * taken out of the build. A view without a `code` is addressed by its title.
      */
     private static function pullVis(array $raw): array
     {
         $vis = $entries = [];
         foreach (is_array($raw['vis'] ?? null) ? $raw['vis'] : [] as $entry) {
             if (!is_array($entry)) {
-                return [$raw, []]; // left to the schema check
+                return [$raw, []]; // left to the server's check
             }
             $entry += ['code' => $entry['title'] ?? ''];
             $filters = array_values((array) ($entry['filter'] ?? []));
@@ -245,29 +244,23 @@ final class Model
     }
 
     /**
-     * `link.column` / `link.joinColumn` of a drill: the source row's column (`id` by default) and the linked
-     * model's field holding it (its first path segment), applied by the node and kept out of the build, as Java
-     * keeps them `@Transient`. The rest is filled from the schema defaults; a drill without a `code` is
-     * addressed by its title.
+     * A drill's `link` goes to the server whole: it reads the source row and joins on `column` / `joinColumn`
+     * (§12.4). Its `linkCondition` is the node's query language: kept here, applied to a drilled table. A drill
+     * without a `code` is addressed by its title.
      */
     private static function pullDrills(array $raw): array
     {
         $drills = $entries = [];
         foreach (is_array($raw['drills'] ?? null) ? $raw['drills'] : [] as $entry) {
             if (!is_array($entry) || !is_array($entry['link'] ?? [])) {
-                return [$raw, []]; // left to the schema check
+                return [$raw, []]; // left to the server's check
             }
             $link = $entry['link'] ?? [];
-            $column = $link['column'] ?? 'id';
-            $join = $link['joinColumn'] ?? null;
-            if (!is_string($join) || $join === '' || !is_string($link['linkErupt'] ?? null) || $link['linkErupt'] === '' || !is_string($column)) {
+            if (!is_string($link['joinColumn'] ?? null) || $link['joinColumn'] === '' || !is_string($link['linkErupt'] ?? null) || $link['linkErupt'] === '') {
                 throw new \InvalidArgumentException("drill '" . (is_string($entry['title'] ?? null) ? $entry['title'] : '') . "' needs link.linkErupt and link.joinColumn");
             }
-            unset($link['column'], $link['joinColumn']);
-            $entry = array_merge(Schema::declaredDefaults('Drill'), ['code' => $entry['title'] ?? ''], $entry,
-                ['link' => array_merge(Schema::declaredDefaults('Link'), $link)]);
-            $drills[$entry['code']] = ['erupt' => $link['linkErupt'], 'column' => $column, 'join' => explode('.', $join)[0],
-                'condition' => is_string($link['linkCondition'] ?? null) ? $link['linkCondition'] : ''];
+            $entry += ['code' => $entry['title'] ?? ''];
+            $drills[$entry['code']] = is_string($link['linkCondition'] ?? null) ? $link['linkCondition'] : '';
             $entries[] = $entry;
         }
         if (is_array($raw['drills'] ?? null)) {
@@ -320,8 +313,7 @@ final class Model
     /** @param list<OperationSpec> $operations */
     public function buildErupt(array $operations = []): array
     {
-        $erupt = self::merge(Schema::defaults()['erupt'], ['primaryKeyCol' => $this->pk ?? 'id']);
-        $erupt['rowOperation'] = array_map(fn(OperationSpec $op) => $op->build(), $operations);
+        $erupt = ['primaryKeyCol' => $this->pk ?? 'id', 'rowOperation' => array_map(fn(OperationSpec $op) => $op->build(), $operations)];
         return [
             'eruptName' => $this->name,
             'eruptJson' => self::merge($erupt, $this->raw),

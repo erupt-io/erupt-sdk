@@ -24,12 +24,23 @@ Shared repository rules (not all reachable over HTTP, so each SDK also unit-test
 rows come back by primary key ascending; SQL repositories bind every value, quote whitelisted identifiers
 and escape LIKE with `ESCAPE '!'`, which every database reads the same way.
 
-Server calls are checked both ways: with the plain `Access-Token`, and signed (`Erupt-Signature`, no token)
-the way erupt 2.3.x servers call. A node verifies the signature with the algorithm of
-[`signature-vectors.json`](signature-vectors.json) (computed by the Java reference; every SDK unit-tests
-against it), trusts `Erupt-Enforced` only under a valid signature, and skips the `erupt-power` callback when it
-lists `power`. A reference travels as its key: the server resolves labels, flattened columns and trees, and
-answers `reference-tree`, `build/{erupt}/{field}` and `drag-sort` itself, so a node serves none of them.
+The node's protocol decides the checks. A node registering with `protocolVersion: 2` (every SDK here) is a
+thin node (`erupt-cloud/PROTOCOL.md` §12): the suite answers its registration with `{"protocolVersion": 2}`, signs
+every call with the `Erupt-Enforced` its endpoint needs (§12.2) and sends what a v2 server sends: normalized
+values, references as keys, drills and link trees as plain conditions (`drill` in the body names the drill whose
+`linkCondition` the node adds). The node must refuse an unsigned call and one missing a required
+`Erupt-Enforced` value, never ask for `erupt-power`, and keep checking what it checks whoever calls it: field
+names, body shapes, its own keys, its page size. Its build declares only what it sets; the suite checks every
+object against the annotation schema and completes it the way the server does
+([`annotations.py`](annotations.py), from `schema/`) before the build assertions.
+
+Any other node (the Java node) is checked against protocol v1: the plain `Access-Token` and signed calls, the
+`erupt-power` callback skipped when a signed `Erupt-Enforced` lists `power`, and the node's own validation.
+
+A node verifies the signature with the algorithm of [`signature-vectors.json`](signature-vectors.json) (computed
+by the Java reference; every SDK unit-tests against it). A reference travels as its key: the server resolves
+labels, flattened columns and trees, and answers `reference-tree`, `build/{erupt}/{field}` and `drag-sort`
+itself, so a node serves none of them.
 
 ## Fixture
 

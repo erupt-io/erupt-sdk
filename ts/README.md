@@ -26,6 +26,11 @@ await node.serve(9090);
 2. Add a menu of type `table` with value `blog.Article`.
 3. Run the node. The server must reach it on `http://<node ip>:9090`; pass `{ address }` otherwise.
 
+The node speaks node protocol v2 (erupt-cloud/PROTOCOL.md §12) and needs an erupt server that does too: it
+registers with `protocolVersion: 2`, and stops with an error if the server does not answer in kind. The server signs
+every call with the access token (an unsigned call is refused), enforces the user's rights and the rights the model
+switches off, checks and normalizes queries and records, and turns drills and link trees into plain conditions.
+
 `node.listener` is a plain `(req, res)` handler for any `node:http` server; then call `node.startHeartbeat()`
 once it listens and `node.deregister()` on shutdown. `serve()` does all three (deregisters on SIGINT / SIGTERM).
 
@@ -37,9 +42,11 @@ Options: `search`, `notNull`, `sortable`, `table` (column, default true), `form`
 `view` / `edit` attributes. Model options: `power` (`{ delete: false }`), `orderBy` (`"views desc, id"`,
 applied by the node), raw `erupt` attributes (`{ layout: { pageSize: 30 } }`), `operations`, `dataProxy`.
 
-Raw attributes are typed with the generated `View`, `Edit`, `Erupt`, `RowOperation` interfaces and checked
-against the erupt annotation schema when the model is declared, so a misspelt key or enum value throws
-at startup instead of silently doing nothing in the browser.
+Raw attributes are typed with the generated `View`, `Edit`, `Erupt`, `RowOperation` interfaces. The build carries
+only what a model declares; the erupt server completes it with the annotation defaults and checks it, and answers
+an error naming the model and the attribute when it is invalid. Declaring a model still throws on an unknown edit
+type or operation mode, an `orderBy` over a missing field, an unknown `power` key, a `linkTree.field` that is not a
+reference, or a drill without `link.linkErupt` / `link.joinColumn`.
 
 Dates are stored as wall-clock strings: DATE `2026-01-05`, DATE_TIME `2026-01-05T10:30:00.000`.
 
@@ -136,8 +143,8 @@ Dragging on a board, calendar or gantt view is saved by the erupt server through
 
 `erupt.tree` (`{ id: "id", label: "name", pid: "parent" }`) shows the model as a tree, and
 `erupt.linkTree` (`{ field: "category" }`) puts the tree of a reference field beside the table: the erupt server
-builds both trees from the node's table, and the node keeps the rows under the picked tree node
-(`dependNode: true` shows none until one is picked). `linkTree.field` must be a reference field.
+builds both trees from the node's table and asks the node for the rows under the picked tree node as a plain
+condition (`dependNode: true` shows none until one is picked). `linkTree.field` must be a reference field.
 
 ## Field types and field code
 
@@ -178,8 +185,9 @@ const Author = model("Author", { ... }, {
 });
 ```
 
-opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default);
-`link.linkCondition` adds SQL as written. Both models must be on the node.
+opens `Book` filtered to the rows whose `author` holds the author's `id` (`link.column`, `id` by default): the
+erupt server reads the author and sends that join as a condition. `link.linkCondition` adds SQL as written,
+applied by the node. Both models must be on the node.
 
 ## Server config and user info
 
@@ -240,8 +248,7 @@ npm install /path/to/erupt-sdk-0.1.0.tgz # in your project
 ```
 
 Or copy `ts/src/` into your project and compile it with your own sources: it needs Node 22+, TypeScript 5.3+,
-`"module": "nodenext"` and `"resolveJsonModule": true`, and keeps `schema.json` and `defaults.json` next to the
-code. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `VERSION` in `node.ts` untouched so the server shows which release the node runs.
+`"module": "nodenext"`. A copy does not update itself: when erupt changes the protocol or the annotation schema, replace the whole directory with the next release instead of merging by hand, and leave `VERSION` in `node.ts` untouched so the server shows which release the node runs.
 
 ## Development
 
@@ -249,5 +256,5 @@ code. A copy does not update itself: when erupt changes the protocol or the anno
 npm install
 npm test                                   # build + unit tests
 npm run conformance                        # the shared protocol suite (conformance/)
-node tools/gen-types.mjs <erupt>/schema    # sync schemas, regenerate src/types.ts (--check for CI)
+node tools/gen-types.mjs ../schema        # regenerate src/types.ts from the annotation schema (--check for CI)
 ```

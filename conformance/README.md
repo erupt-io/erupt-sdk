@@ -12,7 +12,7 @@ python conformance/run.py -- php php/examples/conformance.php
 (cd rust && cargo build --release --example conformance) && python conformance/run.py -- rust/target/release/examples/conformance
 python conformance/run.py -- ruby ruby/examples/conformance.rb
 (cd swift && swift build -c release --product Conformance) && python conformance/run.py -- swift/.build/release/Conformance
-mvn -B -q -f jvm/examples/pom.xml -pl conformance package && python conformance/run.py -- java -jar jvm/examples/conformance/target/erupt-conformance.jar
+python conformance/run.py -- java -jar ../erupt/erupt-cloud/examples/conformance/target/erupt-conformance.jar   # JVM: built in erupt (erupt-cloud/examples/README.md)
 (cd dotnet && dotnet build -c Release) && python conformance/run.py -- dotnet dotnet/examples/Conformance/bin/Release/net8.0/Conformance.dll
 ```
 
@@ -34,7 +34,7 @@ names, body shapes, its own keys, its page size. Its build declares only what it
 object against the annotation schema and completes it the way the server does
 ([`annotations.py`](annotations.py), from `schema/`) before the build assertions.
 
-Any other node (the Java node) is checked against protocol v1: the plain `Access-Token` and signed calls, the
+Any other node (the Spring node, `erupt-cloud-node-lite` before erupt 2.4.1) is checked against protocol v1: the plain `Access-Token` and signed calls, the
 `erupt-power` callback skipped when a signed `Erupt-Enforced` lists `power`, and the node's own validation.
 
 A node verifies the signature with the algorithm of [`signature-vectors.json`](signature-vectors.json) (computed

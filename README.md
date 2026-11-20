@@ -28,7 +28,8 @@ Every SDK here speaks node protocol v2 (`erupt-cloud/PROTOCOL.md` §12): the ser
 build, enforces the user's rights and the model's, checks and normalizes queries and records, and turns drills
 and link trees into conditions; the node stores rows and runs its own code. A v2 node needs an erupt server that
 speaks v2. Against an older server it logs that the server needs an upgrade and stops registering; it never
-falls back to v1. The Java node (`jvm/`) speaks v1 and ships with erupt.
+falls back to v1. The Java nodes (`jvm/`) ship with erupt: `erupt-cloud-node-lite` speaks v2 from erupt 2.4.1,
+the Spring node (`erupt-cloud-node`) speaks v1.
 
 ## Keeping in step with erupt
 

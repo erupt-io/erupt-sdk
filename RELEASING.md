@@ -26,8 +26,8 @@ git tag python/v0.2.0 && git push origin python/v0.2.0
 | `swift/vX.Y.Z` | SwiftPM, through the split repository `erupt-io/erupt-sdk-swift` (tag `X.Y.Z`) | `version` in `swift/Sources/EruptSDK/Node.swift` |
 
 Java nodes ship with erupt: `xyz.erupt:erupt-cloud-node` (Spring) and `xyz.erupt:erupt-cloud-node-lite` (no Spring;
-`-solon`, `-quarkus`, `-micronaut`, `-vertx`, `-ktor`, `-servlet`). Bump `erupt.version` in `jvm/examples/pom.xml` and
-`jvm/examples/spring-blog/pom.xml` after an erupt release.
+`-solon`, `-quarkus`, `-micronaut`, `-vertx`, `-ktor`, `-servlet`); their examples are in the erupt repository
+(`erupt-cloud/examples`), so nothing here follows an erupt release.
 
 ## One-time setup
 

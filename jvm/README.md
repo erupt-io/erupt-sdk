@@ -9,8 +9,8 @@ one dependency.
 | Spring Boot 3.5 | `xyz.erupt:erupt-cloud-node-jpa` (JPA data layer), or the bare `erupt-cloud-node` |
 | No Spring | [`xyz.erupt:erupt-cloud-node-lite`](https://github.com/erupts/erupt/tree/develop/erupt-cloud/erupt-cloud-node-lite) on the JDK's HTTP server, or mounted by `-solon`, `-quarkus`, `-micronaut`, `-vertx`, `-ktor`, `-servlet` |
 
-`erupt-cloud-node` is the reference implementation of the node protocol every SDK here follows; the
-erupt-cloud-node-lite README documents models, handlers, storage and the frameworks.
+`erupt-cloud-node` runs the full erupt-core pipeline and speaks node protocol v1; `erupt-cloud-node-lite` speaks
+v2 from erupt 2.4.1, like every SDK here, and its README documents models, handlers, storage and the frameworks.
 
 ```xml
 <dependency>
@@ -33,29 +33,16 @@ erupt:
 
 ## Examples
 
-- [`examples/conformance`](examples/conformance): the conformance fixture in Java, on erupt-cloud-node-lite;
-- [`examples/blog`](examples/blog): the blog in Kotlin over H2, on erupt-cloud-node-lite;
-- [`examples/spring-blog`](examples/spring-blog): the same blog on Spring Boot with erupt-cloud-node-jpa.
-
-```bash
-# lite: in an erupt checkout (until the version in examples/pom.xml is released)
-mvn install -pl erupt-cloud/erupt-cloud-node-lite -am -DskipTests
-# here
-mvn -f jvm/examples/pom.xml package
-python3 conformance/run.py -- java -jar jvm/examples/conformance/target/erupt-conformance.jar
-java -jar jvm/examples/blog/target/erupt-blog.jar
-
-# Spring, against the released erupt-cloud-node-jpa
-mvn -f jvm/examples/spring-blog/pom.xml package
-ERUPT_ACCESS_TOKEN=... ERUPT_SERVER=http://localhost:8080 PORT=9090 java -jar jvm/examples/spring-blog/target/erupt-node-blog-0.1.0.jar
-```
-
-Then on the server add menus of type `table` with values `blog.Article` and `blog.Category`.
+The JVM example nodes live in the erupt repository, built with the erupt they ship with:
+[`erupt-cloud/examples`](https://github.com/erupts/erupt/tree/develop/erupt-cloud/examples) — the conformance fixture,
+[SHOWCASE.md](../SHOWCASE.md) on erupt-cloud-node-lite served by every adapter (JDK, Solon, Quarkus, Micronaut, Vert.x,
+Ktor, servlet), a Kotlin blog and the same blog on Spring Boot. erupt's CI runs this repository's
+`conformance/run.py` and `conformance/showcase.py` against them (`.github/workflows/node-examples.yml` there).
 
 ## Differences worth knowing
 
 - Field naming follows Java (`publishDate`); the other SDKs use whatever names the model declares.
-- A wrong access token or a denied right answers **500** from the Spring node and **403** from the SDKs
-  (`erupt-cloud/PROTOCOL.md` §8 proposes 403 for v1). The browser shows an error either way.
-- The Spring node enforces the full annotation surface (sub-tables, Excel, attachments, DataProxy hooks…);
-  the SDKs implement the levels listed in their READMEs.
+- A wrong access token or a denied right answers **500** from the Spring node and **403** from the lite node and the
+  SDKs (`erupt-cloud/PROTOCOL.md` §8 proposes 403 for v1). The browser shows an error either way.
+- The Spring node enforces the full annotation surface (sub-tables, Excel, attachments, DataProxy hooks…) and speaks
+  protocol v1; the lite node and the SDKs speak v2 and implement the levels listed in their READMEs.
